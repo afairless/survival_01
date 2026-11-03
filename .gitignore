@@ -1,0 +1,6 @@
+
+*.pdf
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml
