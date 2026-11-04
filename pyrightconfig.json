@@ -1,0 +1,6 @@
+{
+  "extraPaths": [
+    ".pixi/envs/default/lib/python3.15/site-packages"
+  ],
+  "pythonVersion": "3.13"
+}
