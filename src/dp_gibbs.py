@@ -66,8 +66,10 @@ __all__ = [
     "log_q0_uncensored",
     "make_grid",
     "make_surv_data",
+    "refresh_cluster",
     "sample_step_a",
     "sample_step_a_for_obs",
+    "sample_step_b",
     "trapezoid_log_weights",
     "transform_time",
 ]
@@ -1698,3 +1700,226 @@ def sample_step_a_for_obs(
     _sample_urn_category(state, data, prior, grid, rng, i, log_q0_i, log_kernel_i)
     if compact:
         state.compact()
+
+
+def _validate_step_b_inputs(state: DPState, data: SurvData, prior: DPPrior) -> None:
+    """Check that the state and the data describe the same dataset.
+
+    Step (b) indexes the data with the state's labels, so a state carrying
+    three clusters and a dataset of five times would either raise an
+    IndexError deep in the loop or, worse, silently use the wrong times.  The
+    check is an exact length comparison and costs nothing next to the draws.
+    """
+    _as_shape_parameter(prior.d)
+    if data.time.size != state.n:
+        raise ValueError(
+            "data and state must have the same number of observations, "
+            f"got {data.time.size} and {state.n}"
+        )
+    if data.event.size != state.n:
+        raise ValueError(
+            "data and state must have the same number of censoring indicators, "
+            f"got {data.event.size} and {state.n}"
+        )
+
+
+def _cluster_members(state: DPState, j: int) -> np.ndarray:
+    """Return the observation indices labelled ``j``, checking the counts agree.
+
+    Step (b) runs on the compacted state that step (a) leaves behind, so a
+    cluster's member list and its stored count must match exactly.  A state
+    still carrying the deferred removals of ``remove_observation`` would give
+    the wrong ``n_j^o`` and the wrong power sum; that is a bookkeeping error,
+    not an input error, so it raises :class:`StateInvariantError`.
+    """
+    if not 0 <= j < state.n_star:
+        raise IndexError(f"cluster index {j} is out of range for n_star={state.n_star}")
+    members = np.flatnonzero(state.s == j)
+    if members.size == 0:
+        raise StateInvariantError(
+            f"cluster {j} has no observations; compact the state before step (b)"
+        )
+    if members.size != int(state.n_j[j]):
+        raise StateInvariantError(
+            f"cluster {j} holds {members.size} observations but n_j[j] is "
+            f"{int(state.n_j[j])}; compact the state before step (b)"
+        )
+    return members
+
+
+def _lam_star_parameters(
+    state: DPState, data: SurvData, prior: DPPrior, *, j: int
+) -> tuple[int, float]:
+    """Return the shape and scale of ``[lambda*_j | alpha*_j, gamma, D]``.
+
+    Plan Section 2.2(b):
+
+        ``lambda*_j | alpha*_j, ... ~ IGamma(d + n_j^o,
+          gamma + sum_{i_o in j} t_{i_o}**alpha*_j
+                + sum_{i_c in j} z_{i_c}**alpha*_j)``
+
+    so the shape is the base-measure shape ``d`` plus the number of
+    *uncensored* members (a censored member contributes a survival factor and
+    therefore only to the exponential power sum, not to the shape), and the
+    scale is ``gamma`` plus the power sum over **all** members at the
+    cluster's shape ``alpha*_j``.  Both mistakes are easy to make and silent:
+    using ``n_j`` instead of ``n_j^o``, or dropping ``gamma`` from the scale.
+
+    Everything is evaluated at the cluster's own ``alpha*_j``; a neighbour's
+    shape would change both the sum and its meaning.
+    """
+    members = _cluster_members(state, j)
+    alpha = float(state.alpha_star[j])
+    times = np.asarray(data.time, dtype=np.float64)[members]
+    pows = np.power(times, alpha)
+    n_uncensored = int(np.count_nonzero(np.asarray(data.event, dtype=bool)[members]))
+    shape = _as_shape_parameter(prior.d) + n_uncensored
+    scale = float(state.gamma) + float(np.sum(pows))
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise StateInvariantError(
+            "the lambda* conditional of cluster "
+            f"{j} has a non-finite scale {scale!r}; state and data are inconsistent"
+        )
+    return shape, scale
+
+
+def refresh_cluster(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    j: int,
+    rng: np.random.Generator,
+) -> None:
+    """Refresh cluster ``j``'s scale ``lambda*_j`` from its full conditional.
+
+    This is the first half of step (b) of plan Section 3.4, the
+    Bush-MacEachern location refresh.  With
+    ``n_j^o = |{i_o : s_{i_o} = j}|`` the number of *uncensored* members,
+
+        ``lambda*_j | alpha*_j ~ IGamma(d + n_j^o,
+          gamma + sum_{i in j} t_i**alpha*_j)``,
+
+    where the sum runs over every member, censored or not, and is evaluated at
+    the cluster's current shape ``alpha*_j``.  A censored member contributes
+    its transformed time ``z`` to the sum but does **not** raise the
+    inverse-gamma shape: it is a survival factor, so it appears with exponent
+    ``d`` rather than ``d + 1`` in the observation's base-measure density.
+    Hence an all-censored cluster (``n_j^o = 0``) has shape ``d`` alone, which
+    is exactly the case a ``d + n_j`` shortcut gets right by accident only for
+    uncensored data.
+
+    The draw is exact: ``lambda = 1 / G`` with
+    ``G ~ Gamma(shape, rate=gamma + sum)``.  One gamma variate is consumed per
+    call, and nothing else, so the per-cluster loop in
+    :func:`sample_step_b` has a fixed random-number stream.
+
+    After the draw, the cluster location and the per-observation latent values
+    of its members are updated together, because invariant 1 of plan
+    Section 2.1 requires ``lam == lam_star[s]`` at all times; updating only
+    ``lam_star`` would leave the state inconsistent until the caller synced it.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place: ``lam_star[j]`` and ``lam[members]`` are replaced.
+        ``alpha_star``, ``nu``, ``gamma`` and ``phi`` are untouched.
+    data : SurvData
+        Dataset on the transformed scale; supplies the member times and their
+        censoring indicators.
+    prior : DPPrior
+        Supplies the base-measure shape ``d``.
+    j : int
+        Cluster index in ``0 .. n_star-1``.  This is the test entry point of
+        plan Section 3.3: a test fixes the rest of the state, calls this many
+        times and compares the draws with ``scipy.stats.invgamma`` (test 10 of
+        plan Section 7.2).
+    rng : np.random.Generator
+        Random generator; the only source of randomness.
+
+    Raises
+    ------
+    IndexError
+        If ``j`` is out of range.
+    ValueError
+        If the state and the data describe different datasets, or ``prior.d``
+        is not a positive integer.
+    StateInvariantError
+        If cluster ``j`` is empty or ``n_j`` disagrees with its member list --
+        i.e. the state was not compacted before step (b).
+
+    Notes
+    -----
+    ``lambda*_j``'s conditional does not involve ``nu`` or ``phi``, so a
+    refresh leaves the ``phi >= max_j alpha*_j`` invariant of plan Section 2.1
+    untouched.  The shape ``alpha*_j`` is refreshed by the
+    Damien-Wakefield-Walker auxiliary-variable update of plan Section 2.2(b),
+    which uses this new ``lambda*_j``.
+    """
+    _validate_step_b_inputs(state, data, prior)
+    shape, scale = _lam_star_parameters(state, data, prior, j=j)
+    lam = float(1.0 / rng.gamma(shape=shape, scale=1.0 / scale))
+    if not np.isfinite(lam) or lam <= 0.0:
+        raise StateInvariantError(
+            f"the lambda* draw for cluster {j} was not a finite positive number"
+        )
+    members = np.flatnonzero(state.s == j)
+    state.lam_star[j] = lam
+    state.lam[members] = lam
+
+
+def sample_step_b(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    rng: np.random.Generator,
+) -> None:
+    """Run step (b): refresh every cluster location, in ``j`` order.
+
+    Plan Section 3.4 fixes the order ``j = 0 .. n_star-1``; the order is part
+    of the specification because it fixes the random-number stream and
+    therefore the golden regression test of plan Section 7.5.  Each cluster
+    consumes exactly one gamma variate here (the ``lambda*_j`` draw), so a
+    sweep's step (b) consumes ``n_star`` variates in a deterministic
+    sequence -- a property the caller relies on when it replays a seed.
+
+    This function is the scale half of step (b): ``lambda*_j`` is refreshed by
+    :func:`refresh_cluster`.  The shape ``alpha*_j`` has its own
+    auxiliary-variable update (plan Section 2.2(b), Eqs. A.5-A.6), which uses
+    the freshly drawn ``lambda*_j`` and the current ``alpha*_j``; keeping the
+    two halves in one entry point means the sweep has a single step-(b) call
+    site and the ``alpha_i = alpha*_{s_i}`` / ``lambda_i = lambda*_{s_i}``
+    synchronisation happens once per cluster rather than once per parameter.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place.  Must be compacted: step (a) leaves it so, and
+        :func:`refresh_cluster` rejects a cluster whose member list disagrees
+        with ``n_j``.  ``nu``, ``gamma`` and ``phi`` are held fixed here; step
+        (c) refreshes them, in that order, after this step.
+    data, prior :
+        As in :func:`refresh_cluster`.
+    rng : np.random.Generator
+        Random generator; the only source of randomness.
+
+    Raises
+    ------
+    ValueError
+        If the state and the data describe different datasets.
+    StateInvariantError
+        If a cluster is empty or ``n_j`` disagrees with the labels, or the
+        final state violates a Section 2.1 invariant.
+
+    Notes
+    -----
+    ``state.check_invariants(prior)`` runs once at the end of the loop rather
+    than after every cluster: the cheap per-cluster consistency checks already
+    live in :func:`_cluster_members`, and the full check is what catches a
+    desynchronised ``lam_star``/``lam`` pair before it reaches step (c).
+    """
+    _validate_step_b_inputs(state, data, prior)
+    for j in range(state.n_star):
+        refresh_cluster(state, data, prior, j=j, rng=rng)
+    state.check_invariants(prior)
