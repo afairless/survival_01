@@ -79,6 +79,7 @@ __all__ = [
     "sample_step_a_for_obs",
     "sample_step_b",
     "sample_step_c",
+    "sweep",
     "trapezoid_log_weights",
     "transform_time",
 ]
@@ -2964,3 +2965,115 @@ def sample_step_c(
     refresh_phi(state, prior, rng=rng)
     refresh_gamma(state, prior, rng=rng)
     state.check_invariants(prior)
+
+
+def sweep(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    grid: AlphaGrid,
+    rng: np.random.Generator,
+) -> float:
+    """Run one complete Gibbs sweep and return its log-posterior.
+
+    This is the sweep of plan Section 3.4, whose order *is* the
+    specification: the draw from one sweep is only a draw from the target if
+    the three steps run in this sequence.
+
+    1. **Step (a)** -- :func:`sample_step_a` resamples every observation's
+       ``(alpha_i, lambda_i, s_i)`` sequentially over ``i = 0 .. n-1``.  The
+       per-sweep precompute listed as item 1 of Section 3.4 (``Tau = T**phi``,
+       the ``(n, M)`` integrand, the ``(n,)`` prior-predictive masses ``q_0``
+       and the ``(n, n_star)`` log-kernel matrix) happens at the top of
+       ``sample_step_a``, so the sweep does not duplicate it: the step needs
+       the fresh ``q_0`` after the previous step (c) and cannot reuse a value
+       computed by the caller.
+    2. **Step (b)** -- :func:`sample_step_b` refreshes each cluster's scale
+       ``lambda*_j`` from its inverse-gamma conditional and then its shape
+       ``alpha*_j`` by the auxiliary-variable scheme, over
+       ``j = 0 .. n_star-1``.  It must follow step (a) because it operates on
+       the labels and sizes that step (a) leaves behind.
+    3. **Step (c)** -- :func:`sample_step_c` refreshes ``nu`` (the non-conjugate
+       Escobar-West update), then ``phi``, then ``gamma``.  It must follow
+       step (b): the Pareto update's lower bound is
+       ``max(b_phi, max_j alpha*_j)``, read from the freshly refreshed cluster
+       shapes, and its shape is ``a_phi + n_star``, read from the refreshed
+       partition.
+    4. **Log-posterior** -- the unnormalised collapsed target of plan
+       Section 3.7 is recomputed for the resulting state and returned, so the
+       chain driver can store it with the draw it belongs to (plan
+       Section 3.4 item 5 and ``DPChains.log_post``) without evaluating it
+       twice.
+
+    Nothing here is a special case for the initial state: initialisation only
+    produces a valid :class:`DPState` and the first sweep of a chain is the
+    same call as every other sweep (plan Section 3.6).
+
+    The random-number stream is the concatenation, in this fixed order, of the
+    three steps' documented streams: step (a) consumes one uniform per
+    observation plus a grid uniform and an inverse-gamma variate for every new
+    cluster; step (b) consumes one gamma, and per cluster the ``alpha*``
+    auxiliaries, in ``j`` order; step (c) consumes one beta and one uniform and
+    one gamma for ``nu``, one Pareto for ``phi`` and one gamma for ``gamma``.
+    :func:`log_post` draws nothing.  Replaying a seed therefore reproduces the
+    whole chain.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place; the object identity is preserved.  On return it is
+        compacted and satisfies every Section 2.1 invariant including
+        ``phi >= prior.b_phi``.
+    data : SurvData
+        Dataset on the transformed scale, the same dataset the state was
+        fitted to and the grid was built from.
+    prior : DPPrior
+        Fixed hyperparameters.
+    grid : AlphaGrid
+        Grid built from ``data`` by :func:`make_grid`; its cached ``t**u``
+        rows are the per-chain precompute that makes the new-cluster shape
+        draw cheap.
+    rng : np.random.Generator
+        Random generator; the only source of randomness.  One generator is
+        threaded through all three steps, which is what makes a seed replay
+        the whole sweep rather than one conditional.
+
+    Returns
+    -------
+    float
+        ``log_post(state, data, prior)`` evaluated *after* the three steps, on
+        the stored-draw state.  Plan Section 3.3 sketches the signature as
+        returning ``None``; the value is returned because Section 3.4 item 5
+        requires the recomputation as part of the sweep and the chain driver
+        stores it in ``DPChains.log_post``.  A caller that does not need it
+        (for instance a burn-in sweep) simply ignores the return value; the
+        computation is the vectorised ``~0.05 ms`` pass budgeted in plan
+        Section 8 and is not repeated.
+
+    Raises
+    ------
+    ValueError
+        If the state, data and grid do not describe the same dataset, or a
+        prior hyperparameter is not finite and strictly positive -- raised by
+        the first step that can see the inconsistency, before it consumes any
+        randomness.
+    StateInvariantError
+        If a step's draw is not finite and positive, if ``phi < prior.b_phi``
+        on entry, or if the final state violates a Section 2.1 invariant.  A
+        raise means a bookkeeping or arithmetic error, never an input error.
+
+    Notes
+    -----
+    Tests of plan Section 7.2 check the individual conditionals; this entry
+    point is checked for the *joint* behaviour the order produces: that the
+    three steps run exactly once each, in the (a)-(b)-(c) order, sharing the
+    supplied generator and the supplied state object, and that the returned
+    score is the one of the resulting state (``tests/test_sweep.py``).
+    Mis-ordering, such as step (c) before step (b), leaves the conditionals
+    individually correct and is caught only by such a joint test.
+    """
+    sample_step_a(state, data, prior, grid=grid, rng=rng)
+    sample_step_b(state, data, prior, rng=rng)
+    sample_step_c(state, data, prior, rng=rng)
+    return log_post(state, data, prior)
