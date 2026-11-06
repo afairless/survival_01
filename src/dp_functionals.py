@@ -16,9 +16,12 @@ inference adds the two steps of the paper's Section 3:
 The default ``method="exact"`` is the Rao-Blackwellised limit of the paper's
 ``L -> infinity`` estimator: it replaces the ``L`` Monte Carlo atom draws of
 step (ii) by the truncated weights themselves.  It therefore has no ``L`` noise
-and is the path the figures use.  The sampling-based ``method="mc"`` variant is
-added by the following implementation step; this module currently rejects it
-with :class:`NotImplementedError`.
+and is the path the figures use.  ``method="mc"`` reproduces steps (ii)-(iii)
+of the paper literally: for each stored draw it takes one realisation ``G_b``,
+draws ``L`` atoms from it, and averages the ``L`` kernels.  Both methods prune
+the negligible stick-breaking tail first and evaluate survival, density and
+hazard from the *same* atoms, so the MC hazard is the ratio of two averages
+over one atom set rather than a ratio of two independent estimates.
 
 Time scale
 ----------
@@ -40,13 +43,13 @@ why the map lives in one function and test 26 checks it explicitly.
 Scope
 -----
 In scope: posterior survival, CDF, density and hazard functionals, by exact
-mixture evaluation over a pruned DP realisation.
+mixture evaluation over a pruned DP realisation (``method="exact"``) or by
+the paper's ``L``-atom Monte Carlo estimator (``method="mc"``).
 
-Out of scope (added by later steps or deliberately absent): the Monte Carlo
-estimator, quantile functionals, prior functionals, two-population
-comparisons, plotting, and any re-sampling of ``theta``.  Nothing here draws
-from the posterior of the sampler; it consumes :class:`DPChains` produced by
-:mod:`src.dp_gibbs`.
+Out of scope (added by later steps or deliberately absent): quantile
+functionals, prior functionals, two-population comparisons, plotting, and any
+re-sampling of ``theta``.  Nothing here draws from the posterior of the
+sampler; it consumes :class:`DPChains` produced by :mod:`src.dp_gibbs`.
 """
 
 from __future__ import annotations
@@ -67,6 +70,7 @@ from src.dp_weibull import (
 __all__ = [
     "FunctionalSettings",
     "Functionals",
+    "functionals_from_mc_realizations",
     "functionals_from_realizations",
     "posterior_functionals",
 ]
@@ -81,9 +85,10 @@ class FunctionalSettings:
     method : str
         ``"exact"`` (default) evaluates the mixture functional from the
         truncated weights of one ``G_b``, the Rao-Blackwellised limit of the
-        paper's ``L``-draw estimator.  ``"mc"`` reproduces the paper's step
-        (ii)-(iii) literally; it is implemented by the next step and is
-        rejected here.
+        paper's ``L``-draw estimator.  ``"mc"`` reproduces the paper's steps
+        (ii)-(iii) literally: draw ``L`` atoms from ``G_b`` and average their
+        kernels.  The exact path is used for the figures; the MC path exists
+        to check that the paper's estimator is being computed at all.
     L : int
         Number of atom draws ``L`` for ``method="mc"``.  Ignored by the exact
         path; kept in the container so that one settings object describes
@@ -154,8 +159,9 @@ class Functionals:
         correct limit of the ratio.
     meta : dict
         Provenance of the run: ``method``, ``J_common``, ``atom_tol``,
-        ``n_draws``, ``seed`` and, for :func:`posterior_functionals`, the
-        chain settings seeds and ``t_max``.
+        ``n_draws``, ``seed``, the atom-draw count ``L`` on the Monte Carlo
+        path and, for :func:`posterior_functionals`, the chain settings seeds
+        and ``t_max``.
 
     The container validates its own shape and bounds so that a transposed
     array or a wrong number of grid points fails here, at the storage
@@ -430,6 +436,147 @@ def functionals_from_realizations(
     )
 
 
+def _as_atom_draw_count(L: object, name: str = "L") -> int:
+    """Validate the Monte Carlo atom-draw count ``L``.
+
+    ``L`` must be a positive integer.  Booleans are rejected explicitly
+    because ``True`` is an ``int`` in Python and would silently mean ``L = 1``.
+    """
+    if isinstance(L, bool) or not isinstance(L, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer, got {L!r}")
+    count = int(L)
+    if count < 1:
+        raise ValueError(f"{name} must be at least 1, got {L!r}")
+    return count
+
+
+def _draw_atoms_from_realization(
+    realization: DPRealization, n_atoms: int, rng: np.random.Generator
+) -> DPRealization:
+    """Draw ``n_atoms`` i.i.d. atoms from a realisation, as equal weights.
+
+    Step (ii) of the paper's Section 3 draws ``theta^0_{bl} ~ G_b``.  For a
+    truncated ``G_b = sum_j w_j delta_(alpha_j, lambda_j)`` that is a
+    categorical draw over the atom indices; the result is represented as a
+    :class:`DPRealization` whose atoms carry equal weight ``1 / n_atoms``, so
+    that evaluating it gives exactly the estimator
+
+        ``H_b = (1 / L) sum_l H(K_W(. | theta^0_{bl}))``
+
+    of step (iii).  Keeping one shared set of drawn atoms is what makes the
+    hazard ``f / S`` a ratio over the *same* ``L`` atoms rather than a ratio
+    of two independent Monte Carlo averages.
+    """
+    weights = np.asarray(realization.weights, dtype=np.float64)
+    total = float(np.sum(weights))
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(
+            "realisation weights must carry positive total mass to draw atoms"
+        )
+    probabilities = weights / total
+    indices = rng.choice(probabilities.size, size=n_atoms, p=probabilities)
+    atom_weights = np.full(n_atoms, 1.0 / n_atoms, dtype=np.float64)
+    atom_weights /= np.sum(atom_weights)
+    return DPRealization(
+        weights=atom_weights,
+        alphas=np.asarray(realization.alphas)[indices],
+        lambdas=np.asarray(realization.lambdas)[indices],
+        precision=realization.precision,
+    )
+
+
+def functionals_from_mc_realizations(
+    realizations: Iterable[DPRealization],
+    t_grid: object,
+    data: SurvData,
+    *,
+    L: int = 2_500,
+    rng: np.random.Generator | None = None,
+    meta: dict[str, Any] | None = None,
+) -> Functionals:
+    """Evaluate the paper's Monte Carlo functionals from DP realisations.
+
+    This is the literal version of steps (ii)-(iii) of the paper's Section 3
+    and the low-level engine behind ``posterior_functionals(method="mc")``.
+    For each supplied ``G_b`` it
+
+    1. draws ``L`` atoms ``theta^0_{bl} ~ G_b`` from the realisation's weights
+       (one shared set, used for every functional);
+    2. evaluates the mixture implied by those atoms,
+
+           ``S_hat_b(t) = (1 / L) sum_l exp(-t**alpha_l / lambda_l)``,
+           ``f_hat_b(t) = (1 / L) sum_l alpha_l t**(alpha_l-1) / lambda_l
+                          exp(-t**alpha_l / lambda_l)``,
+
+       and reports ``h_hat_b = f_hat_b / S_hat_b`` from the same atoms;
+    3. maps the results back to the original time scale with
+       :func:`src.dp_gibbs.inverse_map`.
+
+    No pruning happens here: the caller decides whether the tail of ``G_b``
+    should be dropped (both production paths prune with ``atom_tol`` first).
+    This keeps a single-atom test realisation exact and lets tests compare the
+    MC and exact estimators on identical ``G_b`` draws.
+
+    Monte Carlo noise is ``O(1 / sqrt(L))`` in the survival and the density;
+    the hazard is a ratio of two averages over the same atoms, hence biased at
+    ``O(1 / L)`` but consistent.  The survival and density estimators are
+    conditionally unbiased for their finite-sum counterparts on the truncated
+    ``G_b`` (plan test 22).
+
+    Parameters
+    ----------
+    realizations : iterable of DPRealization
+        One ``G_b`` per functional row.  Each must have weights that sum to
+        one, exactly as for :func:`functionals_from_realizations`; the atom
+        law is otherwise not a probability distribution.
+    t_grid : array-like
+        Original-scale times, 1-D, finite and strictly positive.
+    data : SurvData
+        The dataset whose ``t_max`` defines the inverse map.
+    L : int, optional
+        Number of atoms drawn from each realisation (default 2500, the paper's
+        value).
+    rng : numpy.random.Generator or None, optional
+        Random source for the atom draws.  ``None`` uses fresh OS entropy.
+    meta : dict, optional
+        Provenance to store on the result; ``method``, ``L``, ``n_draws`` and
+        ``t_max`` are filled in here.
+
+    Returns
+    -------
+    Functionals
+        Arrays of shape ``(n_draws, len(t_grid))`` on the original scale.
+    """
+    if not isinstance(data, SurvData):
+        raise ValueError("data must be a SurvData instance")
+    n_atoms = _as_atom_draw_count(L)
+    if rng is not None and not isinstance(rng, np.random.Generator):
+        raise ValueError("rng must be a numpy.random.Generator or None")
+    generator = np.random.default_rng() if rng is None else rng
+
+    def empirical_realizations() -> Iterable[DPRealization]:
+        for realization in realizations:
+            if not isinstance(realization, DPRealization):
+                raise ValueError(
+                    "realizations must contain only DPRealization instances, "
+                    f"got {type(realization).__name__}"
+                )
+            total = float(np.sum(realization.weights))
+            if not np.isclose(total, 1.0, rtol=0.0, atol=1e-10):
+                raise ValueError(
+                    "realisation weights must sum to one, got "
+                    f"{total!r}; call DPRealization.pruned or use a proper draw"
+                )
+            yield _draw_atoms_from_realization(realization, n_atoms, generator)
+
+    out_meta: dict[str, Any] = dict(meta) if meta is not None else {}
+    out_meta["method"] = "mc"
+    out_meta["L"] = n_atoms
+    return functionals_from_realizations(
+        empirical_realizations(), t_grid, data, meta=out_meta
+    )
+
+
 def posterior_functionals(
     chains: DPChains | Sequence[DPChains],
     t_grid: object,
@@ -451,10 +598,14 @@ def posterior_functionals(
     3. evaluates the exact mixture ``S``, ``F``, ``f`` and ``h`` on
        ``t_grid`` and maps them back to the original time scale.
 
-    This is the Rao-Blackwellised estimator of the paper's Section 3: the
-    ``L`` atom draws of step (ii) are replaced by the truncated weights, which
-    is their ``L -> infinity`` limit and has no Monte Carlo noise in ``L``.
-    The Monte Carlo path is a separate, later implementation step.
+    ``settings.method="exact"`` (default) is the Rao-Blackwellised estimator
+    of the paper's Section 3: the ``L`` atom draws of step (ii) are replaced by
+    the truncated weights, which is their ``L -> infinity`` limit and has no
+    Monte Carlo noise in ``L``.  ``settings.method="mc"`` draws
+    ``settings.L`` atoms from each pruned ``G_b`` instead, reproducing the
+    paper's estimator literally; see :func:`functionals_from_mc_realizations`.
+    Both methods prune before evaluating kernels and use one shared atom set
+    for the hazard.
 
     Parameters
     ----------
@@ -478,22 +629,11 @@ def posterior_functionals(
         ``(n_draws, len(t_grid))`` functionals for every stored draw, plus
         provenance in ``meta``.
 
-    Raises
-    ------
-    NotImplementedError
-        If ``settings.method == "mc"``.  The paper's literal Monte Carlo
-        estimator is added by the next step; silently computing the exact
-        path under an ``"mc"`` request would make test 22 compare a method
-        with itself.
     """
     if settings is None:
         settings = FunctionalSettings()
     if not isinstance(settings, FunctionalSettings):
         raise ValueError("settings must be a FunctionalSettings instance")
-    if settings.method != "exact":
-        raise NotImplementedError(
-            "method='mc' is not implemented yet; use method='exact'"
-        )
 
     sequence = _as_chain_sequence(chains)
     data = sequence[0].data
@@ -508,7 +648,16 @@ def posterior_functionals(
     j_common = truncation_number_for_posterior(max_nu, n, epsilon)
 
     resolved_seed = _resolve_seed(seed)
-    rng = np.random.default_rng(resolved_seed)
+    if settings.method == "mc":
+        # Two independent child streams: one for the G_b draws, one for the
+        # atoms drawn from each G_b.  Reusing a single stream for both would
+        # couple the atom indices to the realisation they are drawn from.
+        realization_seed, atom_seed = np.random.SeedSequence(resolved_seed).spawn(2)
+        rng = np.random.default_rng(realization_seed)
+        atom_rng = np.random.default_rng(atom_seed)
+    else:
+        rng = np.random.default_rng(resolved_seed)
+        atom_rng = None
 
     def realizations() -> Iterable[DPRealization]:
         for chain in sequence:
@@ -534,4 +683,9 @@ def posterior_functionals(
         "n_chains": len(sequence),
         "chain_seeds": tuple(chain.settings.seed for chain in sequence),
     }
+    if settings.method == "mc":
+        meta["L"] = int(settings.L)
+        return functionals_from_mc_realizations(
+            realizations(), t_grid, data, L=settings.L, rng=atom_rng, meta=meta
+        )
     return functionals_from_realizations(realizations(), t_grid, data, meta=meta)

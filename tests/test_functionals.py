@@ -27,8 +27,8 @@ These tests pin the three things that are easiest to get wrong silently:
 
 The module also tests the production ``posterior_functionals`` path itself:
 the common truncation level ``J``, the shape and provenance of the result,
-seed-based replayability, and rejection of the not-yet-implemented ``"mc"``
-method instead of silently computing the exact path under a different label.
+and seed-based replayability.  The Monte Carlo path (``method="mc"``) of plan
+test 22 lives in ``tests/test_functionals_mc.py``.
 """
 
 from typing import Any
@@ -417,16 +417,16 @@ class TestPosteriorFunctionals:
         with pytest.raises(ValueError, match=r"same number of observations"):
             posterior_functionals([chain_a, chain_b], t_grid, seed=1)
 
-    def test_rejects_the_not_yet_implemented_mc_method(self) -> None:
-        """``"mc"`` must not silently compute the exact path."""
+    def test_the_exact_path_is_the_default(self) -> None:
+        """Omitting ``settings`` selects the exact estimator, not a fallback."""
         data = _data()
         chain = sample_chain(data, PRIOR, _settings())
         t_grid = np.linspace(0.05, 1.0, 5)
 
-        with pytest.raises(NotImplementedError, match=r"method='mc'"):
-            posterior_functionals(
-                chain, t_grid, settings=FunctionalSettings(method="mc"), seed=1
-            )
+        fit = posterior_functionals(chain, t_grid, seed=1)
+
+        assert fit.meta["method"] == "exact"
+        assert "L" not in fit.meta
 
     def test_rejects_unknown_settings(self) -> None:
         """An unknown method is an input error, not a fallback."""
