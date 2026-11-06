@@ -192,6 +192,42 @@ def truncation_number(precision, epsilon=1e-4):
     return max(j, 1)
 
 
+def truncation_number_for_posterior(max_nu, n, epsilon=1e-4):
+    """Common truncation level J for a whole posterior run.
+
+    A posterior draw has precision ``nu + n`` (the prior precision plus one
+    for each observation), so the paper's common-J rule
+        J = ceil(log(epsilon) / log((n + max_nu) / (n + 1 + max_nu)))
+    is exactly ``truncation_number(n + max_nu, epsilon)``.  It is given a name
+    of its own because the one-J-for-all-draws rule is easy to get wrong:
+    using the per-draw rule ``truncation_number(nu_b + n)`` inside the
+    sampler changes the number of atoms between iterations, so the draws no
+    longer target a single truncated posterior and the functional estimates
+    are not comparable across draws.  ``truncation_number`` is increasing in
+    the precision, so fixing J at ``max_nu`` makes it at least as large as
+    every per-draw J.
+
+    Parameters
+    ----------
+    max_nu : float
+        Largest DP precision drawn in the run (``max_b nu_b``).
+    n : int
+        Number of observations in the data set.
+    epsilon : float, optional
+        Truncation tolerance, in (0, 1).
+
+    Returns
+    -------
+    int
+        The common truncation level J, at least 1.
+    """
+    if max_nu < 0.0:
+        raise ValueError("max_nu must be non-negative")
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    return truncation_number(n + max_nu, epsilon)
+
+
 def stick_breaking_weights(precision, n_terms, rng):
     """Draw truncated stick-breaking weights.
 
