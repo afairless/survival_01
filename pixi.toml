@@ -5,6 +5,10 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+test = "pytest -m 'not slow and not paper'"
+test-all = "pytest"
+lint = "ruff check src tests && ruff format --check src tests"
+typecheck = "pyright"
 
 [dependencies]
 numpy = ">=2.5.4,<3"
@@ -13,3 +17,11 @@ polars = ">=2.1.0,<3"
 pyarrow = ">=26.0.0,<27"
 scipy = ">=1.18.1,<2"
 matplotlib = ">=3.11.2,<4"
+
+[feature.dev.dependencies]
+pytest = ">=8,<9"
+ruff = ">=0.6,<1"
+pyright = ">=1.1,<2"
+
+[environments]
+default = { features = ["dev"], solve-group = "default" }

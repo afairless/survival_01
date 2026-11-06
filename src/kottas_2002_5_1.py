@@ -1,33 +1,31 @@
 #! /usr/bin/env python3
 
-from dataclasses import dataclass, field, InitVar
+from dataclasses import dataclass, field
+
 import numpy as np
-from scipy.stats import lognorm, binom, gamma
-import matplotlib.pyplot as plt
+from scipy.stats import lognorm
 
 from src.dp_weibull import (
-    weibull_from_median_iqr,
     b_gamma_b_phi_from_weibull,
-    sample_prior_hyperparameters,
     sample_dp_prior,
-    sample_dp_posterior,
-    )
+    sample_prior_hyperparameters,
+    weibull_from_median_iqr,
+)
 
 
 @dataclass
-class TwoLognormalMix():
+class TwoLognormalMix:
+    mu_1: float = 0
+    mu_2: float = 0
+    sigma_1: float = 1
+    sigma_2: float = 1
+    p: float = 0.5
+    n: int = 100
+    seed: int = 250118
 
-    mu_1: float=0
-    mu_2: float=0
-    sigma_1: float=1
-    sigma_2: float=1
-    p: float=0.5
-    n: int=100
-    seed: int=250118
-
-    p1_n: int=field(init=False)
-    p2_n: int=field(init=False)
-    lgn_mix: np.ndarray=field(init=False)
+    p1_n: int = field(init=False)
+    p2_n: int = field(init=False)
+    lgn_mix: np.ndarray = field(init=False)
 
     def __post_init__(self):
 
@@ -35,21 +33,22 @@ class TwoLognormalMix():
         self.p2_n = self.n - self.p1_n
 
         lgn_1 = lognorm.rvs(
-            s=np.sqrt(self.sigma_1), 
-            scale=np.exp(self.mu_1), 
-            size=self.p1_n, 
-            random_state=self.seed)
+            s=np.sqrt(self.sigma_1),
+            scale=np.exp(self.mu_1),
+            size=self.p1_n,
+            random_state=self.seed,
+        )
         lgn_2 = lognorm.rvs(
-            s=np.sqrt(self.sigma_2), 
-            scale=np.exp(self.mu_2), 
-            size=self.p2_n, 
-            random_state=self.seed)
+            s=np.sqrt(self.sigma_2),
+            scale=np.exp(self.mu_2),
+            size=self.p2_n,
+            random_state=self.seed,
+        )
         self.lgn_mix = np.append(lgn_1, lgn_2)
 
 
 def main() -> None:
-
-    '''
+    """
     mu_1 = 0
     mu_2 = 1.2
     sigma_1 = 0.25
@@ -70,8 +69,8 @@ def main() -> None:
     gamma.rvs(a=alpha, loc=0, scale=1/beta, size=n, random_state=seed)
     x = np.linspace(start=0, stop=12, num=1000)
     gy = gamma.pdf(x=x, a=alpha, loc=0, scale=1/beta)
-    '''
-    '''
+    """
+    """
     plt.clf()
     plt.close()
     plt.hist(lgn_mix.lgn_mix, bins=50)
@@ -84,30 +83,23 @@ def main() -> None:
     plt.plot(x, gy)
 
     plt.show()
-    '''
-
+    """
 
     rng = np.random.default_rng(887373)
-    alpha_tilde, lambda_tilde = weibull_from_median_iqr(
-        median=1.1727, iqr=1.3679)
+    alpha_tilde, lambda_tilde = weibull_from_median_iqr(median=1.1727, iqr=1.3679)
     b_gamma, b_phi = b_gamma_b_phi_from_weibull(alpha_tilde, lambda_tilde)
     a_nu = 2.0
     b_nu = 0.9
-    a_gamma=1.0
-    a_phi=2.0
+    a_gamma = 1.0
+    a_phi = 2.0
 
     nu, gamma, phi = sample_prior_hyperparameters(
-        a_nu, b_nu, a_gamma, b_gamma, a_phi, b_phi, rng=rng)
+        a_nu, b_nu, a_gamma, b_gamma, a_phi, b_phi, rng=rng
+    )
 
-    G = sample_dp_prior(nu, gamma, phi, epsilon=1e-4, rng=rng)
-    #G = sample_dp_posterior(nu, gamma, phi, theta, d=2, epsilon=1e-4, rng=rng)
-
-
-
+    sample_dp_prior(nu, gamma, phi, epsilon=1e-4, rng=rng)
+    # G = sample_dp_posterior(nu, gamma, phi, theta, d=2, epsilon=1e-4, rng=rng)
 
 
-
-
-if __name__ == '__main__()':
+if __name__ == "__main__()":
     main()
-

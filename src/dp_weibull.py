@@ -74,12 +74,7 @@ def weibull_sf(t, alpha, lam):
 def weibull_pdf(t, alpha, lam):
     """k_W(t | alpha, lambda)."""
     t = np.asarray(t, dtype=float)
-    return (
-        alpha
-        * np.power(t, alpha - 1.0)
-        / lam
-        * np.exp(-np.power(t, alpha) / lam)
-    )
+    return alpha * np.power(t, alpha - 1.0) / lam * np.exp(-np.power(t, alpha) / lam)
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +233,7 @@ class DPRealization:
         self.weights = np.asarray(self.weights, dtype=float)
         self.alphas = np.asarray(self.alphas, dtype=float)
         self.lambdas = np.asarray(self.lambdas, dtype=float)
-        if not (
-            self.weights.shape == self.alphas.shape == self.lambdas.shape
-        ):
+        if not (self.weights.shape == self.alphas.shape == self.lambdas.shape):
             raise ValueError("weights, alphas and lambdas must have equal shape")
         if np.any(self.weights < 0.0):
             raise ValueError("weights must be non-negative")
@@ -258,9 +251,7 @@ class DPRealization:
     # The mixture F(t; G) = sum_j w_j K_W(t | alpha_j, lambda_j), etc.
     def cdf(self, t):
         z = self._scaled_time(t)
-        return np.sum(
-            self.weights[:, None] * (1.0 - np.exp(-z)), axis=0
-        )
+        return np.sum(self.weights[:, None] * (1.0 - np.exp(-z)), axis=0)
 
     def survival(self, t):
         z = self._scaled_time(t)
@@ -271,12 +262,7 @@ class DPRealization:
         alpha = self.alphas[:, None]
         lam = self.lambdas[:, None]
         z = np.power(t[None, :], alpha) / lam
-        kernel = (
-            alpha
-            * np.power(t[None, :], alpha - 1.0)
-            / lam
-            * np.exp(-z)
-        )
+        kernel = alpha * np.power(t[None, :], alpha - 1.0) / lam * np.exp(-z)
         return np.sum(self.weights[:, None] * kernel, axis=0)
 
     def hazard(self, t):
@@ -378,9 +364,7 @@ def _demo():
     # Section 5.1 data-generating distribution: 0.8 LN(0, 0.25)
     # + 0.2 LN(1.2, 0.02).  Section 4.3 prior guesses: roughly the
     # median and IQR of that distribution.
-    alpha_tilde, lambda_tilde = weibull_from_median_iqr(
-        median=1.1727, iqr=1.3679
-    )
+    alpha_tilde, lambda_tilde = weibull_from_median_iqr(median=1.1727, iqr=1.3679)
     b_gamma, b_phi = b_gamma_b_phi_from_weibull(alpha_tilde, lambda_tilde)
     print(f"alpha_tilde = {alpha_tilde:.4f}, lambda_tilde = {lambda_tilde:.4f}")
     print(f"b_gamma     = {b_gamma:.4f}, b_phi         = {b_phi:.4f}")
@@ -409,8 +393,10 @@ def _demo():
             rng=rng,
         )
         G = sample_dp_prior(nu, gamma, phi, epsilon=1e-4, rng=rng)
-        print(f"{label:14s}: nu={nu:6.3f}, gamma={gamma:6.3f}, "
-              f"phi={phi:6.3f}, atoms={G.n_atoms}")
+        print(
+            f"{label:14s}: nu={nu:6.3f}, gamma={gamma:6.3f}, "
+            f"phi={phi:6.3f}, atoms={G.n_atoms}"
+        )
 
         axes[0].plot(t_grid, G.survival(t_grid), label=label)
         axes[1].plot(t_grid, G.pdf(t_grid), label=label)
