@@ -81,18 +81,51 @@ grid does not bracket is an error rather than a silent clamp: at ``t = 0``
 the transformed time is ``1`` and the mixture CDF is already positive, which
 is exactly why small probabilities may be unreachable on a positive grid.
 
+Two-population comparisons
+--------------------------
+:func:`compare` implements plan Section 4.4 for two independent fits of the
+same time scale (e.g. treatments A and B of Section 5.2).  It returns, on the
+one grid both fits carry,
+
+* ``ratio``: the hazard ratio ``h_B(t) / h_A(t)`` per draw and grid point
+  (Figure 5a; the paper calls the hazard ``lambda``);
+* ``difference``: ``F_B(t) - F_A(t)`` per draw and grid point (Figure 5b), so
+  a positive difference means population B fails earlier at that time;
+* ``eta_a``, ``eta_b`` and ``eta_difference = eta_a - eta_b`` per draw, plus
+  ``prob_eta_a_gt_eta_b``, the posterior probability that A's quantile is the
+  larger one (Figure 5c, the paper's ``Pr(eta_A > eta_B | D) = 0.9135``).
+
+Because the two fits come from independent chains, draw ``b`` of A is paired
+with draw ``b`` of B: the product of the two posteriors is a sample from the
+joint posterior, so pairing is valid only for **independent fits with the same
+number of stored draws**.  The fit objects cannot prove independence, so this
+is a documented obligation of the caller rather than a checked invariant.
+
+``eta`` is the quantile of level ``p`` (default the median, ``p = 0.5``).
+:class:`Functionals` stores only the evaluated ``S``/``F`` arrays, not the DP
+realisations, so the quantile is found by inverting each draw's CDF
+*piecewise linearly on ``t_grid``* (the same first guess
+:func:`_invert_cdf` starts from, before its Newton polish).  Grid inversion
+is ``O(h**2)`` in ``t`` and is what Figure 5c needs -- a per-draw ranking of
+two clearly separated populations -- not a substitute for the exact per-draw
+inversion of :func:`posterior_quantiles`.  The ranking, and therefore
+``Pr(eta_A > eta_B)``, is invariant under any strictly increasing change of
+time scale, which is why the comparison is meaningful on the original scale.
+
 Scope
 -----
 In scope: posterior survival, CDF, density and hazard functionals, by exact
 mixture evaluation over a pruned DP realisation (``method="exact"``) or by
 the paper's ``L``-atom Monte Carlo estimator (``method="mc"``); quantile
-functionals by inverting the exact mixture CDF per draw; and prior
-functionals from prior DP realisations, used as the Figure 2 prior bands.
+functionals by inverting the exact mixture CDF per draw; prior functionals
+from prior DP realisations, used as the Figure 2 prior bands; and
+two-population comparisons of those functionals.
 
-Out of scope (added by later steps or deliberately absent): two-population
-comparisons, plotting, and any re-sampling of ``theta``.  Nothing here draws
-from the posterior of the sampler; it consumes :class:`DPChains` produced by
-:mod:`src.dp_gibbs`, or a :class:`DPPrior` when there are no data.
+Out of scope (deliberately absent): plotting, model comparison, and any
+re-sampling of ``theta``.  Nothing here draws from the posterior of the
+sampler; it consumes :class:`DPChains` produced by :mod:`src.dp_gibbs`, or a
+:class:`DPPrior` when there are no data.  Two-population comparisons are in
+scope through :func:`compare`.
 """
 
 from __future__ import annotations
@@ -116,6 +149,7 @@ from src.dp_weibull import (
 __all__ = [
     "FunctionalSettings",
     "Functionals",
+    "compare",
     "functionals_from_mc_realizations",
     "functionals_from_realizations",
     "posterior_functionals",
@@ -1285,3 +1319,284 @@ def posterior_quantiles(
         rng=rng,
     )
     return quantiles_from_realizations(realizations, grid, probability, data)
+
+
+def _as_comparison_fit(value: object, name: str) -> Functionals:
+    """Validate one side of a two-population comparison."""
+    if not isinstance(value, Functionals):
+        raise ValueError(
+            f"{name} must be a Functionals instance, got {type(value).__name__}"
+        )
+    return value
+
+
+def _comparison_grid(
+    fit_a: Functionals, fit_b: Functionals, t_grid: object
+) -> np.ndarray:
+    """Require one shared, strictly positive grid for both fits.
+
+    ``compare`` never re-interpolates: the stored ``S``/``F`` arrays are
+    evaluated at the grid each :class:`Functionals` carries, so a comparison on
+    a different grid would have to invent interpolation rules (and the median
+    ranking could then depend on those rules).  Requiring the caller's
+    ``t_grid`` to be exactly the grid of both fits makes that impossible.
+    """
+    grid = _as_t_grid(t_grid)
+    if np.any(np.diff(grid) <= 0.0):
+        raise ValueError(
+            "t_grid must be strictly increasing for the quantile comparison, "
+            "got a duplicate or descending pair"
+        )
+    for name, fit in (("fit_a", fit_a), ("fit_b", fit_b)):
+        if fit.t_grid.shape != grid.shape or not np.allclose(
+            fit.t_grid, grid, rtol=1e-12, atol=0.0
+        ):
+            raise ValueError(
+                f"{name}.t_grid does not match the supplied t_grid; a "
+                "comparison must use the one grid both fits were evaluated "
+                "on, because compare does not re-interpolate"
+            )
+    return grid
+
+
+def _comparison_scale(fit_a: Functionals, fit_b: Functionals) -> float | None:
+    """Check that both fits describe the same original time scale.
+
+    The original-scale grid is ``t = t_max (t_tilde - 1)``.  Two fits on
+    different ``t_max`` are in different units, so a difference of quantiles in
+    original time would compare weeks with months.  The check only runs when
+    both fits record ``t_max`` in ``meta``; hand-built test functionals need no
+    provenance.
+    """
+    scale_a = fit_a.meta.get("t_max")
+    scale_b = fit_b.meta.get("t_max")
+    if scale_a is not None and scale_b is not None and float(scale_a) != float(scale_b):
+        raise ValueError(
+            "the two fits must share t_max to be comparable on the original "
+            f"time scale, got {scale_a!r} and {scale_b!r}"
+        )
+    if scale_a is not None:
+        return float(scale_a)
+    if scale_b is not None:
+        return float(scale_b)
+    return None
+
+
+def _require_non_decreasing_cdf(fit: Functionals, name: str) -> None:
+    """Reject a CDF that is not non-decreasing along the grid.
+
+    Quantile inversion searches a monotone CDF; on a non-monotone row the
+    search would silently return a point that is not a quantile at all.  A
+    tiny negative step is tolerated because ``F = 1 - S`` can round by one ulp
+    when ``S`` is built by summing many atoms.
+    """
+    steps = np.diff(fit.F, axis=1)
+    if steps.size and np.any(steps < -1e-12):
+        raise ValueError(
+            f"{name}.F must be non-decreasing along t_grid to invert the CDF "
+            "for the eta comparison"
+        )
+
+
+def _grid_quantiles(
+    cdf: np.ndarray, t_grid: np.ndarray, p: float, name: str
+) -> np.ndarray:
+    """Invert each row of a grid CDF piecewise linearly at probability ``p``.
+
+    ``cdf`` is ``(n_draws, n_grid)`` and non-decreasing along the grid.  The
+    quantile of each row is found by locating the first grid point at or above
+    ``p`` and linearly interpolating between it and its predecessor.  This is
+    the ``O(h**2)`` grid inversion the comparison needs for a per-draw ranking;
+    :func:`posterior_quantiles` polishes the same root on the exact mixture CDF
+    and is the right tool when the quantile value itself is the deliverable.
+
+    A ``p`` the grid does not bracket is an error rather than a clamp: the
+    quantile would lie outside the evaluated times, and silently returning the
+    grid edge would make the A-versus-B ranking an artefact of the grid.
+    """
+    n_draws, n_grid = cdf.shape
+    first = cdf[:, 0]
+    last = cdf[:, -1]
+    if np.any(first > p):
+        worst = float(np.max(first))
+        raise ValueError(
+            f"p={p!r} is not bracketed by {name}.F on t_grid: the first grid "
+            f"point already has F up to {worst!r}, so the quantile lies below "
+            "t_grid[0].  Extend t_grid to the left (t=0 is allowed for a "
+            "quantile grid)"
+        )
+    if np.any(last < p):
+        best = float(np.min(last))
+        raise ValueError(
+            f"p={p!r} is not bracketed by {name}.F on t_grid: the last grid "
+            f"point reaches F only up to {best!r}.  Extend t_grid to the right"
+        )
+
+    # For a non-decreasing row, the number of entries below ``p`` is the first
+    # index at or above it (``searchsorted(..., side="left")``).
+    index = np.clip(np.sum(cdf < p, axis=1), 0, n_grid - 1)
+    rows = np.arange(n_draws)
+    lower = np.maximum(index - 1, 0)
+    upper = index
+    f_lower = cdf[rows, lower]
+    f_upper = cdf[rows, upper]
+    span = f_upper - f_lower
+    fraction = np.divide(
+        p - f_lower, span, out=np.zeros(n_draws, dtype=np.float64), where=span > 0.0
+    )
+    return t_grid[lower] + fraction * (t_grid[upper] - t_grid[lower])
+
+
+def _hazard_ratio(h_a: np.ndarray, h_b: np.ndarray) -> np.ndarray:
+    """Per-draw, per-grid-point ratio ``h_b / h_a`` with explicit limits.
+
+    Both hazards are non-negative and may be ``inf`` where a survival
+    underflows.  The ratio is
+
+    * ``h_b / h_a`` where ``h_a`` is finite and positive;
+    * ``inf`` where ``h_a == 0`` and ``h_b > 0`` (the correct limit);
+    * ``0`` where ``h_a`` is infinite and ``h_b`` is finite;
+    * ``nan`` where both are zero or both are infinite -- ``0/0`` and
+      ``inf/inf`` are not numbers, and reporting one would silently poison a
+      mean band.  Callers summarising the ratio should use nan-aware
+      reductions.
+    """
+    ratio = np.full(h_a.shape, np.nan, dtype=np.float64)
+    finite_positive = np.isfinite(h_a) & (h_a > 0.0)
+    np.divide(h_b, h_a, out=ratio, where=finite_positive)
+    zero_denominator = h_a == 0.0
+    ratio[zero_denominator & (h_b > 0.0)] = np.inf
+    infinite_denominator = np.isinf(h_a)
+    ratio[infinite_denominator & np.isfinite(h_b)] = 0.0
+    ratio[infinite_denominator & np.isinf(h_b)] = np.nan
+    return ratio
+
+
+def compare(
+    fit_a: Functionals,
+    fit_b: Functionals,
+    t_grid: object,
+    *,
+    p: float = 0.5,
+) -> dict[str, Any]:
+    """Two-population comparison of two independent fits (plan Section 4.4).
+
+    For treatments A and B fitted independently, draw ``b`` of A is paired with
+    draw ``b`` of B.  The posterior of two independent datasets factorises, so
+    the paired draws are draws from the joint posterior -- but only when the
+    fits are genuinely independent **and** have the same number of stored
+    draws.  The equal-length condition is checked; independence is the caller's
+    obligation.
+
+    On the shared original-scale grid the function returns three comparisons:
+
+    * ``ratio`` -- ``h_B(t) / h_A(t)`` per draw and grid point, the hazard
+      ratio of the paper's Figure 5a (the paper writes ``lambda`` for the
+      hazard).  It is ``inf`` where ``h_A`` is zero and ``h_B`` positive and
+      ``nan`` where the ratio is undefined; see :func:`_hazard_ratio`.
+    * ``difference`` -- ``F_B(t) - F_A(t)`` per draw and grid point (Figure
+      5b).  A positive value means population B has the larger CDF at ``t``,
+      i.e. fails earlier.
+    * ``eta_a``, ``eta_b`` and ``eta_difference = eta_a - eta_b`` -- the
+      quantile of level ``p`` of each draw, inverted per draw from the stored
+      CDF.  ``prob_eta_a_gt_eta_b`` is ``mean(eta_a > eta_b)``, the posterior
+      probability ``Pr(eta_A > eta_B | D)`` of Figure 5c (paper: 0.9135).
+      Ties count as "not greater", so the reported probability is strictly the
+      probability that A's quantile exceeds B's.
+
+    The quantile is obtained by piecewise-linear inversion of each draw's CDF
+    on ``t_grid`` (see :func:`_grid_quantiles`).  That is ``O(h**2)`` in ``t``
+    and is deliberately not the exact per-draw inversion of
+    :func:`posterior_quantiles`: :class:`Functionals` keeps no DP
+    realisations, and the comparison only needs the *ranking* of the two
+    populations, which is invariant under the strictly increasing time
+    transform.  If the quantile *value* is the deliverable, use
+    :func:`posterior_quantiles` on the chains instead.
+
+    ``t_grid`` must be exactly the grid both fits were evaluated on; there is
+    no re-interpolation.  Both fits must also record the same ``t_max`` in
+    ``meta`` when they record one at all.
+
+    Parameters
+    ----------
+    fit_a : Functionals
+        Functionals of population A (e.g. the longer-remission treatment).
+    fit_b : Functionals
+        Functionals of population B.
+    t_grid : array-like
+        The shared original-scale grid, positive, finite and 1-D.  It must
+        match ``fit_a.t_grid`` and ``fit_b.t_grid``.
+    p : float, optional
+        Quantile level used for the ``eta`` comparison, in ``(0, 1)``.
+        Default ``0.5`` (the population median), which is the Figure 5c
+        functional.
+
+    Returns
+    -------
+    dict
+        Keys ``t_grid``, ``ratio`` (``(B, M)``), ``difference`` (``(B, M)``),
+        ``eta_a``, ``eta_b``, ``eta_difference`` (``(B,)``),
+        ``prob_eta_a_gt_eta_b`` (float), ``p`` and ``meta`` (``p``, the number
+        of draws and grid points, both fits' method/seed provenance when
+        present, and the shared ``t_max`` when known).
+
+    Raises
+    ------
+    ValueError
+        If either argument is not a :class:`Functionals`, the same object is
+        passed twice, the draw counts differ, the grids do not match, the two
+        fits record different ``t_max``, ``p`` is not in ``(0, 1)``, a CDF is
+        not non-decreasing, or ``p`` is not bracketed by a fit's CDF.
+    """
+    fit_a = _as_comparison_fit(fit_a, "fit_a")
+    fit_b = _as_comparison_fit(fit_b, "fit_b")
+    if fit_a is fit_b:
+        raise ValueError(
+            "fit_a and fit_b must be two different fits; comparing a fit with "
+            "itself would always give ratio 1, difference 0 and probability 0.5"
+        )
+    if fit_a.n_draws != fit_b.n_draws:
+        raise ValueError(
+            "the two fits must have the same number of stored draws to pair "
+            f"draw b with draw b, got {fit_a.n_draws} and {fit_b.n_draws}"
+        )
+    grid = _comparison_grid(fit_a, fit_b, t_grid)
+    scale = _comparison_scale(fit_a, fit_b)
+    probability_level = _as_probability(p)
+    _require_non_decreasing_cdf(fit_a, "fit_a")
+    _require_non_decreasing_cdf(fit_b, "fit_b")
+
+    ratio = _hazard_ratio(fit_a.h, fit_b.h)
+    difference = fit_b.F - fit_a.F
+
+    eta_a = _grid_quantiles(fit_a.F, grid, probability_level, "fit_a")
+    eta_b = _grid_quantiles(fit_b.F, grid, probability_level, "fit_b")
+    eta_difference = eta_a - eta_b
+    prob_eta_a_gt_eta_b = float(np.mean(eta_a > eta_b))
+
+    meta: dict[str, Any] = {
+        "p": probability_level,
+        "n_draws": int(fit_a.n_draws),
+        "n_grid": int(grid.size),
+        "ratio": "h_B(t) / h_A(t)",
+        "difference": "F_B(t) - F_A(t)",
+        "pairing": "draw b of A paired with draw b of B (independent fits)",
+    }
+    for suffix, fit in (("a", fit_a), ("b", fit_b)):
+        for key in ("method", "seed"):
+            if key in fit.meta:
+                meta[f"{key}_{suffix}"] = fit.meta[key]
+    if scale is not None:
+        meta["t_max"] = scale
+
+    return {
+        "t_grid": grid,
+        "ratio": ratio,
+        "difference": difference,
+        "eta_a": eta_a,
+        "eta_b": eta_b,
+        "eta_difference": eta_difference,
+        "prob_eta_a_gt_eta_b": prob_eta_a_gt_eta_b,
+        "p": probability_level,
+        "meta": meta,
+    }
