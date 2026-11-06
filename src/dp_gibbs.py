@@ -69,11 +69,14 @@ __all__ = [
     "alpha_bound_guard_count",
     "refresh_cluster",
     "refresh_cluster_alpha",
+    "refresh_gamma",
     "refresh_nu",
+    "refresh_phi",
     "reset_alpha_bound_guard_count",
     "sample_step_a",
     "sample_step_a_for_obs",
     "sample_step_b",
+    "sample_step_c",
     "trapezoid_log_weights",
     "transform_time",
 ]
@@ -2283,3 +2286,265 @@ def refresh_nu(state: DPState, prior: DPPrior, *, rng: np.random.Generator) -> f
         )
     state.nu = nu_new
     return u
+
+
+def _validate_phi_conditional_inputs(state: DPState, prior: DPPrior) -> None:
+    """Check the pieces of the ``phi`` conditional that a container cannot.
+
+    The Pareto update reads the prior's shape ``a_phi`` and lower bound
+    ``b_phi``, plus ``n_star`` and ``max_j alpha*_j`` from the state.  A
+    non-positive or non-finite ``a_phi`` would make the draw invalid and a
+    non-positive ``b_phi`` would place the lower bound below zero, so both are
+    rejected here rather than allowed to produce a ``NaN`` bound that then
+    trips invariant 3 far from the cause.
+
+    ``alpha_star`` is validated as finite and strictly positive: a zero or
+    negative cluster shape cannot be a valid bound for the Pareto draw, and
+    :class:`DPState` already guarantees the array is non-empty.
+    """
+    a_phi = float(prior.a_phi)
+    b_phi = float(prior.b_phi)
+    if not np.isfinite(a_phi) or a_phi <= 0.0:
+        raise ValueError("prior.a_phi must be a finite, strictly positive number")
+    if not np.isfinite(b_phi) or b_phi <= 0.0:
+        raise ValueError("prior.b_phi must be a finite, strictly positive number")
+    if state.n_star < 1:
+        raise ValueError("the phi conditional needs at least one cluster")
+    alpha_star = np.asarray(state.alpha_star, dtype=np.float64)
+    if not np.all(np.isfinite(alpha_star)) or np.any(alpha_star <= 0.0):
+        raise StateInvariantError(
+            "the phi conditional needs finite, strictly positive alpha_star"
+        )
+
+
+def refresh_phi(state: DPState, prior: DPPrior, *, rng: np.random.Generator) -> float:
+    """Refresh the base-measure upper bound ``phi`` from its Pareto conditional.
+
+    This is the second part of step (c) of plan Section 3.4, the Appendix's
+    Eq. (c) for ``phi``:
+
+        ``phi | alpha*, n_star ~ Pareto(a_phi + n_star,
+          max(b_phi, max_j alpha*_j))``,
+
+    where ``Pareto(a, b)`` has density ``a b**a / phi**(a+1)`` on
+    ``phi >= b`` (the convention already used in ``src/dp_weibull.py`` and
+    stated in plan Section 2.2).  The prior is conjugate here in the
+    ``alpha``-only sense: the uniform base measure's upper bound is *also* a
+    truncation point of every ``alpha*_j``, so the likelihood contributes one
+    factor ``1/phi`` per cluster -- hence the shape ``a_phi + n_star`` -- while
+    the support restriction ``phi >= max_j alpha*_j`` raises the lower bound
+    from ``b_phi`` to that maximum.  The maximum can never exceed the current
+    ``phi`` because invariant 3 of plan Section 2.1 holds at every step, so the
+    new lower bound never exceeds ``state.phi`` either.
+
+    Order matters: plan Section 3.4 runs this update *after* step (b), because
+    the lower bound reads ``max_j alpha*_j`` from the freshly refreshed cluster
+    shapes (and, inside step (c), after the ``nu`` update).
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place: only ``phi`` is replaced.  ``alpha_star``,
+        ``lam_star``, ``alpha``, ``lam``, ``s``, ``n_j``, ``nu`` and ``gamma``
+        are untouched.  Invariant 3 (``0 < alpha <= phi``) holds after the
+        draw by construction of the lower bound.
+    prior : DPPrior
+        Supplies ``a_phi`` (shape) and ``b_phi`` (prior lower bound).
+    rng : np.random.Generator
+        Random generator; the only source of randomness.  Exactly one Pareto
+        variate is consumed, so the sweep's random-number stream is fixed.
+
+    Returns
+    -------
+    float
+        The new ``phi``, for the distributional test of plan Section 7.2
+        test 13.
+
+    Raises
+    ------
+    ValueError
+        If ``a_phi`` or ``b_phi`` is not finite and strictly positive.
+    StateInvariantError
+        If ``alpha_star`` contains a non-positive or non-finite value, or if
+        the draw somehow falls below ``max_j alpha*_j``.
+    """
+    _validate_phi_conditional_inputs(state, prior)
+    a_phi = float(prior.a_phi)
+    b_phi = float(prior.b_phi)
+    n_star = state.n_star
+    alpha_star = np.asarray(state.alpha_star, dtype=np.float64)
+
+    lower = max(b_phi, float(np.max(alpha_star)))
+    # numpy's Generator.pareto(a) is the *shifted* (Lomax/Pareto II) law with
+    # density a / (1+x)**(a+1) on x >= 0, so the classical Pareto(a, b) draw
+    # of plan Section 2.2 is b * (1 + x).  (RandomState.pareto, by contrast,
+    # is already classical; using it here would be a silent off-by-shift.)
+    phi_new = float(lower * (1.0 + rng.pareto(a_phi + n_star)))
+
+    if not np.isfinite(phi_new) or phi_new <= 0.0:
+        raise StateInvariantError(
+            f"the phi draw was not a finite positive number: {phi_new!r} "
+            f"(shape={a_phi + n_star!r}, lower={lower!r})"
+        )
+    # Guard the support exactly: the draw must not violate invariant 3,
+    # because step (b) is the only place allowed to move alpha*.
+    if phi_new < float(np.max(alpha_star)):
+        raise StateInvariantError(
+            f"the phi draw {phi_new!r} fell below max_j alpha*_j "
+            f"{float(np.max(alpha_star))!r}"
+        )
+    state.phi = phi_new
+    return phi_new
+
+
+def _validate_gamma_conditional_inputs(state: DPState, prior: DPPrior) -> None:
+    """Check the pieces of the ``gamma`` conditional that a container cannot.
+
+    The Gamma update reads the prior's shape ``a_gamma`` and rate ``b_gamma``,
+    plus ``d`` and the reciprocal scales of all clusters.  A non-positive or
+    non-finite hyperparameter is rejected here; so is a ``lam_star`` that is
+    not finite and strictly positive, which would make ``sum_j 1/lam*_j``
+    invalid and could give a non-positive rate.
+    """
+    a_gamma = float(prior.a_gamma)
+    b_gamma = float(prior.b_gamma)
+    if not np.isfinite(a_gamma) or a_gamma <= 0.0:
+        raise ValueError("prior.a_gamma must be a finite, strictly positive number")
+    if not np.isfinite(b_gamma) or b_gamma <= 0.0:
+        raise ValueError("prior.b_gamma must be a finite, strictly positive number")
+    _as_shape_parameter(prior.d)
+    if state.n_star < 1:
+        raise ValueError("the gamma conditional needs at least one cluster")
+    lam_star = np.asarray(state.lam_star, dtype=np.float64)
+    if not np.all(np.isfinite(lam_star)) or np.any(lam_star <= 0.0):
+        raise StateInvariantError(
+            "the gamma conditional needs finite, strictly positive lam_star"
+        )
+
+
+def refresh_gamma(state: DPState, prior: DPPrior, *, rng: np.random.Generator) -> float:
+    """Refresh the base-measure inverse-gamma scale ``gamma`` from its conditional.
+
+    This is the third and last part of step (c) of plan Section 3.4, the
+    Appendix's Eq. (c) for ``gamma``:
+
+        ``gamma | lambda*, n_star ~ Gamma(a_gamma + d n_star,
+          rate = b_gamma + sum_{j=1}^{n_star} 1 / lambda*_j)``,
+
+    with the shape-rate convention already used throughout the module (so
+    SciPy would want ``scale = 1 / rate``).  Each cluster contributes its
+    ``G0`` inverse-gamma factor, whose shape is ``d``, so the likelihood adds
+    ``d n_star`` -- one ``d`` per cluster, **not** one per observation and
+    **not** ``n_star`` -- while the exponential's coefficient adds one
+    ``1/lambda*_j`` per cluster to the prior's rate ``b_gamma``.  The
+    ``d n_star`` versus ``n_star`` error is invisible on a trace plot, so
+    plan Section 7.2 test 14 compares the sample against the exact law.
+
+    The sum runs over *all* clusters once each, unweighted by ``n_j``: the
+    ``gamma`` factor appears once per cluster location in the base-measure
+    density, not once per observation.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place: only ``gamma`` is replaced.  ``alpha_star``,
+        ``lam_star``, ``alpha``, ``lam``, ``s``, ``n_j``, ``nu`` and ``phi``
+        are untouched.
+    prior : DPPrior
+        Supplies ``a_gamma`` (shape), ``b_gamma`` (rate) and ``d``.
+    rng : np.random.Generator
+        Random generator; the only source of randomness.  Exactly one gamma
+        variate is consumed, so the sweep's random-number stream is fixed.
+
+    Returns
+    -------
+    float
+        The new ``gamma``, for the distributional test of plan Section 7.2
+        test 14.
+
+    Raises
+    ------
+    ValueError
+        If ``a_gamma`` or ``b_gamma`` is not finite and strictly positive, or
+        if ``d`` is not a positive integer.
+    StateInvariantError
+        If ``lam_star`` contains a non-positive or non-finite value, or if the
+        draw is not finite and positive.
+    """
+    _validate_gamma_conditional_inputs(state, prior)
+    a_gamma = float(prior.a_gamma)
+    b_gamma = float(prior.b_gamma)
+    d = _as_shape_parameter(prior.d)
+    n_star = state.n_star
+    lam_star = np.asarray(state.lam_star, dtype=np.float64)
+
+    shape = a_gamma + d * n_star
+    rate = b_gamma + float(np.sum(1.0 / lam_star))
+    gamma_new = float(rng.gamma(shape=shape, scale=1.0 / rate))
+
+    if not np.isfinite(gamma_new) or gamma_new <= 0.0:
+        raise StateInvariantError(
+            f"the gamma draw was not a finite positive number: {gamma_new!r} "
+            f"(shape={shape!r}, rate={rate!r})"
+        )
+    state.gamma = gamma_new
+    return gamma_new
+
+
+def sample_step_c(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    rng: np.random.Generator,
+) -> None:
+    """Run step (c): refresh the hyperparameters ``nu``, ``phi``, ``gamma``.
+
+    Plan Section 3.4 fixes both the contents and the order of this step: the
+    DP precision first (:func:`refresh_nu`, the non-conjugate Escobar-West
+    augmentation), then the base-measure upper bound (:func:`refresh_phi`),
+    then the inverse-gamma scale (:func:`refresh_gamma`).  The order is part
+    of the specification -- it fixes the random-number stream and therefore
+    the golden regression of plan Section 7.5 -- and it is also the only order
+    in which the ``phi`` update is valid without a re-check: its Pareto lower
+    bound reads ``max_j alpha*_j`` from step (b), and the ``nu`` update is
+    placed first because it is the one conditional that reads no other
+    hyperparameter.
+
+    ``data`` is not read by any of the three updates (they depend on the state
+    and the prior only), but it is part of the public signature of plan
+    Section 3.3 and it is validated against the state here, so a mismatch
+    between a chain and the dataset it claims to have fitted fails at the step
+    boundary rather than two steps later inside step (a).
+
+    Random-number consumption, in order: one beta and one uniform and one
+    gamma for ``nu``; one Pareto for ``phi``; one gamma for ``gamma``.  The
+    ``nu`` auxiliary ``u`` returned by :func:`refresh_nu` is discarded here --
+    test 12 reads it directly from :func:`refresh_nu`.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place: ``nu``, ``phi`` and ``gamma`` are replaced, in that
+        order.  The locations, labels and counts are untouched.
+    data : SurvData
+        Only used to check that the state and the dataset agree on ``n``.
+    prior : DPPrior
+        Supplies all six hyperparameters and ``d``.
+    rng : np.random.Generator
+        Random generator; the only source of randomness.
+
+    Raises
+    ------
+    ValueError
+        If the state and the data describe different datasets, or a prior
+        hyperparameter is not finite and strictly positive.
+    StateInvariantError
+        If any of the three draws is not finite and positive, or if the final
+        state violates a Section 2.1 invariant.
+    """
+    _validate_step_b_inputs(state, data, prior)
+    refresh_nu(state, prior, rng=rng)
+    refresh_phi(state, prior, rng=rng)
+    refresh_gamma(state, prior, rng=rng)
+    state.check_invariants(prior)
