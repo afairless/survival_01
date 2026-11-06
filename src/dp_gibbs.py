@@ -63,6 +63,7 @@ __all__ = [
     "log_integral_alpha",
     "draw_g0_conditional_alpha",
     "init_state",
+    "log_post",
     "log_q0_censored",
     "log_q0_uncensored",
     "make_grid",
@@ -1534,6 +1535,263 @@ def init_state(
         nu=nu_init,
         gamma=gamma_init,
         phi=phi,
+    )
+
+
+def _log_g0_density(state: DPState, prior: DPPrior) -> float:
+    """Return ``sum_j log g0(alpha*_j, lambda*_j | phi, gamma)``.
+
+    The base measure is
+
+        ``G0(alpha, lambda | phi, gamma)
+            = Uniform(alpha | 0, phi) * InvGamma(lambda | d, gamma)``,
+
+    so each **cluster** contributes ``-log phi`` from the uniform factor plus
+
+        ``d log gamma - log Gamma(d) - (d + 1) log lambda - gamma / lambda``
+
+    from the inverse-gamma factor (shape ``d``, scale ``gamma``).  The sum runs
+    over clusters, not observations: the collapsed target has one ``g0`` factor
+    per cluster location, while the observations enter through the likelihood
+    (:func:`_log_likelihood`).  Summing this term per observation instead is
+    the natural-looking error the per-cluster test in ``tests/test_log_post.py``
+    rejects.
+    """
+    d = _as_shape_parameter(prior.d)
+    log_phi = math.log(float(state.phi))
+    log_gamma = math.log(float(state.gamma))
+    lam_star = np.asarray(state.lam_star, dtype=np.float64)
+    per_cluster = (
+        -log_phi
+        + d * log_gamma
+        - math.lgamma(float(d))
+        - (d + 1.0) * np.log(lam_star)
+        - float(state.gamma) / lam_star
+    )
+    return float(np.sum(per_cluster))
+
+
+def _log_eppf(state: DPState) -> float:
+    """Return the exchangeable partition term ``log p(s | nu)``.
+
+    The EPPF of a Dirichlet process with precision ``nu`` assigns a partition
+    with cluster sizes ``n_1, ..., n_{n_star}`` the probability
+
+        ``p(s | nu) = nu**n_star prod_j (n_j - 1)! / (nu)_(n)``,
+
+    where ``(nu)_(n) = Gamma(nu + n) / Gamma(nu) = nu (nu + 1) ...
+    (nu + n - 1)`` is the rising factorial.  In log space
+
+        ``log p(s | nu) = n_star log nu + sum_j log Gamma(n_j)
+            + log Gamma(nu) - log Gamma(nu + n)``,
+
+    because ``log (n_j - 1)! = log Gamma(n_j)`` and
+    ``-log (nu)_(n) = log Gamma(nu) - log Gamma(nu + n)``.
+
+    Plan Section 3.7 writes the last two terms in the opposite order in its
+    inline display (``- log Gamma(nu) + log Gamma(nu + n)``), which would make
+    the term grow with ``n`` instead of being a proper partition probability.
+    The EPPF named in the same sentence is the definition, and the correct
+    signs above are the ones implemented and pinned by the independent
+    rising-factorial check in ``tests/test_log_post.py``.
+
+    The ``(nu)_(n)`` denominator is evaluated as a product of ``n`` factors by
+    the test, not here; here the two ``lgamma`` calls are the whole cost.  Only
+    ``n_star`` (a few clusters) is looped over, so the evaluation is effectively
+    vectorised in ``n``.
+    """
+    nu = float(state.nu)
+    log_term = float(state.n_star) * math.log(nu)
+    log_term += sum(math.lgamma(float(n_j)) for n_j in state.n_j)
+    log_term += math.lgamma(nu) - math.lgamma(nu + float(state.n))
+    return log_term
+
+
+def _log_likelihood(state: DPState, data: SurvData) -> float:
+    """Return ``sum_i log L_i(theta_{s_i})`` on the transformed time scale.
+
+    An uncensored observation contributes the Weibull density
+
+        ``log(alpha_i / lambda_i) + (alpha_i - 1) log t_i
+            - t_i**alpha_i / lambda_i``
+
+    and a right-censored one only the log survival ``-t_i**alpha_i /
+    lambda_i``.  Using the density for a censored observation is the same
+    mistake test 8 guards against in step (a), and it is silent on a trace.
+
+    The times are the sampler's transformed times ``t_tilde``; the target is a
+    density on that scale, so no Jacobian is applied here.  The inverse map for
+    reporting lives in :func:`inverse_map`.  The per-observation latent values
+    ``state.alpha`` / ``state.lam`` are used (invariant 1 makes them equal to
+    the cluster location), which keeps the whole likelihood one vectorised
+    pass over ``n``: no loop over observations, clusters or the alpha grid.
+    """
+    time = np.asarray(data.time, dtype=np.float64)
+    event = np.asarray(data.event, dtype=bool)
+    alpha = np.asarray(state.alpha, dtype=np.float64)
+    lam = np.asarray(state.lam, dtype=np.float64)
+    log_time = np.log(time)
+    log_survival = -np.power(time, alpha) / lam
+    log_density = np.log(alpha) + (alpha - 1.0) * log_time - np.log(lam) + log_survival
+    return float(np.sum(np.where(event, log_density, log_survival)))
+
+
+def _log_hyperprior(state: DPState, prior: DPPrior) -> float:
+    """Return ``log p(nu) + log p(gamma) + log p(phi)``.
+
+    With the shape-rate Gamma convention used throughout the module and the
+    classical Pareto density ``a b**a / phi**(a + 1)`` on ``phi >= b``:
+
+        ``log p(nu)    = a_nu log b_nu - log Gamma(a_nu)
+            + (a_nu - 1) log nu - b_nu nu``
+        ``log p(gamma) = a_gamma log b_gamma - log Gamma(a_gamma)
+            + (a_gamma - 1) log gamma - b_gamma gamma``
+        ``log p(phi)   = log a_phi + a_phi log b_phi
+            - (a_phi + 1) log phi``.
+
+    The Pareto term is evaluated only on its support; :func:`log_post` checks
+    ``phi >= prior.b_phi`` first, so this function never has to return ``-inf``.
+    """
+    a_nu = float(prior.a_nu)
+    b_nu = float(prior.b_nu)
+    a_gamma = float(prior.a_gamma)
+    b_gamma = float(prior.b_gamma)
+    a_phi = float(prior.a_phi)
+    b_phi = float(prior.b_phi)
+    nu = float(state.nu)
+    gamma = float(state.gamma)
+    phi = float(state.phi)
+    return (
+        a_nu * math.log(b_nu)
+        - math.lgamma(a_nu)
+        + (a_nu - 1.0) * math.log(nu)
+        - b_nu * nu
+        + a_gamma * math.log(b_gamma)
+        - math.lgamma(a_gamma)
+        + (a_gamma - 1.0) * math.log(gamma)
+        - b_gamma * gamma
+        + math.log(a_phi)
+        + a_phi * math.log(b_phi)
+        - (a_phi + 1.0) * math.log(phi)
+    )
+
+
+def _validate_log_post_inputs(state: DPState, data: SurvData, prior: DPPrior) -> None:
+    """Check that a state can be scored by :func:`log_post`.
+
+    The collapsed target is defined only on the support of the model: the
+    data and state must describe the same ``n`` observations, every prior
+    hyperparameter must be finite and strictly positive, ``d`` a positive
+    integer, and the state must satisfy the Section 2.1 invariants including
+    ``phi >= prior.b_phi``.  A state left in the deferred-compaction form of
+    step (a) -- an empty cluster, ``n_j`` disagreeing with ``s`` -- is rejected
+    by the same check, because the EPPF and the ``g0`` sum would then count a
+    cluster the partition does not contain.
+    """
+    if not isinstance(data, SurvData):
+        raise ValueError("data must be a SurvData instance")
+    if not isinstance(prior, DPPrior):
+        raise ValueError("prior must be a DPPrior instance")
+    _as_positive_scalar(prior.a_nu, "prior.a_nu")
+    _as_positive_scalar(prior.b_nu, "prior.b_nu")
+    _as_positive_scalar(prior.a_gamma, "prior.a_gamma")
+    _as_positive_scalar(prior.b_gamma, "prior.b_gamma")
+    _as_positive_scalar(prior.a_phi, "prior.a_phi")
+    _as_positive_scalar(prior.b_phi, "prior.b_phi")
+    _as_shape_parameter(prior.d)
+    if data.time.size != state.n:
+        raise ValueError(
+            "data and state must have the same number of observations, "
+            f"got {data.time.size} and {state.n}"
+        )
+    if data.event.size != state.n:
+        raise ValueError(
+            "data and state must have the same number of censoring indicators, "
+            f"got {data.event.size} and {state.n}"
+        )
+    state.check_invariants(prior)
+
+
+def log_post(state: DPState, data: SurvData, prior: DPPrior) -> float:
+    """Evaluate the unnormalised collapsed log-posterior of plan Section 3.7.
+
+    The collapsed target of the sampler, as a function of the cluster
+    locations, the partition and the three hyperparameters, is
+
+        ``log p(theta*, s, nu, gamma, phi | D)
+            = sum_j log g0(alpha*_j, lambda*_j | phi, gamma)
+            + log p(s | nu)
+            + sum_i log L_i(theta_{s_i})
+            + log p(nu) + log p(gamma) + log p(phi)``,
+
+    with ``L_i`` the Weibull density (uncensored) or survival (right-censored)
+    at observation ``i``'s own location.  The EPPF term is
+
+        ``log p(s | nu) = n_star log nu + sum_j log Gamma(n_j)
+            + log Gamma(nu) - log Gamma(nu + n)``,
+
+    i.e. ``nu**n_star prod_j (n_j - 1)! / (nu)_(n)``.  The ``g0`` terms are
+    **per cluster**, not per observation; the likelihood terms are per
+    observation.  :func:`_log_g0_density`, :func:`_log_eppf`,
+    :func:`_log_likelihood` and :func:`_log_hyperprior` hold the four groups,
+    and the docstring of :func:`_log_eppf` records the sign convention (the
+    plan's inline display of the two Gamma terms is inverted; the EPPF it names
+    is what is implemented).
+
+    This is a genuine log density up to an additive constant, so it can be
+    monitored as a trace and used as the scale in the golden regression of plan
+    Section 7.5.  It is deliberately **not normalised** and must never be used
+    for model comparison (plan Section 10, decision 4).  The likelihood is
+    evaluated on the sampler's transformed time scale ``t_tilde = 1 + t/t_max``;
+    the prior in force is therefore also the one on that scale (the time-scale
+    caveat in the module docstring).
+
+    The evaluation is one vectorised pass: the likelihood is a single ``n``-row
+    NumPy expression, the ``g0`` sum is a single ``n_star``-row expression, and
+    only ``n_star`` (a few clusters) is touched by Python-level ``lgamma``
+    calls.  There is no loop over the alpha grid.
+
+    Parameters
+    ----------
+    state : DPState
+        A compacted, invariant-clean state: one of the draws stored by a chain,
+        or the result of :func:`init_state`.  A state still carrying the
+        deferred removals of step (a) is rejected.
+    data : SurvData
+        The dataset the state was fitted to, on the transformed scale.
+    prior : DPPrior
+        The fixed hyperparameters, supplying both the ``g0`` shape ``d`` and
+        the three prior densities.
+
+    Returns
+    -------
+    float
+        The unnormalised log-posterior, finite for every valid input.
+
+    Raises
+    ------
+    ValueError
+        If ``data`` or ``prior`` is of the wrong type, a prior hyperparameter
+        is not finite and strictly positive, ``d`` is not a positive integer,
+        or the state and data disagree on ``n``.
+    StateInvariantError
+        If the state violates a Section 2.1 invariant, including
+        ``phi >= prior.b_phi`` or a non-compacted partition.
+
+    Notes
+    -----
+    The score is invariant to how the clusters are numbered and to the order of
+    the observations: the EPPF depends on the partition only through its sizes,
+    and the other three groups are sums over clusters or observations.  A test
+    permutes both and asserts equality, which catches a term that accidentally
+    depends on a label or an index.
+    """
+    _validate_log_post_inputs(state, data, prior)
+    return (
+        _log_g0_density(state, prior)
+        + _log_eppf(state)
+        + _log_likelihood(state, data)
+        + _log_hyperprior(state, prior)
     )
 
 
