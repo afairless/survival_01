@@ -5,6 +5,14 @@ import numpy as np
 from scipy.stats import lognorm, binom, gamma
 import matplotlib.pyplot as plt
 
+from src.dp_weibull import (
+    weibull_from_median_iqr,
+    b_gamma_b_phi_from_weibull,
+    sample_prior_hyperparameters,
+    sample_dp_prior,
+    sample_dp_posterior,
+    )
+
 
 @dataclass
 class TwoLognormalMix():
@@ -41,6 +49,7 @@ class TwoLognormalMix():
 
 def main() -> None:
 
+    '''
     mu_1 = 0
     mu_2 = 1.2
     sigma_1 = 0.25
@@ -54,7 +63,6 @@ def main() -> None:
     lgn_mix = TwoLognormalMix(
         mu_1=mu_1, mu_2=mu_2, sigma_1=sigma_1, sigma_2=sigma_2, p=p, n=n, seed=seed)
 
-
     alpha = 2
     beta = 0.9
     n = 2000
@@ -62,8 +70,7 @@ def main() -> None:
     gamma.rvs(a=alpha, loc=0, scale=1/beta, size=n, random_state=seed)
     x = np.linspace(start=0, stop=12, num=1000)
     gy = gamma.pdf(x=x, a=alpha, loc=0, scale=1/beta)
-
-
+    '''
     '''
     plt.clf()
     plt.close()
@@ -78,6 +85,25 @@ def main() -> None:
 
     plt.show()
     '''
+
+
+    rng = np.random.default_rng(887373)
+    alpha_tilde, lambda_tilde = weibull_from_median_iqr(
+        median=1.1727, iqr=1.3679)
+    b_gamma, b_phi = b_gamma_b_phi_from_weibull(alpha_tilde, lambda_tilde)
+    a_nu = 2.0
+    b_nu = 0.9
+    a_gamma=1.0
+    a_phi=2.0
+
+    nu, gamma, phi = sample_prior_hyperparameters(
+        a_nu, b_nu, a_gamma, b_gamma, a_phi, b_phi, rng=rng)
+
+    G = sample_dp_prior(nu, gamma, phi, epsilon=1e-4, rng=rng)
+    #G = sample_dp_posterior(nu, gamma, phi, theta, d=2, epsilon=1e-4, rng=rng)
+
+
+
 
 
 
