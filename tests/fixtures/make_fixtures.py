@@ -9,12 +9,16 @@ Run from anywhere with the project environment::
 
     pixi run python tests/fixtures/make_fixtures.py
 
-The script writes ``golden_dp_gibbs.json`` next to itself (test 28 of plan
-Section 7.5) and ``sbc_seeds.json`` (test 17 of plan Section 7.3).  It is
+The script writes four fixtures next to itself: ``golden_dp_gibbs.json``
+(test 28 of plan Section 7.5), ``sbc_seeds.json`` (test 17 of plan Section
+7.3), ``section_5_1.npz`` and ``section_5_2.npz`` (plan Section 7.6).  It is
 deliberately not imported by ``tests/test_golden.py`` or ``tests/test_sbc.py``;
 the tests rebuild the same synthetic data, sampler settings and generation
 protocol from their own constants and regenerate the expected numbers only
-through the production code path.
+through the production code path.  The two Section 5 fixtures are checked by
+``tests/test_paper_data.py`` against the plan's structural assertions (sample
+counts, censoring positions, realised statistics) rather than by regenerating
+their arrays.
 
 The SBC fixture holds seeds only -- one generation, one chain and one
 functional-inference seed per replicate -- because those are what the plan's
@@ -52,10 +56,18 @@ from src.dp_gibbs import (  # noqa: E402
     make_surv_data,
     sample_chain,
 )
+from src.paper_data import (  # noqa: E402
+    LEUKEMIA_5_2,
+    LEUKEMIA_A_TRANSCRIPTION,
+    LEUKEMIA_B_TRANSCRIPTION,
+    TwoLognormalMix,
+)
 
 FIXTURE_DIR = Path(__file__).resolve().parent
 GOLDEN_PATH = FIXTURE_DIR / "golden_dp_gibbs.json"
 SBC_SEEDS_PATH = FIXTURE_DIR / "sbc_seeds.json"
+SECTION_5_1_PATH = FIXTURE_DIR / "section_5_1.npz"
+SECTION_5_2_PATH = FIXTURE_DIR / "section_5_2.npz"
 
 # Plan Section 7.3 test 17: 100 replicates, each with its own generation,
 # chain and functional-inference seed.  One fixed root seed makes the whole
@@ -240,8 +252,106 @@ def build_sbc_seed_fixture() -> dict[str, Any]:
     }
 
 
+def build_section_5_1_fixture() -> dict[str, Any]:
+    """Return the committed Section 5.1 sample and its realised statistics.
+
+    The generator itself lives in ``src.paper_data`` so the fixture is produced
+    through the same production path the drivers use.  The assertions below are
+    the plan's Section 6.1 numbers; a regeneration that moves them must fail
+    here instead of silently replacing the dataset.
+    """
+    mix = TwoLognormalMix()
+    time = mix.times
+    q25, median, q75 = np.quantile(time, [0.25, 0.5, 0.75])
+    iqr = q75 - q25
+    q95 = np.quantile(time, 0.95)
+    t_max = time.max()
+    n_above_4 = int(np.count_nonzero(time > 4.0))
+
+    # Structural sanity: plan Sections 6.1 and 7.6.
+    assert time.size == mix.n == 200
+    assert mix.p1_n == 160
+    assert mix.p2_n == 40
+    assert np.all(np.isfinite(time))
+    assert np.all(time > 0.0)
+    assert np.isclose(median, 1.2172, atol=1e-4)
+    assert np.isclose(iqr, 1.5336, atol=1e-4)
+    assert np.isclose(q25, 0.8168, atol=1e-4)
+    assert np.isclose(q75, 2.3505, atol=1e-4)
+    assert np.isclose(q95, 3.7396, atol=1e-4)
+    assert np.isclose(t_max, 5.1390, atol=1e-4)
+    assert n_above_4 == 2
+
+    return {
+        "time": time,
+        "event": np.ones(time.size, dtype=bool),
+        "seed": np.asarray(mix.seed, dtype=np.int64),
+        "n": np.asarray(mix.n, dtype=np.int64),
+        "p1_n": np.asarray(mix.p1_n, dtype=np.int64),
+        "p2_n": np.asarray(mix.p2_n, dtype=np.int64),
+        "mu_1": np.asarray(mix.mu_1, dtype=np.float64),
+        "mu_2": np.asarray(mix.mu_2, dtype=np.float64),
+        "var_1": np.asarray(mix.var_1, dtype=np.float64),
+        "var_2": np.asarray(mix.var_2, dtype=np.float64),
+        "p": np.asarray(mix.p, dtype=np.float64),
+        "median": np.asarray(median, dtype=np.float64),
+        "iqr": np.asarray(iqr, dtype=np.float64),
+        "q25": np.asarray(q25, dtype=np.float64),
+        "q75": np.asarray(q75, dtype=np.float64),
+        "q95": np.asarray(q95, dtype=np.float64),
+        "max": np.asarray(t_max, dtype=np.float64),
+        "t_max": np.asarray(t_max, dtype=np.float64),
+        "n_above_4": np.asarray(n_above_4, dtype=np.int64),
+    }
+
+
+def build_section_5_2_fixture() -> dict[str, Any]:
+    """Return the leukemia data, its transcription and structural metadata.
+
+    Arm A has 20 observations with 3 censored (28+, 48+, 49+); arm B has 20
+    with 2 censored (27+, 38+).  The plan's earlier "three censored per
+    treatment" claim was wrong for B and is not asserted here.
+    """
+    payload: dict[str, Any] = {}
+    expected = {
+        "a": (LEUKEMIA_A_TRANSCRIPTION, 20, 17, 3, (14, 18, 19), 49.0),
+        "b": (LEUKEMIA_B_TRANSCRIPTION, 20, 18, 2, (16, 18), 44.0),
+    }
+    for arm, (
+        tokens,
+        n,
+        n_observed,
+        n_censored,
+        censored_index,
+        t_max,
+    ) in expected.items():
+        time, event = LEUKEMIA_5_2[arm.upper()]
+        observed_index = np.flatnonzero(event)
+        censored_index_fixture = np.flatnonzero(~event)
+
+        # Structural sanity: plan Sections 6.1 and 7.6.
+        assert time.size == n
+        assert int(np.count_nonzero(event)) == n_observed
+        assert int(np.count_nonzero(~event)) == n_censored
+        assert tuple(int(i) for i in censored_index_fixture) == censored_index
+        assert observed_index.size == n_observed
+        assert float(time.max()) == t_max
+        assert all(tokens[index].endswith("+") for index in censored_index)
+
+        payload[f"{arm}_time"] = time
+        payload[f"{arm}_event"] = event
+        payload[f"{arm}_transcription"] = np.asarray(tokens)
+        payload[f"{arm}_n"] = np.asarray(n, dtype=np.int64)
+        payload[f"{arm}_n_observed"] = np.asarray(n_observed, dtype=np.int64)
+        payload[f"{arm}_n_censored"] = np.asarray(n_censored, dtype=np.int64)
+        payload[f"{arm}_censored_index"] = censored_index_fixture
+        payload[f"{arm}_observed_index"] = observed_index
+        payload[f"{arm}_t_max"] = np.asarray(t_max, dtype=np.float64)
+    return payload
+
+
 def main() -> None:
-    """Write both fixtures and report where they went."""
+    """Write every fixture and report where it went."""
     payload = build_golden_fixture()
     GOLDEN_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {GOLDEN_PATH.relative_to(REPO_ROOT)}")
@@ -251,6 +361,14 @@ def main() -> None:
         json.dumps(sbc_payload, indent=2) + "\n", encoding="utf-8"
     )
     print(f"wrote {SBC_SEEDS_PATH.relative_to(REPO_ROOT)}")
+
+    section_5_1_payload = build_section_5_1_fixture()
+    np.savez(SECTION_5_1_PATH, **section_5_1_payload)
+    print(f"wrote {SECTION_5_1_PATH.relative_to(REPO_ROOT)}")
+
+    section_5_2_payload = build_section_5_2_fixture()
+    np.savez(SECTION_5_2_PATH, **section_5_2_payload)
+    print(f"wrote {SECTION_5_2_PATH.relative_to(REPO_ROOT)}")
 
 
 if __name__ == "__main__":
