@@ -280,6 +280,74 @@ class DPRealization:
     def n_atoms(self):
         return self.weights.size
 
+    def pruned(self, atom_tol=1e-6):
+        """Drop a negligible trailing block of stick-breaking atoms.
+
+        A posterior realisation has ``J ~ 2000`` atoms for the paper's
+        ``n = 200`` data set, but only the first handful carry appreciable
+        mass: with precision ``nu + n ~ 200`` the tail weights decay
+        geometrically, so ``Pr(w_j > 1e-6)`` is essentially zero beyond about
+        ten atoms.  Evaluating every atom for every draw therefore costs about
+        200 times more than necessary.
+
+        This returns a new `DPRealization` holding the leading atoms up to the
+        point where the remaining proper-atom mass, ``sum_{j > k} w_j``, is at
+        most ``atom_tol``, with the weights renormalised to sum to one.  The
+        last atom is always kept: it is the residual stick, i.e. all the
+        remaining infinite series folded into one atom, not an ordinary
+        Beta(1, precision) break.  Dropping the residual atom as well would
+        discard mass that the truncation rule deliberately preserved.
+
+        Because the dropped mass is at most ``atom_tol``, every mixture
+        functional changes by at most ``atom_tol`` times the largest kernel
+        value on the evaluation grid: ``sup_t |S - S'| <= atom_tol``
+        unconditionally, and the density and hazard inherit the same absolute
+        error scale.
+
+        Parameters
+        ----------
+        atom_tol : float, optional
+            Largest admissible total mass of the dropped trailing block, in
+            (0, 1).
+
+        Returns
+        -------
+        DPRealization
+            A new realisation with normalised weights.  ``precision`` is
+            copied unchanged.
+        """
+        if not (0.0 < atom_tol < 1.0):
+            raise ValueError("atom_tol must lie in (0, 1)")
+        total = float(np.sum(self.weights))
+        if total <= 0.0:
+            raise ValueError("weights must carry positive total mass")
+
+        # The final atom is the residual stick and is never pruned.  Walk
+        # backwards over the proper atoms, accumulating the tail mass that
+        # would be discarded, and stop as soon as adding another atom would
+        # exceed the tolerance.
+        n_atoms = self.weights.size
+        first_dropped = n_atoms - 1
+        tail_mass = 0.0
+        for index in range(n_atoms - 2, -1, -1):
+            weight = float(self.weights[index])
+            if tail_mass + weight > atom_tol:
+                break
+            tail_mass += weight
+            first_dropped = index
+
+        keep = np.concatenate(
+            [np.arange(first_dropped, dtype=int), np.array([n_atoms - 1], dtype=int)]
+        )
+        kept_weights = self.weights[keep]
+        kept_weights = kept_weights / np.sum(kept_weights)
+        return DPRealization(
+            kept_weights,
+            self.alphas[keep],
+            self.lambdas[keep],
+            self.precision,
+        )
+
     def _scaled_time(self, t):
         t = np.atleast_1d(np.asarray(t, dtype=float))
         alpha = self.alphas[:, None]
