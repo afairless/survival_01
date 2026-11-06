@@ -59,8 +59,10 @@ __all__ = [
     "SurvData",
     "inverse_map",
     "inverse_time",
+    "log_alpha_integrand_censored",
     "log_alpha_integrand_uncensored",
     "log_integral_alpha",
+    "log_q0_censored",
     "log_q0_uncensored",
     "make_grid",
     "make_surv_data",
@@ -971,7 +973,7 @@ def log_q0_uncensored(
     np.ndarray
         ``float64[n]`` log ``q0^o(t_i)`` for every uncensored row.  Censored
         rows take the survival based mass ``q0^c`` of Eq. A.3 instead, which
-        reuses the same grid and integrand pattern.
+        reuses the same grid: see :func:`log_q0_censored`.
 
     Notes
     -----
@@ -998,6 +1000,110 @@ def log_q0_uncensored(
         - np.log(grid.time)
         + log_integral
     )
+
+
+def log_alpha_integrand_censored(
+    grid: AlphaGrid, *, gamma: float, phi: float, d: int
+) -> np.ndarray:
+    """Log of the Eq. A.3 integrand ``1 / (gamma + z**alpha)**d``.
+
+    Parameters
+    ----------
+    grid : AlphaGrid
+        Quadrature grid; supplies ``u`` and the cache ``T``.
+    gamma, phi : float
+        Current ``G0`` hyperparameters, both strictly positive.
+    d : int
+        Inverse-gamma shape of the base measure (``d = 2`` in the paper).
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n, M]`` log integrand at ``alpha_m = phi * u_m``.  Row ``i``
+        is, up to the omitted normalising constant, the density of
+        ``[alpha_i | gamma, phi, z_i]`` for a *right-censored* observation,
+        the survival counterpart of :func:`log_alpha_integrand_uncensored`.
+
+    Notes
+    -----
+    The survival ``1 - K_W(z | alpha, lambda) = exp(-z**alpha / lambda)``
+    marginalised over ``lambda ~ IGamma(d, gamma)`` leaves
+    ``gamma**d / (gamma + z**alpha)**d``, so the integrand carries the
+    exponent ``d`` and **no** ``alpha`` or ``1 / z`` factor: the ``alpha`` of
+    Eq. A.2 comes from the Weibull density's shape, and a censored row has no
+    density.  This is the one place where ``d + 1`` (the uncensored ``lambda``
+    shape) must not be reused (plan Section 11).
+    """
+    gamma = _as_positive_scalar(gamma, "gamma")
+    phi = _as_positive_scalar(phi, "phi")
+    d = _as_shape_parameter(d)
+    tau = grid.powers(phi)
+    return -d * np.log(gamma + tau)
+
+
+def log_q0_censored(
+    grid: AlphaGrid, *, gamma: float, phi: float, nu: float, d: int
+) -> np.ndarray:
+    """Log prior-predictive mass ``q0^c(z)`` of Eq. A.3, per observation.
+
+    This is the "new cluster" mass of the Polya urn for a *right-censored*
+    observation: the prior-predictive probability that the observation
+    exceeds its recorded time::
+
+        q0^c(z) = nu gamma**d / phi *
+                  integral_0^phi 1 / (gamma + z**alpha)**d dalpha
+
+    With the grid's change of variable ``alpha = phi u`` the ``phi`` of
+    ``dalpha`` cancels the ``1 / phi`` of the base density, exactly as in
+    Eq. A.2, so in log space::
+
+        log q0^c(z) = log nu + d log gamma
+                      + logsumexp_m[ -d log(gamma + T_im**phi) + log w_m ]
+
+    Parameters
+    ----------
+    grid : AlphaGrid
+        Grid built from the data whose times are the arguments of ``q0^c``.
+    gamma, phi, nu : float
+        Current ``G0`` hyperparameters and DP precision, all strictly positive.
+    d : int
+        Inverse-gamma shape of the base measure (``d = 2`` in the paper).
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n]`` log ``q0^c(z_i)``, one entry per row of the grid.  Use
+        :func:`log_q0_uncensored` for the uncensored rows; a censored row must
+        never be given the density mass (plan Section 11).
+
+    Notes
+    -----
+    Test 2 of plan Section 7.1 pins this against a nested ``quad`` over
+    ``(alpha, lambda)`` that integrates the survival ``exp(-z**alpha/lambda)``
+    against the inverse-gamma density numerically, i.e. without using the
+    analytic ``lambda`` marginal.  That comparison catches the constants of
+    A.3 -- the ``nu``, the ``gamma**d`` and above all the ``d`` instead of
+    ``d + 1`` exponent -- none of which the uncensored test can see.
+
+    Grid accuracy differs between the two branches and is stated here rather
+    than assumed: ``(gamma + z**alpha)**-d`` does not vanish at ``alpha = 0``,
+    so the omitted first cell of the plan's grid (nodes start at
+    ``alpha_1 = phi / M``, no ``alpha = 0`` node) costs ``O(1 / M)``, measured
+    at ``0.61 / M`` -- ``6e-3`` relative at the default ``M = 256``, versus
+    ``3e-5`` and ``O(1 / M**2)`` for Eq. A.2.  That is a property of the
+    prescribed quadrature, not of Eq. A.3, and it is negligible for the urn
+    weight; a finer grid (never a restructured one) is the plan's remedy.
+    """
+    gamma = _as_positive_scalar(gamma, "gamma")
+    phi = _as_positive_scalar(phi, "phi")
+    nu = _as_positive_scalar(nu, "nu")
+    d = _as_shape_parameter(d)
+    log_integral = log_integral_alpha(
+        log_alpha_integrand_censored(grid, gamma=gamma, phi=phi, d=d),
+        grid,
+        phi=phi,
+    )
+    return math.log(nu) + d * math.log(gamma) - math.log(phi) + log_integral
 
 
 def _as_shape_parameter(value: object, name: str = "d") -> int:
