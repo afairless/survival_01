@@ -69,6 +69,7 @@ __all__ = [
     "alpha_bound_guard_count",
     "refresh_cluster",
     "refresh_cluster_alpha",
+    "refresh_nu",
     "reset_alpha_bound_guard_count",
     "sample_step_a",
     "sample_step_a_for_obs",
@@ -2145,3 +2146,140 @@ def sample_step_b(
         refresh_cluster(state, data, prior, j=j, rng=rng)
         refresh_cluster_alpha(state, data, prior, j=j, rng=rng)
     state.check_invariants(prior)
+
+
+def _validate_nu_conditional_inputs(state: DPState, prior: DPPrior) -> None:
+    """Check the pieces of the ``nu`` conditional that a container cannot.
+
+    ``DPState`` already enforces ``n >= 1``, ``n_star >= 1`` and ``nu > 0`` at
+    construction, but :class:`DPPrior` stores the two Gamma hyperparameters as
+    plain floats and a caller can build it with a zero or negative shape.  The
+    Escobar-West update reads both, so a bad prior must raise at the update
+    rather than produce a ``NaN`` precision that poisons every later step.
+    """
+    a_nu = float(prior.a_nu)
+    b_nu = float(prior.b_nu)
+    if not np.isfinite(a_nu) or a_nu <= 0.0:
+        raise ValueError("prior.a_nu must be a finite, strictly positive number")
+    if not np.isfinite(b_nu) or b_nu <= 0.0:
+        raise ValueError("prior.b_nu must be a finite, strictly positive number")
+    if state.n < 1:
+        raise ValueError("the nu conditional needs at least one observation")
+    if state.n_star < 1:
+        raise ValueError("the nu conditional needs at least one cluster")
+    if not np.isfinite(state.nu) or state.nu <= 0.0:
+        raise StateInvariantError(
+            f"the current nu must be finite and positive, got {state.nu!r}"
+        )
+
+
+def refresh_nu(state: DPState, prior: DPPrior, *, rng: np.random.Generator) -> float:
+    """Refresh the DP precision ``nu`` by the Escobar-West augmentation.
+
+    This is the first and non-conjugate part of step (c) of plan Section 3.4,
+    the Appendix's Eq. (c) for the precision.  The Escobar-West auxiliary
+    variable device (Escobar & West 1995) turns the intractable
+    ``[nu | s]`` -- which involves the ratio of Gamma functions in the EPPF --
+    into two Gamma draws selected by a Bernoulli variable.  With ``a_nu``,
+    ``b_nu`` the shape and **rate** of the Gamma prior on ``nu``, ``n`` the
+    number of observations and ``n_star`` the current number of clusters:
+
+        ``u ~ Beta(nu + 1, n)``                       (current ``nu``)
+        ``p = (a_nu + n_star - 1) / (n (b_nu - log u) + a_nu + n_star - 1)``
+        ``nu ~ p Gamma(a_nu + n_star, rate = b_nu - log u)
+               + (1 - p) Gamma(a_nu + n_star - 1, rate = b_nu - log u)``
+
+    Every Gamma in the mixture has the same rate ``b_nu - log u``; only the
+    shape differs by one, and the mixing weight ``p`` is that same
+    ``a_nu + n_star - 1`` divided by the augmented total.  The three
+    quantities are easy to get subtly wrong, and all three are silent in a
+    trace: swapping the two shapes, using ``n_star`` where the formula wants
+    ``n_star - 1`` in ``p``, or reading ``b_nu`` as a scale.  Test 12 of plan
+    Section 7.2 is built to reject each of them.
+
+    ``u`` is drawn from ``Beta(nu + 1, n)`` at the **current** ``state.nu``,
+    not at the prior mean, and the returned value is the auxiliary (the caller
+    normally ignores it; test 12 needs it to check the conditional law of ``u``
+    at a fixed ``nu``).  ``nu`` itself enters the other conditionals only
+    through the prior-predictive masses ``q_0^i`` of step (a), so this update
+    touches no data and no cluster location.
+
+    Random-number consumption is fixed so that the golden regression of plan
+    Section 7.5 can replay a seed: exactly one beta variate, one uniform for
+    the mixture-component choice, and one gamma variate -- in that order --
+    regardless of which component is selected.  The uniform is drawn before
+    the gamma so the stream does not depend on the branch.
+
+    Degenerate arithmetic: ``b_nu > 0`` and ``log u <= 0``, so the rate
+    ``b_nu - log u`` is strictly positive for every ``u in (0, 1]`` and no
+    clipping is needed.  ``u = 1`` gives ``log u = 0``; that is the ``-log u``
+    of the formula, not a division by zero, and is handled explicitly rather
+    than through ``math.log`` of a value the beta generator is not supposed to
+    return.  ``a_nu + n_star - 1`` is positive because ``a_nu > 0`` and
+    ``n_star >= 1``, so both mixture components are proper and ``p`` lies in
+    ``(0, 1)``.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place: only ``nu`` is replaced.  ``alpha``, ``lam``, ``s``,
+        ``alpha_star``, ``lam_star``, ``n_j``, ``gamma`` and ``phi`` are
+        untouched, and the invariant ``nu > 0`` is re-checked after the draw.
+    prior : DPPrior
+        Supplies ``a_nu`` and ``b_nu`` (Gamma shape and rate).
+    rng : np.random.Generator
+        Random generator; the only source of randomness.
+
+    Returns
+    -------
+    float
+        The auxiliary ``u``, for the conditional-law test of plan
+        Section 7.2 test 12.
+
+    Raises
+    ------
+    ValueError
+        If ``a_nu`` or ``b_nu`` is not finite and strictly positive.
+    StateInvariantError
+        If the current ``nu`` is not finite and positive, or if the draw is
+        not finite and positive.
+
+    Notes
+    -----
+    Step (c) runs ``nu``, then ``phi``, then ``gamma`` (plan Section 3.4).
+    ``phi`` is refreshed after this function because its Pareto lower bound
+    reads ``max_j alpha*_j`` from step (b); ``nu`` does not depend on ``phi``,
+    so the order inside the two remaining hyperparameter updates is free.
+    """
+    _validate_nu_conditional_inputs(state, prior)
+    n = state.n
+    n_star = state.n_star
+    a_nu = float(prior.a_nu)
+    b_nu = float(prior.b_nu)
+
+    u = float(rng.beta(float(state.nu) + 1.0, float(n)))
+    if not 0.0 < u <= 1.0:
+        raise StateInvariantError(
+            f"the Escobar-West auxiliary u was not in (0, 1]: got {u!r}"
+        )
+    # u = 1 has probability zero for a continuous beta, but represents the
+    # well-defined limit -log u = 0 and must not reach math.log.
+    log_u = math.log(u) if u < 1.0 else 0.0
+
+    rate = b_nu - log_u
+    numerator = a_nu + n_star - 1.0
+    probability_high = numerator / (n * rate + numerator)
+
+    # One uniform is consumed even when one component has zero probability, so
+    # the random-number stream has the same length on every call.
+    choose_high = float(rng.random()) < probability_high
+    shape = a_nu + n_star if choose_high else a_nu + n_star - 1.0
+    nu_new = float(rng.gamma(shape=shape, scale=1.0 / rate))
+
+    if not np.isfinite(nu_new) or nu_new <= 0.0:
+        raise StateInvariantError(
+            f"the nu draw was not a finite positive number: {nu_new!r} "
+            f"(shape={shape!r}, rate={rate!r})"
+        )
+    state.nu = nu_new
+    return u
