@@ -66,6 +66,7 @@ __all__ = [
     "log_alpha_integrand_uncensored",
     "log_integral_alpha",
     "draw_g0_conditional_alpha",
+    "ess",
     "init_state",
     "log_post",
     "log_q0_censored",
@@ -73,12 +74,14 @@ __all__ = [
     "make_grid",
     "make_surv_data",
     "alpha_bound_guard_count",
+    "autocorr_time",
     "refresh_cluster",
     "refresh_cluster_alpha",
     "refresh_gamma",
     "refresh_nu",
     "refresh_phi",
     "reset_alpha_bound_guard_count",
+    "r_hat",
     "sample_chain",
     "sample_chains",
     "sample_step_a",
@@ -3541,3 +3544,433 @@ def sample_chains(
         return [_sample_one_chain(task) for task in tasks]
     with ProcessPoolExecutor(max_workers=workers) as executor:
         return list(executor.map(_sample_one_chain, tasks))
+
+
+# ---------------------------------------------------------------------------
+# Convergence diagnostics (plan Section 3.7, test 31)
+# ---------------------------------------------------------------------------
+#
+# The stored traces are autocorrelated by construction: the Gibbs sweep is a
+# Markov kernel, so successive draws are not independent and a naive
+# ``sd / sqrt(B)`` standard error would understate the Monte Carlo noise by the
+# integrated autocorrelation time ``tau``.  The diagnostics below implement the
+# three quantities plan Section 3.7 requires without a new dependency:
+#
+# * ``autocorr_time`` -- the integrated autocorrelation time of one trace,
+#   ``tau = 1 + 2 sum_{k>=1} rho_k``, truncated by Geyer's initial positive
+#   sequence (the standard estimator; summing every sample autocorrelation is
+#   dominated by noise at long lags);
+# * ``r_hat`` -- Gelman's split potential scale reduction ``sqrt(var_hat / W)``,
+#   with every chain cut into two halves so that a within-chain trend is seen
+#   as a between-chain difference (the reason the plan asks for *split*
+#   R-hat and not the original statistic);
+# * ``ess`` -- the bulk effective sample size, ``sum_b n_b / tau_b``, i.e. the
+#   number of independent draws carrying the same information about a mean.
+#
+# ``r_hat`` and ``ess`` operate on a sequence of ``DPChains`` and select a
+# trace by ``name``; for the analytic checks of test 31 -- and for any caller
+# that already holds a trace -- they also accept a sequence of 1-D float
+# arrays, in which case ``name`` is only the label used in the returned dict.
+# The two input kinds are not mixed in one call.
+#
+# The ``S`` trace is the observation-level mixture evaluated at five times on
+# the original scale, ``S_b(t) = (1/n) sum_i exp(-t_tilde_i(t)**alpha_bi /
+# lambda_bi)`` with ``t_tilde = 1 + t / t_max``.  It is the collapsed
+# posterior's plug-in survival: ``DPChains`` stores per-observation locations
+# and not the cluster labels or a draw of ``G``, so the cluster-level
+# ``S`` of ``dp_functionals`` (which Rao-Blackwellises over a drawn ``G_b``)
+# is not available here and is not what a convergence diagnostic needs.  The
+# five times are fixed fractions of ``t_max`` -- ``0.2, 0.4, 0.6, 0.8, 1`` --
+# because they must be comparable across chains and draws (the endpoints 0
+# and ``t_max`` alone would be degenerate: ``S(0) = 1`` for every draw).
+
+_DIAGNOSTIC_NAMES = ("nu", "n_star", "S")
+_DIAGNOSTIC_TIME_FRACTIONS = np.array([0.2, 0.4, 0.6, 0.8, 1.0], dtype=np.float64)
+
+
+def _as_trace(values: object, name: str) -> np.ndarray:
+    """Normalise one 1-D trace to an owned, finite ``float64`` array.
+
+    Diagnostic inputs are validated as strictly as chain storage is: a
+    two-dimensional array silently reinterpreted as several traces, a scalar
+    promoted to length one or a ``NaN`` reaching the autocorrelation all turn
+    a reported R-hat into a confident-looking number with no relation to the
+    sampler.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError(
+            f"{name} must be a 1-D trace of one value per stored draw, "
+            f"got shape {arr.shape}"
+        )
+    if arr.size < 2:
+        raise ValueError(f"{name} must contain at least two draws, got {arr.size}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values (no NaN or inf)")
+    return np.array(arr, dtype=np.float64, copy=True)
+
+
+def _autocovariance(x: np.ndarray) -> np.ndarray:
+    """Biased sample autocovariance ``gamma_k`` for lags ``k = 0 .. n-1``.
+
+    Computed through a zero-padded FFT (``O(n log n)``) rather than
+    ``np.correlate`` (``O(n^2)``): a stored chain is up to ``10^4`` draws and
+    diagnostics are evaluated over several traces.  The ``1/n`` normalisation
+    is the biased estimator used with Geyer's initial positive sequence: it is
+    the standard pairing for that truncation rule and it damps the noisy
+    long-lag autocovariances as ``1 - k/n``.
+    """
+    n = int(x.size)
+    centered = x - x.mean()
+    n_fft = 1 << (2 * n - 1).bit_length()
+    spectrum = np.fft.rfft(centered, n_fft)
+    acov = np.fft.irfft(spectrum * np.conj(spectrum), n_fft)[:n]
+    return acov / n
+
+
+def autocorr_time(x: np.ndarray) -> float:
+    """Integrated autocorrelation time of one stored trace (plan Section 3.7).
+
+    The returned value is
+
+        ``tau(x) = 1 + 2 * sum_{k>=1} rho_k``,
+
+    where ``rho_k`` is the lag-``k`` sample autocorrelation.  The estimate is
+    truncated by Geyer's initial positive sequence: autocorrelations are added
+    in pairs ``(rho_2k, rho_2k+1)`` and the sum stops at the first non-positive
+    pair.  Truncation is what makes the estimator usable: the sample
+    autocorrelation at long lags is dominated by noise, and including it would
+    make ``tau`` grow with the trace length.  For a chain with
+    ``x_t = rho x_{t-1} + eps_t`` the population value is
+    ``(1 + rho) / (1 - rho)``, so ``ess = n / tau`` reproduces the analytic
+    ``n (1 - rho) / (1 + rho)`` used by test 31.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        One stored trace, 1-D and finite, at least two draws.
+
+    Returns
+    -------
+    float
+        The integrated autocorrelation time, strictly positive.  It is ``1``
+        for independent draws and ``> 1`` for a positively autocorrelated
+        chain; antithetic chains give ``< 1`` and hence ``ess > n``.
+
+    Raises
+    ------
+    ValueError
+        If ``x`` is not 1-D, has fewer than two draws, is not finite, or is
+        constant (its autocorrelation is ``0/0`` and no autocorrelation time
+        can be defined).
+    """
+    arr = _as_trace(x, "x")
+    acov = _autocovariance(arr)
+    if acov[0] <= 0.0:
+        raise ValueError(
+            "x is constant; the autocorrelation time is undefined "
+            "(zero variance, no autocorrelation)"
+        )
+    rho = acov / acov[0]
+
+    total = 0.0
+    pair = 0
+    while 2 * pair < arr.size:
+        index = 2 * pair
+        pair_sum = rho[index]
+        if index + 1 < arr.size:
+            pair_sum += rho[index + 1]
+        if pair_sum <= 0.0:
+            break
+        total += pair_sum
+        pair += 1
+
+    tau = -1.0 + 2.0 * total
+    # A numerically negative tau (only reachable when the very first pair is
+    # dominated by round-off on a strongly antithetic trace) is floored rather
+    # than returned as a negative time, which would invert the ESS sign.
+    floor = 1.0 / arr.size
+    return float(max(tau, floor))
+
+
+def _as_diagnostic_chains(chains: object) -> list[object]:
+    """Normalise the ``chains`` argument to a non-empty list of chains/traces.
+
+    A single ``DPChains`` or a 1-D array is rejected with the "wrap it in a
+    list" hint: either would make a multi-chain diagnostic silently report a
+    single-chain value, which always looks better than it is.
+    """
+    if isinstance(chains, DPChains):
+        raise ValueError(
+            "chains must be a sequence of DPChains (not a single chain); "
+            "wrap a single entry in a list, e.g. ``[chain]``"
+        )
+    if isinstance(chains, np.ndarray):
+        if chains.ndim == 1:
+            raise ValueError(
+                "chains must be a sequence of 1-D traces, not a single trace; "
+                "wrap it in a list, e.g. ``[trace]``"
+            )
+        if chains.ndim != 2:
+            raise ValueError(
+                "chains must be a sequence of 1-D traces or a 2-D array of "
+                f"traces, got shape {chains.shape}"
+            )
+        items: list[object] = [chains[i] for i in range(chains.shape[0])]
+    else:
+        try:
+            items = list(chains)  # type: ignore[call-overload]
+        except TypeError as exc:
+            raise ValueError(
+                "chains must be a sequence of DPChains or 1-D traces"
+            ) from exc
+    if not items:
+        raise ValueError("chains must contain at least one chain")
+    return items
+
+
+def _survival_trace(chain: DPChains) -> np.ndarray:
+    """Observation-level survival mixture at the five diagnostic times.
+
+    Returns ``float64[n_draws, 5]``: one column per diagnostic time, with
+
+        ``S_b(t) = (1/n) sum_i exp(-t_tilde**alpha_bi / lambda_bi)``
+        ``t_tilde = 1 + t / t_max``.
+
+    The per-observation average is used because that is the mixture stored in
+    ``DPChains``; see the section comment above for why the cluster-level
+    functional is deliberately not reconstructed here.
+    """
+    t_tilde = 1.0 + _DIAGNOSTIC_TIME_FRACTIONS
+    alpha = chain.theta[:, :, 0]
+    lam = chain.theta[:, :, 1]
+    kernels = np.exp(-(t_tilde[None, :, None] ** alpha[:, None, :]) / lam[:, None, :])
+    return kernels.mean(axis=2)
+
+
+def _chain_traces(
+    chains: list[DPChains], name: str
+) -> tuple[list[np.ndarray], np.ndarray | None]:
+    """Extract the named trace from every chain and optional point labels.
+
+    Returns ``(traces, labels)`` where ``labels`` is ``None`` for a scalar
+    trace and the five original-scale times for ``name == "S"``.  For ``S``
+    every chain must hold the same dataset: comparing survival at different
+    ``t_max`` values would make split R-hat a variance ratio of curves
+    evaluated at different times.
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"name must be a string, got {name!r}")
+    if name not in _DIAGNOSTIC_NAMES:
+        raise ValueError(f"name must be one of {_DIAGNOSTIC_NAMES!r}, got {name!r}")
+    if name == "nu":
+        return [chain.nu for chain in chains], None
+    if name == "n_star":
+        return [np.asarray(chain.n_star, dtype=np.float64) for chain in chains], None
+
+    first = chains[0]
+    labels = _DIAGNOSTIC_TIME_FRACTIONS * first.data.t_max
+    traces = []
+    for chain in chains:
+        if chain.n != first.n:
+            raise ValueError(
+                "chains must share the same dataset to compare S: "
+                f"got n={chain.n} and n={first.n}"
+            )
+        if chain.data.t_max != first.data.t_max:
+            raise ValueError(
+                "chains must share the same dataset to compare S: "
+                f"got t_max={chain.data.t_max} and t_max={first.data.t_max}"
+            )
+        traces.append(_survival_trace(chain))
+    return traces, labels
+
+
+def _trace_matrix(
+    chains: object, name: str
+) -> tuple[list[np.ndarray], np.ndarray | None]:
+    """Resolve ``chains``/``name`` to a list of traces and optional labels.
+
+    Accepts either a sequence of ``DPChains`` with a vocabulary name, or a
+    sequence of 1-D traces (``name`` is then used only as the result label).
+    Mixing the two kinds is rejected rather than resolved by guessing.
+    """
+    items = _as_diagnostic_chains(chains)
+    is_chain = [isinstance(item, DPChains) for item in items]
+    if all(is_chain):
+        return _chain_traces(items, name)  # type: ignore[arg-type]
+    if any(is_chain):
+        raise ValueError(
+            "chains must be all DPChains or all 1-D traces; "
+            "mixing them in one call is ambiguous"
+        )
+    return [_as_trace(item, name) for item in items], None
+
+
+def _split_r_hat(traces: list[np.ndarray]) -> float:
+    """Split R-hat for one scalar statistic (plan Section 3.7).
+
+    Every chain is cut into two halves (first half and last half; the middle
+    draw of an odd-length chain is dropped), and the potential scale reduction
+
+        ``R = sqrt(var_hat / W)``,
+        ``W = mean_j s_j^2``,
+        ``B = m * var_j(mean_j)``,
+        ``var_hat = (m - 1) / m * W + B / m``
+
+    is evaluated over the ``2 * len(traces)`` sub-chains, with ``m`` draws per
+    half and ``s_j^2`` the within-half variance (``ddof=1``).
+
+    Splitting is the point of the statistic: a chain that is still drifting
+    upward has a *within*-chain mean shift, so unsplit R-hat cannot see it,
+    while the two halves differ between chains exactly as two independent
+    runs started at different values would.  The variance ratio is taken over
+    sub-chains, never over draws: applying it over the draw axis returns
+    ``R ~ 1`` for any input and is the silent bug test 31 is designed to catch.
+
+    A degenerate all-constant input has ``W = 0``.  When the constants agree
+    the chains are trivially converged and ``1.0`` is returned; when they
+    disagree the between-chain spread is finite while ``W`` is zero, and the
+    correct statement is ``inf`` rather than a division error.
+    """
+    if not traces:
+        raise ValueError("at least one trace is required")
+    lengths = {int(trace.size) for trace in traces}
+    if len(lengths) != 1:
+        raise ValueError(
+            "split R-hat requires traces of equal length, got lengths "
+            f"{sorted(lengths)}"
+        )
+    n = lengths.pop()
+    if n < 4:
+        raise ValueError(
+            "split R-hat requires at least four draws per chain "
+            f"(two per half), got {n}"
+        )
+    half = n // 2
+    sub_chains = []
+    for trace in traces:
+        sub_chains.append(trace[:half])
+        sub_chains.append(trace[-half:])
+
+    means = np.array([sub.mean() for sub in sub_chains], dtype=np.float64)
+    variances = np.array([sub.var(ddof=1) for sub in sub_chains], dtype=np.float64)
+    within = float(variances.mean())
+    between = float(half * means.var(ddof=1))
+    if within == 0.0:
+        return 1.0 if between == 0.0 else math.inf
+    var_hat = (half - 1.0) / half * within + between / half
+    return float(math.sqrt(var_hat / within))
+
+
+def _bulk_ess(traces: list[np.ndarray]) -> float:
+    """Bulk effective sample size of one scalar statistic.
+
+    ``sum_b n_b / tau_b``: each chain contributes the number of independent
+    draws that would carry the same information about its mean.  Summing the
+    per-chain contributions is exact when the chains are independent (they are:
+    one seed per chain) and avoids the pooled-autocorrelation bookkeeping that
+    would have to assume a common stationary variance across chains.
+    """
+    if not traces:
+        raise ValueError("at least one trace is required")
+    return float(sum(trace.size / autocorr_time(trace) for trace in traces))
+
+
+def r_hat(chains: object, name: str = "nu") -> dict[str, float | np.ndarray]:
+    """Split R-hat of the named statistic across chains (plan Section 3.7).
+
+    Parameters
+    ----------
+    chains : sequence of DPChains or sequence of np.ndarray
+        Independent chains.  A sequence of ``DPChains`` selects a stored trace
+        by ``name``; a sequence of 1-D traces (or a 2-D ``(n_chains, n_draws)``
+        array) is used directly, with ``name`` serving as the result label.
+        Every chain must have the same number of stored draws.
+    name : str
+        ``"nu"``, ``"n_star"`` or ``"S"`` when ``chains`` are ``DPChains``.
+        For raw traces any string is accepted and is only the result label.
+        The ``"S"`` trace is the observation-level survival mixture at the
+        five original-scale times ``0.2, 0.4, 0.6, 0.8, 1.0`` times ``t_max``.
+
+    Returns
+    -------
+    dict
+        ``{"nu": R}`` (or ``{"n_star": R}``) with a Python ``float`` for a
+        scalar statistic, or ``{"S": R_array, "t": t_array}`` with
+        ``R_array`` of shape ``(5,)`` and the five original-scale times.
+        ``R`` is ``1`` at convergence; the acceptance rule of plan Section
+        3.7 is ``R < 1.05`` on every monitored quantity.
+
+    Raises
+    ------
+    ValueError
+        If ``chains`` is empty, a single chain/trace, mixed kinds, or a
+        ``DPChains`` sequence with an unknown ``name``; if the traces differ
+        in length or have fewer than four draws; if the raw traces are not
+        finite; or if ``S`` is requested from chains fitted to different
+        datasets.
+
+    Notes
+    -----
+    This is not the rank-normalised R-hat of Vehtari et al. (2021): plan
+    Section 3.7 asks for Gelman's split statistic, which is what the paper
+    reports.  A heavy-tailed posterior can therefore leave R-hat above 1.05
+    even for a well-mixed chain; the mixing test of plan Section 7.3 uses
+    ``quick`` runs where that is not the dominant effect.
+    """
+    traces, labels = _trace_matrix(chains, name)
+    first = traces[0]
+    if first.ndim == 1:
+        return {name: _split_r_hat(traces)}
+    if labels is None:  # pragma: no cover - defensive; only "S" is 2-D
+        raise ValueError("multi-point traces need labels")
+    n_points = int(first.shape[1])
+    values = np.array(
+        [_split_r_hat([trace[:, j] for trace in traces]) for j in range(n_points)],
+        dtype=np.float64,
+    )
+    return {name: values, "t": np.array(labels, dtype=np.float64, copy=True)}
+
+
+def ess(chains: object, name: str = "nu") -> dict[str, float | np.ndarray]:
+    """Bulk effective sample size of the named statistic (plan Section 3.7).
+
+    Parameters
+    ----------
+    chains : sequence of DPChains or sequence of np.ndarray
+        As for :func:`r_hat`.  Chains need not have equal length for ESS: the
+        per-chain contributions are summed.
+    name : str
+        ``"nu"``, ``"n_star"`` or ``"S"`` for ``DPChains``; any label for raw
+        traces.  ``"S"`` uses the same five times as :func:`r_hat`.
+
+    Returns
+    -------
+    dict
+        ``{"nu": ESS}`` (or ``{"n_star": ESS}``) with a Python ``float``, or
+        ``{"S": ESS_array, "t": t_array}`` with one ESS per diagnostic time.
+        ``ESS`` is the number of independent draws with the same information
+        about the mean; it can exceed the number of stored draws when the
+        chain is antithetic (negative autocorrelation).
+
+    Raises
+    ------
+    ValueError
+        If the inputs are malformed, or if a trace is constant, in which case
+        :func:`autocorr_time` cannot be defined.  A constant trace is a
+        genuine diagnostic failure (a chain stuck at one value), not a
+        missing-number case to paper over with ``n``.
+    """
+    traces, labels = _trace_matrix(chains, name)
+    first = traces[0]
+    if first.ndim == 1:
+        return {name: _bulk_ess(traces)}
+    if labels is None:  # pragma: no cover - defensive; only "S" is 2-D
+        raise ValueError("multi-point traces need labels")
+    n_points = int(first.shape[1])
+    values = np.array(
+        [_bulk_ess([trace[:, j] for trace in traces]) for j in range(n_points)],
+        dtype=np.float64,
+    )
+    return {name: values, "t": np.array(labels, dtype=np.float64, copy=True)}
