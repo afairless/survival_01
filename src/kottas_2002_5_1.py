@@ -1,105 +1,112 @@
-#! /usr/bin/env python3
+#!/usr/bin/env python3
+"""Legacy entry point for the Kottas (2002) Section 5.1 example.
 
-from dataclasses import dataclass, field
+Scope
+-----
+This module is kept for history only.  It used to carry its own copy of the
+two-lognormal generator, a ``_demo()``-style script and a ``main()`` that ended
+in an undefined ``theta`` behind a ``if __name__ == "__main__()":`` guard, so it
+had never run.  Plan decision 10 replaces that body with a thin wrapper:
 
-import numpy as np
-from scipy.stats import lognorm
+* the data generator is :class:`src.paper_data.TwoLognormalMix` (re-exported
+  here so old imports keep working);
+* the run itself is :func:`src.paper_examples.example_5_1`, which does the
+  sampling, the prior band and Figures 1-3 under the git-ignored
+  ``docs/research/figures/`` directory.
 
-from src.dp_weibull import (
-    b_gamma_b_phi_from_weibull,
-    sample_dp_prior,
-    sample_prior_hyperparameters,
-    weibull_from_median_iqr,
+Non-goals
+---------
+No model code, no plotting and no data generation lives here; nothing in the
+package imports this module.  Use the driver directly for anything new:
+``python -m src.paper_examples --example 5.1``.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+from pathlib import Path
+
+from src.paper_data import TwoLognormalMix
+from src.paper_examples import (
+    DEFAULT_FIGURE_DIR,
+    PRESETS,
+    SEED_5_1,
+    DemoResult,
+    Preset,
+    example_5_1,
 )
 
-
-@dataclass
-class TwoLognormalMix:
-    mu_1: float = 0
-    mu_2: float = 0
-    sigma_1: float = 1
-    sigma_2: float = 1
-    p: float = 0.5
-    n: int = 100
-    seed: int = 250118
-
-    p1_n: int = field(init=False)
-    p2_n: int = field(init=False)
-    lgn_mix: np.ndarray = field(init=False)
-
-    def __post_init__(self):
-
-        self.p1_n = round(self.p * self.n)
-        self.p2_n = self.n - self.p1_n
-
-        lgn_1 = lognorm.rvs(
-            s=np.sqrt(self.sigma_1),
-            scale=np.exp(self.mu_1),
-            size=self.p1_n,
-            random_state=self.seed,
-        )
-        lgn_2 = lognorm.rvs(
-            s=np.sqrt(self.sigma_2),
-            scale=np.exp(self.mu_2),
-            size=self.p2_n,
-            random_state=self.seed,
-        )
-        self.lgn_mix = np.append(lgn_1, lgn_2)
+__all__ = ["TwoLognormalMix", "build_parser", "main", "run"]
 
 
-def main() -> None:
-    """
-    mu_1 = 0
-    mu_2 = 1.2
-    sigma_1 = 0.25
-    sigma_2 = 0.02
-    p = 0.8
-    n = 2000
-    p1_n = round(p * n)
-    p2_n = n - p1_n
-    seed = 721383
-
-    lgn_mix = TwoLognormalMix(
-        mu_1=mu_1, mu_2=mu_2, sigma_1=sigma_1, sigma_2=sigma_2, p=p, n=n, seed=seed)
-
-    alpha = 2
-    beta = 0.9
-    n = 2000
-    seed = 786112
-    gamma.rvs(a=alpha, loc=0, scale=1/beta, size=n, random_state=seed)
-    x = np.linspace(start=0, stop=12, num=1000)
-    gy = gamma.pdf(x=x, a=alpha, loc=0, scale=1/beta)
-    """
-    """
-    plt.clf()
-    plt.close()
-    plt.hist(lgn_mix.lgn_mix, bins=50)
-
-    plt.show()
-
-
-    plt.clf()
-    plt.close()
-    plt.plot(x, gy)
-
-    plt.show()
-    """
-
-    rng = np.random.default_rng(887373)
-    alpha_tilde, lambda_tilde = weibull_from_median_iqr(median=1.1727, iqr=1.3679)
-    b_gamma, b_phi = b_gamma_b_phi_from_weibull(alpha_tilde, lambda_tilde)
-    a_nu = 2.0
-    b_nu = 0.9
-    a_gamma = 1.0
-    a_phi = 2.0
-
-    nu, gamma, phi = sample_prior_hyperparameters(
-        a_nu, b_nu, a_gamma, b_gamma, a_phi, b_phi, rng=rng
+def build_parser() -> argparse.ArgumentParser:
+    """Argument parser for the legacy script (a subset of the driver's CLI)."""
+    parser = argparse.ArgumentParser(
+        prog="kottas_2002_5_1",
+        description=(
+            "Legacy entry point for Kottas (2002) Section 5.1.  Delegates to "
+            "src.paper_examples.example_5_1 and writes Figures 1-3."
+        ),
     )
+    parser.add_argument(
+        "--preset",
+        default="quick",
+        choices=tuple(PRESETS),
+        help="run length preset (default: quick)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=SEED_5_1,
+        help=f"chain-group base seed (default: {SEED_5_1})",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=DEFAULT_FIGURE_DIR,
+        help=f"figure directory (default: {DEFAULT_FIGURE_DIR})",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="chain pool size (default: min(n_chains, cpu count))",
+    )
+    return parser
 
-    sample_dp_prior(nu, gamma, phi, epsilon=1e-4, rng=rng)
-    # G = sample_dp_posterior(nu, gamma, phi, theta, d=2, epsilon=1e-4, rng=rng)
+
+def run(
+    *,
+    preset: str | Preset = "quick",
+    seed: int | None = SEED_5_1,
+    out_dir: Path | str = DEFAULT_FIGURE_DIR,
+    max_workers: int | None = None,
+) -> DemoResult:
+    """Run the Section 5.1 example through the driver and report its figures."""
+    result = example_5_1(
+        preset=preset,
+        seed=seed,
+        out_dir=out_dir,
+        max_workers=max_workers,
+    )
+    print(f"example {result.label}: {len(result.fits)} fit(s)")
+    for path in result.figures:
+        print(f"wrote {path}")
+    return result
 
 
-if __name__ == "__main__()":
-    main()
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point.  Returns 0 on success; argparse exits 2 on bad input."""
+    args = build_parser().parse_args(argv)
+    run(
+        preset=args.preset,
+        seed=args.seed,
+        out_dir=args.out,
+        max_workers=args.max_workers,
+    )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())
