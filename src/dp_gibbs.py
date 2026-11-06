@@ -48,7 +48,6 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.special import logsumexp
 
 __all__ = [
     "AlphaGrid",
@@ -67,6 +66,8 @@ __all__ = [
     "log_q0_uncensored",
     "make_grid",
     "make_surv_data",
+    "sample_step_a",
+    "sample_step_a_for_obs",
     "trapezoid_log_weights",
     "transform_time",
 ]
@@ -898,6 +899,22 @@ def log_alpha_integrand_uncensored(
     return np.log(alpha)[None, :] + phi * np.log(grid.T) - (d + 1) * np.log(gamma + tau)
 
 
+def _logsumexp_rows(values: np.ndarray) -> np.ndarray:
+    """Row-wise ``log(sum(exp(values), axis=1))`` with a max shift.
+
+    Same algorithm as ``scipy.special.logsumexp(..., axis=1)`` -- subtract the
+    row maximum before exponentiating and add it back -- without the SciPy
+    array-API dispatch, which costs more than the arithmetic on the small rows
+    of this module.  Every row must contain at least one finite entry; the
+    integrands integrated here always do (they are ``-inf`` only if
+    ``gamma + t**alpha`` overflowed, which cannot happen for ``t <= 2`` and a
+    fitted ``phi``).
+    """
+    values = np.asarray(values, dtype=np.float64)
+    row_max = np.max(values, axis=1)
+    return row_max + np.log(np.sum(np.exp(values - row_max[:, None]), axis=1))
+
+
 def log_integral_alpha(
     log_integrand: np.ndarray, grid: AlphaGrid, *, phi: float
 ) -> np.ndarray:
@@ -907,6 +924,14 @@ def log_integral_alpha(
     ``alpha`` with ``logsumexp`` over the nodes, so that the sum of integrand
     values can never underflow to zero.  The change of variable
     ``alpha = phi * u`` is accounted for by the ``log(phi)`` term.
+
+    The row-wise sum uses the same max-shift stabilisation as
+    ``scipy.special.logsumexp`` but is written here directly on the 2-D array:
+    the SciPy wrapper resolves an array namespace on every call (about 0.15 ms
+    for a 16-node row in this environment), and step (a) forms this integral
+    once per observation, so it would dominate the sweep cost of plan
+    Section 8.  The arithmetic is unchanged -- only the dispatch overhead is
+    removed.
 
     Parameters
     ----------
@@ -934,11 +959,29 @@ def log_integral_alpha(
             f"log_integrand must have shape ({grid.n}, {grid.M}), "
             f"got {log_integrand.shape}"
         )
-    return logsumexp(log_integrand + grid.log_w[None, :], axis=1) + math.log(phi)
+    return _log_integral_rows(log_integrand, grid, phi=phi)
+
+
+def _log_integral_rows(
+    log_integrand: np.ndarray, grid: AlphaGrid, *, phi: float
+) -> np.ndarray:
+    """Quadrature core: integrate already-selected rows, without validation.
+
+    Shared by :func:`log_integral_alpha` (all rows) and by the ``rows``
+    subset of :func:`log_q0_uncensored` / :func:`log_q0_censored`, which step
+    (a) uses to integrate only the observations of one censoring branch.
+    """
+    return _logsumexp_rows(log_integrand + grid.log_w[None, :]) + math.log(phi)
 
 
 def log_q0_uncensored(
-    grid: AlphaGrid, *, gamma: float, phi: float, nu: float, d: int
+    grid: AlphaGrid,
+    *,
+    gamma: float,
+    phi: float,
+    nu: float,
+    d: int,
+    rows: np.ndarray | None = None,
 ) -> np.ndarray:
     """Log prior-predictive density ``q0^o(t)`` of Eq. A.2, per observation.
 
@@ -968,11 +1011,17 @@ def log_q0_uncensored(
         Current ``G0`` hyperparameters and DP precision, all strictly positive.
     d : int
         Inverse-gamma shape of the base measure (``d = 2`` in the paper).
+    rows : np.ndarray, optional
+        Subset of grid rows to evaluate.  ``None`` (the default) evaluates
+        every row.  Step (a) passes the uncensored rows only, so a
+        right-censored observation never pays for the density quadrature it
+        cannot use; the result then has ``rows.size`` entries, in the order
+        given.
 
     Returns
     -------
     np.ndarray
-        ``float64[n]`` log ``q0^o(t_i)`` for every uncensored row.  Censored
+        ``float64[n]`` log ``q0^o(t_i)`` for every evaluated row.  Censored
         rows take the survival based mass ``q0^c`` of Eq. A.3 instead, which
         reuses the same grid: see :func:`log_q0_censored`.
 
@@ -988,17 +1037,17 @@ def log_q0_uncensored(
     phi = _as_positive_scalar(phi, "phi")
     nu = _as_positive_scalar(nu, "nu")
     d = _as_shape_parameter(d)
-    log_integral = log_integral_alpha(
-        log_alpha_integrand_uncensored(grid, gamma=gamma, phi=phi, d=d),
-        grid,
-        phi=phi,
+    log_integrand = _select_rows(
+        log_alpha_integrand_uncensored(grid, gamma=gamma, phi=phi, d=d), rows
     )
+    times = _select_rows(grid.time, rows)
+    log_integral = _log_integral_rows(log_integrand, grid, phi=phi)
     return (
         math.log(d)
         + math.log(nu)
         + d * math.log(gamma)
         - math.log(phi)
-        - np.log(grid.time)
+        - np.log(times)
         + log_integral
     )
 
@@ -1043,7 +1092,13 @@ def log_alpha_integrand_censored(
 
 
 def log_q0_censored(
-    grid: AlphaGrid, *, gamma: float, phi: float, nu: float, d: int
+    grid: AlphaGrid,
+    *,
+    gamma: float,
+    phi: float,
+    nu: float,
+    d: int,
+    rows: np.ndarray | None = None,
 ) -> np.ndarray:
     """Log prior-predictive mass ``q0^c(z)`` of Eq. A.3, per observation.
 
@@ -1069,11 +1124,14 @@ def log_q0_censored(
         Current ``G0`` hyperparameters and DP precision, all strictly positive.
     d : int
         Inverse-gamma shape of the base measure (``d = 2`` in the paper).
+    rows : np.ndarray, optional
+        Subset of grid rows to evaluate, as in :func:`log_q0_uncensored`.
+        ``None`` (the default) evaluates every row.
 
     Returns
     -------
     np.ndarray
-        ``float64[n]`` log ``q0^c(z_i)``, one entry per row of the grid.  Use
+        ``float64[n]`` log ``q0^c(z_i)``, one entry per evaluated row.  Use
         :func:`log_q0_uncensored` for the uncensored rows; a censored row must
         never be given the density mass (plan Section 11).
 
@@ -1099,12 +1157,27 @@ def log_q0_censored(
     phi = _as_positive_scalar(phi, "phi")
     nu = _as_positive_scalar(nu, "nu")
     d = _as_shape_parameter(d)
-    log_integral = log_integral_alpha(
-        log_alpha_integrand_censored(grid, gamma=gamma, phi=phi, d=d),
-        grid,
-        phi=phi,
+    log_integrand = _select_rows(
+        log_alpha_integrand_censored(grid, gamma=gamma, phi=phi, d=d), rows
     )
+    log_integral = _log_integral_rows(log_integrand, grid, phi=phi)
     return math.log(nu) + d * math.log(gamma) - math.log(phi) + log_integral
+
+
+def _select_rows(values: np.ndarray, rows: np.ndarray | None) -> np.ndarray:
+    """Return ``values`` or the subset named by ``rows``.
+
+    ``rows`` must be a 1-D array of integer indices into ``values``; ``None``
+    selects everything.  Used by the ``rows`` option of the ``q0`` helpers so
+    that the integrand and the ``1 / t`` factor are subset by the same index
+    array.
+    """
+    if rows is None:
+        return np.asarray(values)
+    rows = np.asarray(rows)
+    if rows.ndim != 1 or not np.issubdtype(rows.dtype, np.integer):
+        raise ValueError("rows must be a 1-D array of integer indices")
+    return np.asarray(values)[rows]
 
 
 def _as_shape_parameter(value: object, name: str = "d") -> int:
@@ -1268,3 +1341,360 @@ def draw_g0_conditional_alpha(
     lam_scale = gamma + t**alpha
     lam = float(1.0 / rng.gamma(shape=lam_shape, scale=1.0 / lam_scale))
     return alpha, lam
+
+
+def _log_q0_by_observation(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    grid: AlphaGrid,
+    rows: np.ndarray | None = None,
+) -> np.ndarray:
+    """Log prior-predictive masses ``q0^i`` for every observation.
+
+    The urn's "new cluster" mass depends on the censoring indicator: an
+    uncensored observation contributes a density and uses Eq. A.2
+    (:func:`log_q0_uncensored`), a right-censored one contributes a survival
+    probability and uses Eq. A.3 (:func:`log_q0_censored`).  Each branch is
+    integrated for its own rows only, so an all-uncensored dataset never pays
+    for the censored quadrature and a single-observation update (the test
+    entry point) integrates one row instead of ``n``.
+
+    Parameters
+    ----------
+    rows : np.ndarray, optional
+        Rows of the grid to evaluate, in the order given.  ``None`` evaluates
+        every row and returns an ``(n,)`` array; otherwise the result has
+        ``rows.size`` entries.
+    """
+    event = np.asarray(data.event, dtype=bool)
+    selected = (
+        np.arange(grid.n, dtype=np.intp)
+        if rows is None
+        else np.asarray(rows, dtype=np.intp)
+    )
+    selected_event = event[selected]
+    q0 = np.empty(selected.size, dtype=np.float64)
+    if np.any(selected_event):
+        q0[selected_event] = log_q0_uncensored(
+            grid,
+            gamma=state.gamma,
+            phi=state.phi,
+            nu=state.nu,
+            d=prior.d,
+            rows=selected[selected_event],
+        )
+    if np.any(~selected_event):
+        q0[~selected_event] = log_q0_censored(
+            grid,
+            gamma=state.gamma,
+            phi=state.phi,
+            nu=state.nu,
+            d=prior.d,
+            rows=selected[~selected_event],
+        )
+    return q0
+
+
+def _log_cluster_kernel(
+    time: np.ndarray,
+    event: np.ndarray,
+    alpha_star: np.ndarray,
+    lam_star: np.ndarray,
+) -> np.ndarray:
+    """Log ``q_j^i`` for every observation against every cluster location.
+
+    For an uncensored observation ``q_j^i = k_W(t_i | alpha*_j, lambda*_j)``
+    (the Weibull density, Eq. A.2's kernel); for a right-censored one it is
+    ``1 - K_W(z_i | alpha*_j, lambda*_j) = exp(-z_i**alpha / lambda)`` (the
+    survival function).  Swapping the two -- using the density for a censored
+    observation -- is one of the bugs test 8 is designed to catch.
+
+    Everything stays in log space: the exponential factor is exactly the log
+    survival ``-t**alpha / lambda``, so the density adds the normalising
+    ``log(alpha / lambda) + (alpha - 1) log t`` on top of it and no term is
+    exponentiated only to be logged again.
+
+    Parameters
+    ----------
+    time, event : np.ndarray
+        ``float64[n]`` transformed times and ``bool[n]`` censoring indicators.
+    alpha_star, lam_star : np.ndarray
+        ``float64[n_star]`` cluster shapes and scales, all strictly positive.
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n, n_star]`` log kernel masses.  Column ``j`` refers to the
+        cluster ``j`` of the *supplied* location arrays, i.e. the pre-removal
+        labelling; step (a) appends columns as clusters are created.
+    """
+    time = np.asarray(time, dtype=np.float64)
+    event = np.asarray(event, dtype=bool)
+    alpha_star = np.asarray(alpha_star, dtype=np.float64)
+    lam_star = np.asarray(lam_star, dtype=np.float64)
+    if alpha_star.size == 0:
+        return np.empty((time.size, 0), dtype=np.float64)
+    tau = np.power(time[:, None], alpha_star[None, :])
+    log_survival = -tau / lam_star[None, :]
+    log_density = (
+        np.log(alpha_star)[None, :]
+        + (alpha_star[None, :] - 1.0) * np.log(time)[:, None]
+        - np.log(lam_star)[None, :]
+        + log_survival
+    )
+    return np.where(event[:, None], log_density, log_survival)
+
+
+def _validate_step_a_inputs(
+    state: DPState, data: SurvData, prior: DPPrior, grid: AlphaGrid
+) -> None:
+    """Check that state, data, prior and grid describe the same problem.
+
+    A grid built for another dataset would supply the wrong ``t ** u`` row to
+    the continuous-piece draw and the wrong rows to ``q0``, which is silent
+    and biases every new cluster; an exact comparison of the times is cheap
+    enough to run on every call and turns that into an error.
+    """
+    _as_shape_parameter(prior.d)
+    if state.phi < prior.b_phi:
+        raise StateInvariantError(
+            "invariant 4 violated: phi must be at least prior.b_phi"
+        )
+    if data.time.size != state.n:
+        raise ValueError(
+            "data and state must have the same number of observations, "
+            f"got {data.time.size} and {state.n}"
+        )
+    if grid.n != state.n or not np.array_equal(grid.time, np.asarray(data.time)):
+        raise ValueError("the alpha grid was built for a different dataset")
+
+
+def _sample_urn_category(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    grid: AlphaGrid,
+    rng: np.random.Generator,
+    i: int,
+    log_q0_i: float,
+    log_kernel_i: np.ndarray,
+) -> bool:
+    """Resample observation ``i``'s urn category and apply the assignment.
+
+    Implements the Po'lya urn mixture of plan Section 2.2(a) literally:
+
+    1. remove observation ``i`` first, so that its own cluster contributes
+       ``n_j^- q_j^i`` -- zero when it was a singleton, which is what makes a
+       singleton's cluster disappear from the candidate set instead of being
+       selectable with weight zero;
+    2. form ``[log q0^i, log n_j^- + log q_j^i]`` over the *non-empty*
+       clusters (deferred-compaction labels) plus the new-cluster category;
+    3. draw the category by inverse CDF on the ``logsumexp``-shifted weights;
+    4. copy the location (existing cluster) or draw a fresh
+       ``(alpha, lambda)`` from the continuous piece and append a cluster.
+
+    The RNG consumption follows the branch: one uniform for the category, plus
+    a grid uniform and an inverse-gamma variate when the new cluster is drawn.
+
+    Returns
+    -------
+    bool
+        ``True`` if a new cluster was created.
+    """
+    state.remove_observation(i)
+    candidates = np.flatnonzero(state.n_j > 0)
+    log_weights = np.empty(candidates.size + 1, dtype=np.float64)
+    log_weights[0] = log_q0_i
+    log_weights[1:] = np.log(state.n_j[candidates]) + log_kernel_i[candidates]
+    if not np.all(np.isfinite(log_weights)):
+        raise StateInvariantError(
+            "urn weights are not finite; state, data and grid are inconsistent"
+        )
+    weights = np.exp(log_weights - float(np.max(log_weights)))
+    cumulative = np.cumsum(weights)
+    index = int(np.searchsorted(cumulative, rng.random() * weights.sum()))
+    index = min(index, weights.size - 1)
+
+    if index == 0:
+        alpha, lam = draw_g0_conditional_alpha(
+            data.time[i],
+            data.event[i],
+            gamma=state.gamma,
+            phi=state.phi,
+            grid=grid,
+            rng=rng,
+            d=prior.d,
+        )
+        state.assign_new(i, alpha, lam)
+        return True
+    state.assign_existing(i, int(candidates[index - 1]))
+    return False
+
+
+def sample_step_a(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    grid: AlphaGrid,
+    rng: np.random.Generator,
+) -> None:
+    """Run step (a): resample every observation's ``(alpha_i, lambda_i, s_i)``.
+
+    This is the Po'lya urn mixture of plan Section 2.2(a), applied
+    sequentially over ``i = 0 .. n-1`` in index order.  The order is part of
+    the specification -- it fixes the random-number stream -- so the loop is
+    deliberately *not* vectorised into one simultaneous update, which would
+    change the transition kernel.
+
+    For each ``i`` the full conditional is
+
+    ``q0^i h_i(alpha_i, lambda_i | gamma, phi, t_i)
+      + sum_j n_j^- q_j^i delta_{(alpha*_j, lambda*_j)}``
+
+    normalised by ``q0^i + sum_j n_j^- q_j^i``, with ``q0^i`` from Eq. A.2
+    (uncensored) or Eq. A.3 (right-censored) and ``q_j^i`` the Weibull density
+    or survival at the cluster location.  The ``n_j^-`` are the counts *after*
+    removing ``i``: using ``n_j`` is a classic error that makes a singleton
+    reselect its own cluster with weight ``q_j`` instead of zero, and it is
+    invisible in a trace plot.
+
+    Bookkeeping follows the deferred-compaction variant of plan Section 3.4:
+    :meth:`DPState.remove_observation` decrements a count but leaves the label
+    in place, so the candidate clusters keep their pre-removal indices while
+    the weights are formed; the single :meth:`DPState.compact` pass at the end
+    drops any cluster emptied by a removal, renumbers the rest and revalidates
+    the Section 2.1 invariants.  New clusters are appended during the loop and
+    the cached ``(n, n_star)`` log-kernel matrix grows a column for each, so
+    the columns and the state's labels never disagree.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place.  ``nu``, ``gamma`` and ``phi`` are held fixed here;
+        they are refreshed by steps (b) and (c).
+    data : SurvData
+        Dataset on the transformed scale, its ``time`` rows the grid rows.
+    prior : DPPrior
+        Supplies the base-measure shape ``d``.
+    grid : AlphaGrid
+        Grid built from ``data``; its cache supplies ``q0`` and the
+        continuous-piece ``alpha`` draw.
+    rng : np.random.Generator
+        Random generator; the only source of randomness.
+
+    Raises
+    ------
+    ValueError
+        If the state, data and grid do not describe the same dataset, or the
+        observation index is out of range.
+    StateInvariantError
+        If the urn weights are not finite or the final state violates a
+        Section 2.1 invariant -- a bookkeeping error, never an input error.
+
+    Notes
+    -----
+    Test 8 of plan Section 7.2 drives :func:`sample_step_a_for_obs` many times
+    from a fixed state and compares the empirical category frequencies with
+    the reference urn probabilities; the different exits (join an existing
+    cluster, create one, join after the old cluster disappeared) are covered
+    there.
+    """
+    _validate_step_a_inputs(state, data, prior, grid)
+    log_q0 = _log_q0_by_observation(state, data, prior, grid)
+    log_kernel = _log_cluster_kernel(
+        data.time, data.event, state.alpha_star, state.lam_star
+    )
+    for i in range(state.n):
+        created = _sample_urn_category(
+            state, data, prior, grid, rng, i, log_q0[i], log_kernel[i]
+        )
+        if created:
+            start = log_kernel.shape[1]
+            new_columns = _log_cluster_kernel(
+                data.time,
+                data.event,
+                state.alpha_star[start:],
+                state.lam_star[start:],
+            )
+            log_kernel = np.hstack([log_kernel, new_columns])
+    # ``compact`` drops the clusters emptied by a removal, renumbers the rest
+    # and revalidates the Section 2.1 invariants; the ``phi >= b_phi`` bound
+    # (invariant 4) cannot change in step (a) and was checked on entry.
+    state.compact()
+
+
+def sample_step_a_for_obs(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    i: int,
+    grid: AlphaGrid,
+    rng: np.random.Generator,
+    compact: bool = True,
+) -> None:
+    """Resample one observation's ``(alpha_i, lambda_i, s_i)`` (test entry).
+
+    This is exactly the per-observation update that :func:`sample_step_a`
+    applies in its loop, exposed separately so that a test can fix the state,
+    draw the category for one ``i`` many times and compare the frequencies
+    with the exact urn probabilities (test 8 of plan Section 7.2).  The public
+    sweep entry point is :func:`sample_step_a`; production code should not
+    call this per observation in a loop, because it recomputes the whole
+    ``q0`` vector and kernel matrix on every call.
+
+    By default the state is left compacted and invariant-clean, so the assigned
+    category can be read back as ``state.s[i]`` and its location as
+    ``(alpha_star[s_i], lam_star[s_i])``; an existing-cluster assignment copies
+    the location exactly, while a new-cluster assignment carries a fresh draw
+    from the continuous piece.
+
+    ``compact=False`` returns the deferred-compaction state of plan
+    Section 3.4 instead: labels are the pre-removal ones and ``s[i]`` names the
+    sampled category directly -- the old label of a surviving cluster, or
+    ``n_star_before`` when a fresh cluster was appended.  That is what test 8
+    needs to count categories without matching locations, and it skips the
+    relabel pass on each of its many repetitions.  In that mode the state may
+    contain one empty cluster (if ``i`` was a singleton) and is therefore
+    *not* invariant-clean until :meth:`DPState.compact` runs; the caller owns
+    the state and must either reset or compact it.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place: ``i`` is removed, reassigned and the labels are
+        compacted.
+    data, prior, grid :
+        As in :func:`sample_step_a`.
+    i : int
+        Observation index in ``0 .. n-1``.
+    rng : np.random.Generator
+        Random generator; the only source of randomness.
+    compact : bool, optional
+        Compaction policy; see above.  ``True`` (the default) matches
+        :func:`sample_step_a` and leaves a valid state.
+
+    Raises
+    ------
+    IndexError
+        If ``i`` is out of range.
+    ValueError
+        If the state, data and grid do not describe the same dataset.
+    """
+    _validate_step_a_inputs(state, data, prior, grid)
+    if not 0 <= i < state.n:
+        raise IndexError(f"observation index {i} is out of range for n={state.n}")
+    log_q0_i = float(
+        _log_q0_by_observation(state, data, prior, grid, rows=np.array([i]))[0]
+    )
+    log_kernel_i = _log_cluster_kernel(
+        data.time[i : i + 1],
+        data.event[i : i + 1],
+        state.alpha_star,
+        state.lam_star,
+    )[0]
+    _sample_urn_category(state, data, prior, grid, rng, i, log_q0_i, log_kernel_i)
+    if compact:
+        state.compact()
