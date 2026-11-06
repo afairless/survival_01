@@ -44,11 +44,14 @@ here and in the results note, and made explicit by the prior-functional tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.special import logsumexp
 
 __all__ = [
+    "AlphaGrid",
     "DPPrior",
     "DPSettings",
     "DPState",
@@ -56,7 +59,12 @@ __all__ = [
     "SurvData",
     "inverse_map",
     "inverse_time",
+    "log_alpha_integrand_uncensored",
+    "log_integral_alpha",
+    "log_q0_uncensored",
+    "make_grid",
     "make_surv_data",
+    "trapezoid_log_weights",
     "transform_time",
 ]
 
@@ -680,3 +688,324 @@ class DPState:
         """
         j = self.append_cluster(alpha, lam)
         return self.assign_existing(i, j)
+
+
+def trapezoid_log_weights(n_alpha: int) -> np.ndarray:
+    """Log of the trapezoid weights of the unit-interval alpha grid.
+
+    The grid nodes are ``u_m = m / M`` for ``m = 1..M`` (plan Section 2.4), so
+    the trapezoid rule covers ``[1/M, 1]`` rather than ``[0, 1]``: the first
+    cell is deliberately omitted because ``alpha = 0`` is not a valid Weibull
+    shape.  The dominant quadrature error is therefore the omitted first cell,
+    ``O(1/M**2)`` (measured in test 3 of plan Section 7.1).
+
+    Parameters
+    ----------
+    n_alpha : int
+        Number of quadrature nodes ``M``.  Must be at least 2.
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[M]`` log weights ``log(delta)`` with ``delta = 1 / M``, with
+        the two endpoints halved.  They integrate over ``u``; the change of
+        variable ``alpha = phi * u`` contributes the factor ``phi`` and is
+        applied by :func:`log_integral_alpha`, not here.
+
+    Notes
+    -----
+    The weights are kept in log space because the sweep multiplies them by an
+    integrand that can underflow: ``logsumexp`` of ``log integrand + log
+    weight`` cannot cancel to zero, whereas summing exponentiated products can.
+    """
+    n_alpha = int(n_alpha)
+    if n_alpha < 2:
+        raise ValueError(f"n_alpha must be at least 2, got {n_alpha}")
+    weights = np.full(n_alpha, 1.0 / n_alpha, dtype=np.float64)
+    weights[0] *= 0.5
+    weights[-1] *= 0.5
+    return np.log(weights)
+
+
+@dataclass(frozen=True)
+class AlphaGrid:
+    """Fixed alpha quadrature grid of one chain (plan Sections 2.4 and 3.3).
+
+    The grid lives in the unit interval and is scaled by the *current* ``phi``,
+    ``alpha_m = phi * u_m``, so it always stays exactly inside ``(0, phi)`` as
+    ``phi`` moves, needs no ``phi`` cap and makes the quadrature domain bounded
+    -- the computational reason the paper put a Uniform prior on ``alpha``.
+
+    The expensive part, ``T_im = t_i ** u_m``, does not depend on ``phi`` and
+    is cached once per chain.  A sweep then needs only ``t_i ** alpha_m =
+    T_im ** phi``, one ``pow`` on an ``(n, M)`` array.  ``T`` is bounded by 2
+    because the transformed times lie in ``(1, 2]``.
+
+    Attributes
+    ----------
+    time : np.ndarray
+        ``float64[n]`` transformed times the grid was built from; needed for
+        the ``1 / t`` factor of Eq. A.2 and for consistency checks.
+    u : np.ndarray
+        ``float64[M]`` unit-interval nodes ``u_m = (m + 1) / M``, ``m = 0..M-1``.
+    T : np.ndarray
+        ``float64[n, M]`` cache ``T_im = time_i ** u_m``.
+    M : int
+        Number of nodes; kept explicit because the plan's API names it.
+    log_w : np.ndarray
+        ``float64[M]`` log trapezoid weights from :func:`trapezoid_log_weights`;
+        derived, not passed by the caller.
+
+    The constructor re-derives ``T`` from ``time`` and ``u`` and rejects a
+    mismatch, so a stale cache (grid built for one dataset and reused with
+    another) cannot silently feed wrong prior-predictive masses to step (a).
+    """
+
+    time: np.ndarray
+    u: np.ndarray
+    T: np.ndarray
+    M: int
+    log_w: np.ndarray = field(init=False)
+
+    def __post_init__(self) -> None:
+        time = np.asarray(self.time, dtype=np.float64)
+        u = np.asarray(self.u, dtype=np.float64)
+        T = np.asarray(self.T, dtype=np.float64)
+        M = int(self.M)
+
+        if time.ndim != 1 or time.size == 0:
+            raise ValueError("time must be a non-empty 1-D array")
+        if not np.all(np.isfinite(time)) or np.any(time <= 1.0):
+            raise ValueError("time must be finite and greater than 1")
+        if u.ndim != 1 or u.size < 2:
+            raise ValueError("u must be a 1-D array with at least two nodes")
+        if M != u.size:
+            raise ValueError(
+                f"M must equal the number of grid nodes, got M={M} and {u.size} nodes"
+            )
+        if np.any(u <= 0.0) or np.any(u > 1.0):
+            raise ValueError("u must lie in (0, 1]")
+        if np.any(np.diff(u) <= 0.0):
+            raise ValueError("u must be strictly increasing")
+        if T.shape != (time.size, u.size):
+            raise ValueError(
+                f"T must have shape ({time.size}, {u.size}), got {T.shape}"
+            )
+        if not np.all(np.isfinite(T)) or np.any(T <= 1.0):
+            raise ValueError("T must be finite and greater than 1 (times are > 1)")
+        expected = np.power(time[:, None], u[None, :])
+        if not np.allclose(T, expected, rtol=1e-12, atol=0.0):
+            raise ValueError("T is not time ** u; rebuild the grid with make_grid")
+
+        object.__setattr__(self, "time", time)
+        object.__setattr__(self, "u", u)
+        object.__setattr__(self, "T", T)
+        object.__setattr__(self, "M", M)
+        object.__setattr__(self, "log_w", trapezoid_log_weights(M))
+
+    @property
+    def n(self) -> int:
+        """Number of observations the grid covers."""
+        return int(self.time.size)
+
+    def powers(self, phi: float) -> np.ndarray:
+        """Return ``t_i ** alpha_m = T_im ** phi``, shape ``(n, M)``.
+
+        This is the only ``phi``-dependent part of the grid cache: one ``pow``
+        call per sweep instead of recomputing ``t ** alpha`` per node, and it
+        cannot overflow because ``T <= 2`` and ``phi`` is a fitted scalar of
+        order one.
+        """
+        phi = _as_positive_scalar(phi, "phi")
+        return np.power(self.T, phi)
+
+
+def make_grid(data: SurvData, n_alpha: int) -> AlphaGrid:
+    """Build the alpha quadrature grid for one chain.
+
+    Parameters
+    ----------
+    data : SurvData
+        Dataset on the transformed scale; its times define the grid rows.
+    n_alpha : int
+        Number of nodes ``M``.  ``DPSettings.n_alpha`` defaults to 256, which
+        gives a relative quadrature error of order ``3e-5`` for the calibres in
+        plan Section 2.4.
+
+    Returns
+    -------
+    AlphaGrid
+        Nodes ``u_m = (m + 1) / M``, the cache ``T = time ** u`` and the log
+        trapezoid weights.
+
+    Raises
+    ------
+    ValueError
+        If ``n_alpha < 2``: a single node has no trapezoid rule, and the
+        quadrature would silently lose the ``delta`` factor.
+    """
+    n_alpha = int(n_alpha)
+    if n_alpha < 2:
+        raise ValueError(f"n_alpha must be at least 2, got {n_alpha}")
+    time = np.asarray(data.time, dtype=np.float64)
+    u = np.arange(1, n_alpha + 1, dtype=np.float64) / n_alpha
+    return AlphaGrid(time=time, u=u, T=np.power(time[:, None], u[None, :]), M=n_alpha)
+
+
+def log_alpha_integrand_uncensored(
+    grid: AlphaGrid, *, gamma: float, phi: float, d: int
+) -> np.ndarray:
+    """Log of the Eq. A.2 integrand ``alpha * t**alpha / (gamma + t**alpha)**(d+1)``.
+
+    Parameters
+    ----------
+    grid : AlphaGrid
+        Quadrature grid; supplies ``u``, the cache ``T`` and the times.
+    gamma, phi : float
+        Current ``G0`` hyperparameters, both strictly positive.
+    d : int
+        Inverse-gamma shape of the base measure (``d = 2`` in the paper).
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n, M]`` log integrand at ``alpha_m = phi * u_m``.  Row ``i``
+        is, up to the omitted normalising constant, the density of
+        ``[alpha_i | gamma, phi, t_i]`` for an *uncensored* observation -- the
+        single most important implementation fact of the algorithm (plan
+        Section 2.2): the same grid row serves both the urn weight ``q0^o``
+        and, after normalisation, the continuous-piece draw of ``alpha_i``.
+
+    Notes
+    -----
+    Eq. A.2 is written as ``alpha t**(alpha-1) / (gamma + t**alpha)**(d+1)``;
+    the ``1 / t`` factor is pulled out of the integrand and reapplied in
+    :func:`log_q0_uncensored`, which is why ``t**alpha`` (cached as
+    ``T**phi``) appears here instead of ``t**(alpha-1)``.  The denominator is
+    formed as ``gamma + T**phi`` and never as ``log t**alpha`` exponentiated
+    twice, and no quantity is exponentiated before the sum: a large
+    ``t**alpha`` can only make the integrand small, but forming it in log
+    space keeps the ``logsumexp`` in :func:`log_integral_alpha` exact.
+    """
+    gamma = _as_positive_scalar(gamma, "gamma")
+    phi = _as_positive_scalar(phi, "phi")
+    d = _as_shape_parameter(d)
+    alpha = phi * grid.u
+    tau = grid.powers(phi)
+    return np.log(alpha)[None, :] + phi * np.log(grid.T) - (d + 1) * np.log(gamma + tau)
+
+
+def log_integral_alpha(
+    log_integrand: np.ndarray, grid: AlphaGrid, *, phi: float
+) -> np.ndarray:
+    """Integrate an ``(n, M)`` log integrand over ``alpha`` in ``(0, phi)``.
+
+    Implements the quadrature of plan Section 2.4: the trapezoid rule in
+    ``alpha`` with ``logsumexp`` over the nodes, so that the sum of integrand
+    values can never underflow to zero.  The change of variable
+    ``alpha = phi * u`` is accounted for by the ``log(phi)`` term.
+
+    Parameters
+    ----------
+    log_integrand : np.ndarray
+        ``float64[n, M]`` values of the log integrand on the grid nodes.
+    grid : AlphaGrid
+        Grid supplying the log weights; its shape must match.
+    phi : float
+        Current uniform upper bound, strictly positive.
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n]`` log of ``integral_0^phi f(alpha) dalpha``.
+
+    Raises
+    ------
+    ValueError
+        If the integrand shape does not match the grid.
+    """
+    log_integrand = np.asarray(log_integrand, dtype=np.float64)
+    phi = _as_positive_scalar(phi, "phi")
+    if log_integrand.shape != (grid.n, grid.M):
+        raise ValueError(
+            f"log_integrand must have shape ({grid.n}, {grid.M}), "
+            f"got {log_integrand.shape}"
+        )
+    return logsumexp(log_integrand + grid.log_w[None, :], axis=1) + math.log(phi)
+
+
+def log_q0_uncensored(
+    grid: AlphaGrid, *, gamma: float, phi: float, nu: float, d: int
+) -> np.ndarray:
+    """Log prior-predictive density ``q0^o(t)`` of Eq. A.2, per observation.
+
+    This is the "new cluster" mass of the Polya urn for an *uncensored*
+    observation::
+
+        q0^o(t) = d nu gamma**d / phi *
+                  integral_0^phi alpha t**(alpha-1) / (gamma + t**alpha)**(d+1) dalpha
+                = d nu gamma**d / (phi t) *
+                  integral_0^phi alpha t**alpha   / (gamma + t**alpha)**(d+1) dalpha
+
+    The second form is what the code evaluates: it reuses the cached grid row
+    ``T**phi = t**alpha`` and moves the ``1 / t`` outside the quadrature.  In
+    log space the ``phi`` of the change of variable ``alpha = phi u`` cancels
+    against the ``1 / phi`` of the base density, so the result is::
+
+        log q0^o(t) = log d + log nu + d log gamma - log t
+                      + logsumexp_m[ log(phi u_m) + phi log T_im
+                                      - (d + 1) log(gamma + T_im**phi)
+                                      + log w_m ]
+
+    Parameters
+    ----------
+    grid : AlphaGrid
+        Grid built from the data whose times are the arguments of ``q0^o``.
+    gamma, phi, nu : float
+        Current ``G0`` hyperparameters and DP precision, all strictly positive.
+    d : int
+        Inverse-gamma shape of the base measure (``d = 2`` in the paper).
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n]`` log ``q0^o(t_i)`` for every uncensored row.  Censored
+        rows take the survival based mass ``q0^c`` of Eq. A.3 instead, which
+        reuses the same grid and integrand pattern.
+
+    Notes
+    -----
+    Test 1 of plan Section 7.1 pins this against a nested ``quad`` over
+    ``(alpha, lambda)`` that marginalises the inverse-gamma integrand
+    numerically.  That comparison catches every constant here: the missing or
+    extra ``gamma**d``, the ``1 / phi``, the ``1 / t`` (or wrong
+    ``t**(alpha-1)`` index) and the ``d`` versus ``d + 1`` exponent.
+    """
+    gamma = _as_positive_scalar(gamma, "gamma")
+    phi = _as_positive_scalar(phi, "phi")
+    nu = _as_positive_scalar(nu, "nu")
+    d = _as_shape_parameter(d)
+    log_integral = log_integral_alpha(
+        log_alpha_integrand_uncensored(grid, gamma=gamma, phi=phi, d=d),
+        grid,
+        phi=phi,
+    )
+    return (
+        math.log(d)
+        + math.log(nu)
+        + d * math.log(gamma)
+        - math.log(phi)
+        - np.log(grid.time)
+        + log_integral
+    )
+
+
+def _as_shape_parameter(value: object, name: str = "d") -> int:
+    """Normalise the inverse-gamma shape ``d`` to a positive ``int``."""
+    try:
+        out = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if out != value or out < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return out
