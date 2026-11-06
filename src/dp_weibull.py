@@ -138,7 +138,9 @@ def b_gamma_b_phi_from_weibull(alpha_tilde, lambda_tilde):
         [lambda] = 2 b_gamma / (1 + lambda b_gamma)**3,
         [alpha]  = 2 b_phi**2 / (3 * max(alpha, b_phi)**3).
 
-    Their medians are (sqrt(2) - 1) / b_gamma and 3 b_phi / 4, respectively.
+    Their medians are (sqrt(2) - 1) / b_gamma and 3 b_phi / 4, respectively;
+    the first follows from the CDF 1 - (1 + lambda b_gamma)**-2, not
+    ...**-3 (a known trap), which equals 1/2 at that point.
     Setting these equal to lambda_tilde and alpha_tilde gives
 
         b_gamma = (sqrt(2) - 1) / lambda_tilde,
