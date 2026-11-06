@@ -2,6 +2,10 @@
 *__pycache__*
 *.pdf
 
+# Regenerated paper figures: the numbers live in the results note, never the
+# binaries (plan decision 8).
+docs/research/figures/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
