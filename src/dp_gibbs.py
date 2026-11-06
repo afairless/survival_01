@@ -66,13 +66,43 @@ __all__ = [
     "log_q0_uncensored",
     "make_grid",
     "make_surv_data",
+    "alpha_bound_guard_count",
     "refresh_cluster",
+    "refresh_cluster_alpha",
+    "reset_alpha_bound_guard_count",
     "sample_step_a",
     "sample_step_a_for_obs",
     "sample_step_b",
     "trapezoid_log_weights",
     "transform_time",
 ]
+
+
+# Diagnostic counter for the ``alpha*`` bounds guard of plan Section 3.5.  It
+# is module state rather than a ``DPState`` field because it is a property of
+# the sampler's arithmetic, not of a chain: the counter is read by tests and by
+# the diagnostics note, and reset explicitly before a run that reports it.
+_ALPHA_BOUND_GUARD_CLAMPS = 0
+
+
+def alpha_bound_guard_count() -> int:
+    """Return how many ``alpha*`` draws were clamped by the bounds guard.
+
+    Plan Section 3.5 requires that an empty interval
+    ``alpha^-_j < alpha*_j < alpha^+_j`` -- which can only arise from
+    floating-point equality at a boundary, never from the mathematics -- be
+    clamped to the midpoint rather than fed to a degenerate uniform draw, and
+    that the event be counted instead of silently dropped.  A non-zero count is
+    a diagnostic, not an error: it says a cluster's shape was frozen for one
+    sweep.
+    """
+    return _ALPHA_BOUND_GUARD_CLAMPS
+
+
+def reset_alpha_bound_guard_count() -> None:
+    """Reset the :func:`alpha_bound_guard_count` diagnostic to zero."""
+    global _ALPHA_BOUND_GUARD_CLAMPS
+    _ALPHA_BOUND_GUARD_CLAMPS = 0
 
 
 @dataclass(frozen=True)
@@ -1854,7 +1884,8 @@ def refresh_cluster(
     refresh leaves the ``phi >= max_j alpha*_j`` invariant of plan Section 2.1
     untouched.  The shape ``alpha*_j`` is refreshed by the
     Damien-Wakefield-Walker auxiliary-variable update of plan Section 2.2(b),
-    which uses this new ``lambda*_j``.
+    implemented in :func:`refresh_cluster_alpha`, which uses this new
+    ``lambda*_j`` and therefore runs *after* this function for each cluster.
     """
     _validate_step_b_inputs(state, data, prior)
     shape, scale = _lam_star_parameters(state, data, prior, j=j)
@@ -1866,6 +1897,184 @@ def refresh_cluster(
     members = np.flatnonzero(state.s == j)
     state.lam_star[j] = lam
     state.lam[members] = lam
+
+
+def _alpha_star_bounds(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    j: int,
+    rng: np.random.Generator,
+) -> tuple[float, float]:
+    """Return the auxiliary-variable interval ``(alpha^-_j, alpha^+_j)``.
+
+    Plan Section 2.2(b), Eqs. A.5-A.6.  At the cluster's **current** shape
+    ``alpha*_j`` and the **new** scale ``lambda*_j`` the scheme draws
+    ``v ~ U(0, C(alpha*_j))`` with ``C(alpha) = prod_{i_o in j}
+    t_{i_o}**alpha`` -- a product over *uncensored* members only, so ``C = 1``
+    and no draw at all when the cluster has no uncensored member -- and one
+    ``u_i`` uniform per member, from which ``w_i = u_i * exp(-t_i^alpha*_j /
+    lambda*_j)``.  The bounds are then ``alpha^- = max(0, log v / sum_{i_o}
+    log t_{i_o})`` and ``alpha^+ = min(phi, min_i log(-lambda* log w_i) /
+    log t_i)`` over every member, with two explicit degenerate branches: the
+    ``max(0, .)`` is needed because ``v < 1`` gives a negative log, and the
+    empty-sum case ``n_j^o = 0`` sets ``alpha^- = 0`` directly rather than
+    dividing by zero (``v`` is not even drawn).  A ``w_i`` of exactly zero
+    (probability zero, but a real floating-point value) gives an infinite
+    bound and drops out of the minimum.
+
+    The implementation does not form ``v`` or ``w`` themselves, and never
+    computes ``C`` by exponentiating a product of powers: with ``v = u C`` and
+    ``w = u_w exp(-t**alpha / lambda)`` the expressions simplify to
+    ``alpha^- = alpha*_j + log u / sum_i_o log t_i_o`` and
+    ``-lambda* log w_i = t_i**alpha*_j - lambda* log u_w``, which is exactly
+    what the plan says and free of overflow.  ``log t > 0`` is guaranteed by
+    the Appendix requirement ``t > 1`` enforced by :class:`SurvData`.
+
+    Random-number consumption, which the golden regression of plan Section 7.5
+    depends on: one uniform for ``v`` when the cluster has at least one
+    uncensored member, none otherwise, then one uniform per member for the
+    ``w``'s.
+    """
+    members = _cluster_members(state, j)
+    alpha = float(state.alpha_star[j])
+    lam = float(state.lam_star[j])
+    times = np.asarray(data.time, dtype=np.float64)[members]
+    censored_mask = ~np.asarray(data.event, dtype=bool)[members]
+    log_times = np.log(times)
+
+    n_uncensored = int(np.count_nonzero(~censored_mask))
+    if n_uncensored > 0:
+        u_v = float(rng.random())
+        if u_v > 0.0:
+            log_time_sum = float(np.sum(log_times[~censored_mask]))
+            alpha_minus = alpha + math.log(u_v) / log_time_sum
+        else:
+            # v = 0 imposes no lower constraint on the shape.
+            alpha_minus = 0.0
+        alpha_minus = max(0.0, alpha_minus)
+    else:
+        # C(alpha) = 1: the lower bound is unconstrained.  The plan's formula
+        # would divide by an empty sum, so it is not evaluated.
+        alpha_minus = 0.0
+
+    u_w = np.asarray(rng.random(members.size), dtype=np.float64)
+    with np.errstate(divide="ignore"):
+        log_u_w = np.log(u_w)
+        # ``-lambda* log w_i = t_i**alpha - lambda* log u_i``; the bound is
+        # ``log(.) / log t_i``, and ``u_i = 0`` gives ``+inf``, which the
+        # minimum correctly ignores (that ``w`` constrains nothing).
+        upper_bounds = np.log(np.power(times, alpha) - lam * log_u_w) / log_times
+    alpha_plus = min(float(state.phi), float(np.min(upper_bounds)))
+    return alpha_minus, alpha_plus
+
+
+def refresh_cluster_alpha(
+    state: DPState,
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    j: int,
+    rng: np.random.Generator,
+) -> None:
+    """Refresh cluster ``j``'s shape ``alpha*_j`` from its full conditional.
+
+    This is the second half of step (b), the Damien-Wakefield-Walker
+    auxiliary-variable device of plan Section 2.2(b), Eqs. A.5-A.6.  With
+    ``n_j^o = |{i_o : s_{i_o} = j}|`` the number of *uncensored* members and
+    ``lambda*_j`` the scale drawn by :func:`refresh_cluster` in this same
+    sweep, the target is ``p(alpha*_j | v, w) = k (alpha*_j)**(k - 1) /
+    ((alpha^+)**k - (alpha^-)**k)`` on ``(alpha^-_j, alpha^+_j)`` with
+    ``k = n_j^o + 1``, i.e. a density proportional to
+    ``(alpha*_j)**(k - 1) = (alpha*_j)**n_j^o``, *not* a uniform draw.  The
+    inverse-CDF draw is ``alpha*_j = [
+    (alpha^-)**k + u ((alpha^+)**k - (alpha^-)**k) ]**(1/k)`` with
+    ``u ~ U(0, 1)``.  It is uniform only for an all-censored cluster
+    (``n_j^o = 0``, ``k = 1``); for ``n_j^o = 1`` it is already triangular.  A
+    uniform draw on the bounds biases every uncensored cluster's shape upward
+    (+8% in ``E[alpha*]`` at ``n_j^o = 1``, +29% at ``n_j^o = 5`` on
+    ``(0.5, 1.5)``, per plan Section 2.2(b)); test 11 of plan Section 7.2 is
+    built to reject it.
+
+    The transition is exact (acceptance probability 1) but is **not** an
+    ordinary slice sampler: the auxiliaries are redrawn every sweep from
+    ranges determined by the current ``alpha*_j``, and the target is then
+    sampled on the resulting interval.  It is implemented literally as
+    specified; do not substitute a different sampler.
+
+    Degenerate cases are handled explicitly.  For ``n_j^o = 0``:
+    ``alpha^- = 0`` and ``k = 1``, so the target is uniform on
+    ``(0, alpha^+)``.  For ``n_j^c = 0`` the censored terms of the second
+    minimum are absent, so ``alpha^+`` is ``min(phi, min_{i_o} ...)``.  For
+    ``n_j = 1`` both minima are single terms.  If ``alpha^+ <= alpha^-`` --
+    possible only by floating-point equality at a boundary -- the shape is
+    clamped to the interval's midpoint and the event is counted by
+    :func:`alpha_bound_guard_count`; a plain ``uniform`` on a degenerate
+    interval would silently freeze the cluster's shape.
+
+    After the draw the cluster location and the per-observation latent shapes
+    of its members are updated together, because invariant 1 of plan
+    Section 2.1 requires ``alpha == alpha_star[s]`` at all times.
+
+    Parameters
+    ----------
+    state : DPState
+        Mutated in place: ``alpha_star[j]`` and ``alpha[members]`` are replaced.
+        ``lam_star``, ``lam``, ``nu``, ``gamma`` and ``phi`` are untouched.
+    data : SurvData
+        Dataset on the transformed scale; supplies the member times and their
+        censoring indicators.
+    prior : DPPrior
+        Supplies the base-measure shape ``d`` through the input validation; the
+        conditional of ``alpha*_j`` does not otherwise involve ``d``.
+    j : int
+        Cluster index in ``0 .. n_star-1``.  This is the test entry point of plan
+        Section 7.2 test 11: a test fixes ``lambda*_j`` and the data, calls this
+        many times and compares the draws with the unnormalised A.5 density.
+    rng : np.random.Generator
+        Random generator; the only source of randomness.
+
+    Raises
+    ------
+    IndexError
+        If ``j`` is out of range.
+    ValueError
+        If the state and the data describe different datasets, or ``prior.d`` is
+        not a positive integer.
+    StateInvariantError
+        If cluster ``j`` is empty or ``n_j`` disagrees with its member list, or if
+        the resulting draw violates ``0 < alpha*_j <= phi``.
+
+    Notes
+    -----
+    This half must run *after* :func:`refresh_cluster` for the same cluster: the
+    bounds are formed at the new ``lambda*_j`` and the old ``alpha*_j``.  Calling
+    it first would use the stale scale and bias the cluster's location.
+    """
+    global _ALPHA_BOUND_GUARD_CLAMPS
+    _validate_step_b_inputs(state, data, prior)
+    members = _cluster_members(state, j)
+    n_uncensored = int(np.count_nonzero(np.asarray(data.event, dtype=bool)[members]))
+    alpha_minus, alpha_plus = _alpha_star_bounds(state, data, prior, j=j, rng=rng)
+
+    if alpha_plus > alpha_minus:
+        k = n_uncensored + 1
+        u = float(rng.random())
+        lower = alpha_minus**k
+        upper = alpha_plus**k
+        alpha = (lower + u * (upper - lower)) ** (1.0 / k)
+    else:
+        _ALPHA_BOUND_GUARD_CLAMPS += 1
+        alpha = 0.5 * (alpha_minus + alpha_plus)
+
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > float(state.phi):
+        raise StateInvariantError(
+            f"the alpha* draw for cluster {j} left (0, phi]: got {alpha!r} "
+            f"from bounds ({alpha_minus!r}, {alpha_plus!r})"
+        )
+    state.alpha_star[j] = alpha
+    state.alpha[members] = alpha
 
 
 def sample_step_b(
@@ -1884,13 +2093,22 @@ def sample_step_b(
     sweep's step (b) consumes ``n_star`` variates in a deterministic
     sequence -- a property the caller relies on when it replays a seed.
 
-    This function is the scale half of step (b): ``lambda*_j`` is refreshed by
-    :func:`refresh_cluster`.  The shape ``alpha*_j`` has its own
-    auxiliary-variable update (plan Section 2.2(b), Eqs. A.5-A.6), which uses
-    the freshly drawn ``lambda*_j`` and the current ``alpha*_j``; keeping the
-    two halves in one entry point means the sweep has a single step-(b) call
-    site and the ``alpha_i = alpha*_{s_i}`` / ``lambda_i = lambda*_{s_i}``
-    synchronisation happens once per cluster rather than once per parameter.
+    Per cluster the two halves of step (b) run in the order the Appendix
+    states: the scale ``lambda*_j`` from its inverse-gamma conditional
+    (:func:`refresh_cluster`), then the shape ``alpha*_j`` by the
+    Damien-Wakefield-Walker auxiliary-variable scheme of plan Section 2.2(b),
+    Eqs. A.5-A.6 (:func:`refresh_cluster_alpha`), whose ``w`` bounds are formed
+    at the *new* scale and the *old* shape.  Keeping both halves in one entry
+    point means the sweep has a single step-(b) call site and the
+    ``alpha_i = alpha*_{s_i}`` / ``lambda_i = lambda*_{s_i}`` synchronisation
+    happens once per cluster rather than once per parameter.
+
+    The random-number consumption is fixed and documented, because the golden
+    regression of plan Section 7.5 depends on it: per cluster one gamma
+    variate, one uniform for ``u_v`` if the cluster has at least one
+    uncensored member, one uniform per member for the ``w``'s, and one uniform
+    for the inverse-CDF shape draw unless the bounds guard clamped the
+    interval.
 
     Parameters
     ----------
@@ -1898,9 +2116,11 @@ def sample_step_b(
         Mutated in place.  Must be compacted: step (a) leaves it so, and
         :func:`refresh_cluster` rejects a cluster whose member list disagrees
         with ``n_j``.  ``nu``, ``gamma`` and ``phi`` are held fixed here; step
-        (c) refreshes them, in that order, after this step.
+        (c) refreshes them, in that order, after this step.  Invariant 3
+        (``0 < alpha*_j <= phi``) is enforced by the shape draw's bound guard,
+        which caps ``alpha^+_j`` at ``phi``.
     data, prior :
-        As in :func:`refresh_cluster`.
+        As in :func:`refresh_cluster` and :func:`refresh_cluster_alpha`.
     rng : np.random.Generator
         Random generator; the only source of randomness.
 
@@ -1917,9 +2137,11 @@ def sample_step_b(
     ``state.check_invariants(prior)`` runs once at the end of the loop rather
     than after every cluster: the cheap per-cluster consistency checks already
     live in :func:`_cluster_members`, and the full check is what catches a
-    desynchronised ``lam_star``/``lam`` pair before it reaches step (c).
+    desynchronised ``alpha``/``alpha*`` or ``lam``/``lam*`` pair before it
+    reaches step (c).
     """
     _validate_step_b_inputs(state, data, prior)
     for j in range(state.n_star):
         refresh_cluster(state, data, prior, j=j, rng=rng)
+        refresh_cluster_alpha(state, data, prior, j=j, rng=rng)
     state.check_invariants(prior)

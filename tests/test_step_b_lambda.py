@@ -298,26 +298,29 @@ class TestSampleStepB:
         assert np.array_equal(state.lam, state.lam_star[state.s])
         state.check_invariants(PRIOR)
 
-    def test_consumes_one_variate_per_cluster_in_index_order(self):
+    def test_consumes_one_gamma_per_cluster_in_index_order(self):
         state = _make_state()
         rng = np.random.default_rng(10)
         sample_step_b(state, DATA, PRIOR, rng=rng)
 
-        # Replay the same stream by hand: one gamma variate per cluster, in
-        # j = 0..n_star-1 order, from the reference parameters.  This pins the
-        # order and the per-cluster consumption, which the golden test of plan
+        # Replay the same stream by hand: per cluster, in j = 0..n_star-1
+        # order, one gamma variate from the reference parameters, then the
+        # uniforms that the shape half of step (b) consumes (one for v when
+        # the cluster has an uncensored member, one per member for the w's,
+        # and one for the inverse-CDF shape draw).  This pins the order and
+        # the per-cluster consumption, which the golden test of plan
         # Section 7.5 depends on.
         replay = np.random.default_rng(10)
-        expected = np.array(
-            [
-                1.0
-                / replay.gamma(
-                    shape=_reference_parameters(j)[0],
-                    scale=1.0 / _reference_parameters(j)[1],
-                )
-                for j in range(ALPHA_STAR.size)
-            ]
-        )
+        expected = np.empty(ALPHA_STAR.size, dtype=np.float64)
+        for j in range(ALPHA_STAR.size):
+            shape, scale = _reference_parameters(j)
+            expected[j] = 1.0 / replay.gamma(shape=shape, scale=1.0 / scale)
+            n_uncensored = int(np.count_nonzero(DATA.event[LABELS == j]))
+            n_members = int(np.count_nonzero(LABELS == j))
+            if n_uncensored > 0:
+                replay.random()
+            replay.random(n_members)
+            replay.random()
         assert np.allclose(state.lam_star, expected, rtol=1e-15, atol=0.0)
 
     def test_is_reproducible_from_the_seed(self):
@@ -334,7 +337,7 @@ class TestSampleStepB:
         with pytest.raises(StateInvariantError):
             sample_step_b(state, DATA, PRIOR, rng=np.random.default_rng(12))
 
-    def test_leaves_the_other_state_fields_alone(self):
+    def test_leaves_the_hyperparameters_and_labels_alone(self):
         state = _make_state()
         before = dataclasses.replace(
             state,
@@ -346,10 +349,18 @@ class TestSampleStepB:
             n_j=state.n_j.copy(),
         )
         sample_step_b(state, DATA, PRIOR, rng=np.random.default_rng(13))
-        assert np.array_equal(state.alpha, before.alpha)
-        assert np.array_equal(state.alpha_star, before.alpha_star)
+
+        # Both halves of step (b) move the cluster locations; the shape half
+        # must also keep the per-observation latents in step (invariant 1).
+        assert not np.array_equal(state.alpha_star, before.alpha_star)
+        assert not np.array_equal(state.lam_star, before.lam_star)
+        assert np.array_equal(state.alpha, state.alpha_star[state.s])
+        assert np.array_equal(state.lam, state.lam_star[state.s])
+
+        # Assignment, counts and step-(c) hyperparameters are not step (b)'s.
         assert np.array_equal(state.s, before.s)
         assert np.array_equal(state.n_j, before.n_j)
         assert state.nu == before.nu
         assert state.gamma == before.gamma
         assert state.phi == before.phi
+        state.check_invariants(PRIOR)
