@@ -62,6 +62,7 @@ __all__ = [
     "log_alpha_integrand_censored",
     "log_alpha_integrand_uncensored",
     "log_integral_alpha",
+    "draw_g0_conditional_alpha",
     "log_q0_censored",
     "log_q0_uncensored",
     "make_grid",
@@ -1115,3 +1116,155 @@ def _as_shape_parameter(value: object, name: str = "d") -> int:
     if out != value or out < 1:
         raise ValueError(f"{name} must be a positive integer, got {value!r}")
     return out
+
+
+def _as_scalar_transformed_time(time: object) -> float:
+    """Validate one transformed time (``time > 1``) and return it as a float."""
+    arr = np.asarray(time)
+    if arr.ndim != 0:
+        raise ValueError("time must be a scalar")
+    try:
+        out = float(arr)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("time must be a finite scalar greater than 1") from exc
+    if not np.isfinite(out) or out <= 1.0:
+        raise ValueError("time must be a finite scalar greater than 1")
+    return out
+
+
+def _as_scalar_event(event: object) -> bool:
+    """Validate one censoring indicator and return it as a bool."""
+    arr = np.asarray(event)
+    if arr.ndim != 0:
+        raise ValueError("event must be a scalar boolean")
+    if arr.dtype == np.bool_:
+        return bool(arr)
+    if np.issubdtype(arr.dtype, np.number) and (arr == 0 or arr == 1):
+        return bool(arr)
+    raise ValueError("event must be a scalar boolean or 0/1")
+
+
+def _grid_row_for_time(grid: AlphaGrid, time: float) -> int:
+    """Return the row of ``grid`` whose cached time equals ``time``.
+
+    The ``alpha`` draw must reuse the cached ``T_im`` of the observation, not
+    rebuild ``t ** u``: step (a) calls this function once per new cluster, and
+    recomputing the row would make the ``(n, M)`` cache pointless.  An exact
+    match is required, because a grid built for another dataset would give the
+    wrong row and therefore the wrong conditional density.
+    """
+    rows = np.flatnonzero(grid.time == time)
+    if rows.size == 0:
+        raise ValueError("time is not a row of the supplied alpha grid")
+    return int(rows[0])
+
+
+def draw_g0_conditional_alpha(
+    time: object,
+    event: object,
+    *,
+    gamma: float,
+    phi: float,
+    grid: AlphaGrid,
+    rng: np.random.Generator,
+    d: int = 2,
+) -> tuple[float, float]:
+    """Draw ``(alpha, lambda)`` from the continuous piece of the base measure.
+
+    This is the "new cluster" branch of step (a): given that observation ``i``
+    is assigned to a fresh atom, its latent parameters come from the
+    continuous part ``h_i(alpha, lambda | gamma, phi, t_i)`` of plan
+    Section 2.2.  The two factors are
+
+    * uncensored: ``[alpha | .]`` is proportional to
+      ``alpha t**alpha / (gamma + t**alpha)**(d + 1)`` and
+      ``[lambda | alpha, .]`` is ``IGamma(d + 1, gamma + t**alpha)``;
+    * right-censored: ``[alpha | .]`` is proportional to
+      ``1 / (gamma + z**alpha)**d`` and ``[lambda | alpha, .]`` is
+      ``IGamma(d, gamma + z**alpha)``.
+
+    The uncensored ``alpha`` density is exactly the Eq. A.2 integrand, so
+    the same grid row that supplies ``q0`` also supplies this draw; a censored
+    observation must use the Eq. A.3 row instead.  ``alpha`` is drawn by
+    inverse CDF on the grid (plan Section 2.4(ii)): ``cumsum`` the normalised
+    row, draw one uniform, then ``searchsorted``.  ``lambda`` is then drawn
+    from its conjugate inverse-gamma conditional, whose scale is
+    ``gamma + t**alpha`` and whose shape is ``d + 1`` for an uncensored and
+    ``d`` for a right-censored observation.
+
+    Parameters
+    ----------
+    time : object
+        One time on the transformed scale, strictly greater than 1.  It must
+        be a row of ``grid`` so that the cached ``t ** u`` row is reused.
+    event : object
+        Scalar censoring indicator; ``True`` for an uncensored observation
+        (density, Eq. A.2) and ``False`` for a right-censored one (survival,
+        Eq. A.3).  Numeric ``0``/``1`` is accepted.
+    gamma, phi : float
+        Current ``G0`` hyperparameters, both finite and strictly positive.
+    grid : AlphaGrid
+        Grid built from the data containing ``time``; supplies the unit nodes,
+        the trapezoid weights and the cached power row.
+    rng : np.random.Generator
+        Random generator.  Exactly two variates are consumed: one uniform for
+        ``alpha`` and one gamma variate for ``lambda``.
+    d : int, optional
+        Inverse-gamma shape of the base measure.  Defaults to the paper's
+        ``d = 2``; exposed because the tests distinguish ``d`` from ``d + 1``.
+
+    Returns
+    -------
+    tuple of float
+        ``(alpha, lambda)`` with ``0 < alpha < phi`` and ``lambda > 0``.
+
+    Raises
+    ------
+    ValueError
+        If ``time``, ``event``, ``gamma``, ``phi`` or ``d`` is invalid, or if
+        ``time`` is not a row of ``grid``.
+
+    Notes
+    -----
+    Drawing ``alpha`` on the grid makes it discrete with spacing
+    ``Delta alpha = phi / M``.  This is the paper's own approximation (plan
+    Section 2.4(ii)) and is documented rather than removed; the continuous
+    ``lambda`` draw is exact.  The inverse-CDF index is intentionally
+    ``searchsorted(..., side="right")`` with a final ``min(M - 1, ...)``
+    clamp, so a uniform of exactly 1.0 cannot run off the grid.
+    """
+    t = _as_scalar_transformed_time(time)
+    is_event = _as_scalar_event(event)
+    gamma = _as_positive_scalar(gamma, "gamma")
+    phi = _as_positive_scalar(phi, "phi")
+    d = _as_shape_parameter(d)
+    row = _grid_row_for_time(grid, t)
+
+    alpha_nodes = phi * grid.u
+    tau = np.power(grid.T[row], phi)
+    if is_event:
+        log_density = (
+            np.log(alpha_nodes)
+            + phi * np.log(grid.T[row])
+            - (d + 1) * np.log(gamma + tau)
+        )
+        lam_shape = d + 1
+    else:
+        log_density = -d * np.log(gamma + tau)
+        lam_shape = d
+
+    log_weights = log_density + grid.log_w
+    # A single row is normalised with a max shift rather than
+    # ``scipy.special.logsumexp``: the scipy wrapper costs ~0.15 ms per call
+    # on a 16-node array, which would dominate step (a), while this shift is
+    # the same stabilisation.  Batch sums in the sweep still use ``logsumexp``.
+    weights = np.exp(log_weights - float(np.max(log_weights)))
+    weights /= float(np.sum(weights))
+    cumulative = np.cumsum(weights)
+    index = int(np.searchsorted(cumulative, rng.random(), side="right"))
+    index = min(index, grid.M - 1)
+    alpha = float(alpha_nodes[index])
+
+    lam_scale = gamma + t**alpha
+    lam = float(1.0 / rng.gamma(shape=lam_shape, scale=1.0 / lam_scale))
+    return alpha, lam
