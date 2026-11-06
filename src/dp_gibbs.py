@@ -62,6 +62,7 @@ __all__ = [
     "log_alpha_integrand_uncensored",
     "log_integral_alpha",
     "draw_g0_conditional_alpha",
+    "init_state",
     "log_q0_censored",
     "log_q0_uncensored",
     "make_grid",
@@ -1377,6 +1378,163 @@ def draw_g0_conditional_alpha(
     lam_scale = gamma + t**alpha
     lam = float(1.0 / rng.gamma(shape=lam_shape, scale=1.0 / lam_scale))
     return alpha, lam
+
+
+def _validate_init_inputs(
+    data: SurvData, prior: DPPrior, grid: AlphaGrid
+) -> tuple[float, float, float, int]:
+    """Check the initialisation inputs and return the prior-centre values.
+
+    Returns
+    -------
+    tuple
+        ``(nu, gamma, b_phi, d)``: the DP precision and inverse-gamma scale at
+        their prior means, the Pareto lower bound and the base-measure shape.
+    """
+    if not isinstance(data, SurvData):
+        raise ValueError("data must be a SurvData instance")
+    if not isinstance(prior, DPPrior):
+        raise ValueError("prior must be a DPPrior instance")
+    if not isinstance(grid, AlphaGrid):
+        raise ValueError("grid must be an AlphaGrid instance")
+    if grid.n != data.time.size:
+        raise ValueError(
+            "the alpha grid and the data must cover the same observations, "
+            f"got grid.n={grid.n} and data.time.size={data.time.size}"
+        )
+    if not np.array_equal(np.asarray(grid.time), np.asarray(data.time)):
+        raise ValueError(
+            "the alpha grid was built for another dataset; rebuild it with "
+            "make_grid(data, ...) so the cached rows match the observations"
+        )
+
+    a_nu = _as_positive_scalar(prior.a_nu, "prior.a_nu")
+    b_nu = _as_positive_scalar(prior.b_nu, "prior.b_nu")
+    a_gamma = _as_positive_scalar(prior.a_gamma, "prior.a_gamma")
+    b_gamma = _as_positive_scalar(prior.b_gamma, "prior.b_gamma")
+    b_phi = _as_positive_scalar(prior.b_phi, "prior.b_phi")
+    d = _as_shape_parameter(prior.d)
+
+    # The shape of the Pareto prior on phi is not used by the initialisation
+    # (only its lower bound is), but it is validated anyway: a bad a_phi would
+    # make the very first step (c) fail after the state has already been built.
+    _as_positive_scalar(prior.a_phi, "prior.a_phi")
+    return a_nu / b_nu, a_gamma / b_gamma, b_phi, d
+
+
+def init_state(
+    data: SurvData,
+    prior: DPPrior,
+    *,
+    grid: AlphaGrid,
+    seed: int | None = None,
+    rng: np.random.Generator | None = None,
+) -> DPState:
+    """Build the starting state of one chain (plan Section 3.6).
+
+    The paper does not specify initial values, so this module documents its own.
+    Every observation starts as its own singleton cluster and its latent
+    ``(alpha_i, lambda_i)`` is drawn from the continuous piece of the base
+    measure at the prior centre:
+
+    * ``s_i = i`` and ``n_j = 1`` for all ``i``, hence ``n_star = n``;
+    * ``(alpha_i, lambda_i) ~ h_i(.; gamma_0, phi_0)`` with
+      ``gamma_0 = a_gamma / b_gamma`` and ``phi_0 = b_phi``, drawn by
+      :func:`draw_g0_conditional_alpha` -- an uncensored observation uses the
+      Eq. A.2 row and a right-censored one the Eq. A.3 row, exactly as the
+      first step (a) would draw it;
+    * ``nu_0 = a_nu / b_nu`` and ``phi_0 = b_phi`` (the Pareto lower bound),
+      i.e. the prior means, so nothing is started at an extreme.
+
+    The ``phi`` invariant ``max_j alpha*_j <= phi`` is enforced by taking
+    ``phi = max(b_phi, max_i alpha_i)``; because the grid nodes lie in
+    ``(0, 1]`` and are scaled by ``b_phi``, the maximum is ``b_phi`` itself in
+    exact arithmetic, and the ``max`` only stops a floating-point rounding of
+    the last node from tripping invariant 3.  Initialisation is *not* a special
+    case inside the sweep -- it only produces a valid :class:`DPState`.
+
+    Parameters
+    ----------
+    data : SurvData
+        Dataset on the transformed scale.  It must be the dataset ``grid`` was
+        built from; its times supply one grid row per observation.
+    prior : DPPrior
+        Fixed hyperparameters.  All six shape/scale entries must be finite and
+        strictly positive, and ``d`` a positive integer.
+    grid : AlphaGrid
+        Grid built by ``make_grid(data, settings.n_alpha)``.  Its cached power
+        rows are reused, so a new cluster's shape draw does not rebuild
+        ``t ** u``.
+    seed : int or None, optional
+        Seed of the initialisation stream.  ``None`` draws fresh OS entropy.  The
+        chain driver uses ``seed + b`` for chain ``b`` (plan Section 3.6).
+    rng : np.random.Generator, optional
+        An explicit generator, for a caller that wants initialisation and sweeps
+        to share one stream.  Mutually exclusive with ``seed``.
+
+    Returns
+    -------
+    DPState
+        ``n_star = n`` singletons in observation order, ``n_j = 1``, ``s = 0..n-1``
+        and the prior-centre hyperparameters.  The Section 2.1 invariants hold
+        immediately (``check_invariants(prior)`` passes), so the state can go
+        straight into ``sweep``.
+
+    Raises
+    ------
+    ValueError
+        If the grid does not match the data, a prior hyperparameter is not
+        finite and strictly positive, ``d`` is not a positive integer, or both
+        ``seed`` and ``rng`` are supplied.
+    StateInvariantError
+        If a drawn location violates an invariant (defensive; the continuous
+        piece cannot produce one for valid inputs).
+
+    Notes
+    -----
+    Random-number consumption is exactly ``2 * n`` variates in observation order:
+    one uniform for the grid ``alpha`` and one gamma for ``lambda`` per
+    observation, with no branch on the censoring indicator (both branches of
+    :func:`draw_g0_conditional_alpha` consume two).  That fixed count is what
+    lets the chain driver replay a seed and what the golden regression pins.
+    """
+    nu_init, gamma_init, phi_init, d = _validate_init_inputs(data, prior, grid)
+    if seed is not None and rng is not None:
+        raise ValueError("pass either seed or rng, not both")
+    if rng is None:
+        rng = np.random.default_rng(seed)
+
+    n = int(data.time.size)
+    time = np.asarray(data.time, dtype=np.float64)
+    event = np.asarray(data.event, dtype=bool)
+    alpha = np.empty(n, dtype=np.float64)
+    lam = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        alpha[i], lam[i] = draw_g0_conditional_alpha(
+            time[i],
+            event[i],
+            gamma=gamma_init,
+            phi=phi_init,
+            grid=grid,
+            rng=rng,
+            d=d,
+        )
+
+    # Each observation is its own cluster, so alpha_star *is* alpha and every
+    # cluster has size one; no compaction or relabelling is needed.
+    labels = np.arange(n, dtype=np.intp)
+    phi = max(phi_init, float(np.max(alpha)))
+    return DPState(
+        alpha=alpha,
+        lam=lam,
+        s=labels,
+        alpha_star=np.array(alpha, copy=True),
+        lam_star=np.array(lam, copy=True),
+        n_j=np.ones(n, dtype=np.intp),
+        nu=nu_init,
+        gamma=gamma_init,
+        phi=phi,
+    )
 
 
 def _log_q0_by_observation(
