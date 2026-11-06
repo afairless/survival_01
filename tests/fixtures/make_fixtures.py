@@ -10,10 +10,17 @@ Run from anywhere with the project environment::
     pixi run python tests/fixtures/make_fixtures.py
 
 The script writes ``golden_dp_gibbs.json`` next to itself (test 28 of plan
-Section 7.5).  It is deliberately not imported by ``tests/test_golden.py``;
-the test rebuilds the same synthetic data and sampler settings from its own
-constants and regenerates the expected numbers only through the production
-code path.
+Section 7.5) and ``sbc_seeds.json`` (test 17 of plan Section 7.3).  It is
+deliberately not imported by ``tests/test_golden.py`` or ``tests/test_sbc.py``;
+the tests rebuild the same synthetic data, sampler settings and generation
+protocol from their own constants and regenerate the expected numbers only
+through the production code path.
+
+The SBC fixture holds seeds only -- one generation, one chain and one
+functional-inference seed per replicate -- because those are what the plan's
+Section 7.3 test 17 asks to keep reproducible.  The generator itself lives in
+``tests/test_sbc.py``, so a drift of the generation stream shows up as a rank
+change, not as a stale fixture that quietly agrees with itself.
 
 Regenerate only deliberately, and treat the resulting diff as a change to the
 sampler's random-number consumption: the discrete field ``s`` and the floating
@@ -48,6 +55,20 @@ from src.dp_gibbs import (  # noqa: E402
 
 FIXTURE_DIR = Path(__file__).resolve().parent
 GOLDEN_PATH = FIXTURE_DIR / "golden_dp_gibbs.json"
+SBC_SEEDS_PATH = FIXTURE_DIR / "sbc_seeds.json"
+
+# Plan Section 7.3 test 17: 100 replicates, each with its own generation,
+# chain and functional-inference seed.  One fixed root seed makes the whole
+# set reproducible from this script; the child seeds are drawn with numpy's
+# ``SeedSequence``, whose output is stable across library versions.
+SBC_ROOT_SEED = 20241113
+SBC_REPLICATES = 100
+
+# The time unit and censoring-law width of the SBC replicates.  They duplicate
+# tests/test_sbc.py on purpose: a fixture regenerated with a different law must
+# fail that test's metadata assertions instead of silently moving the ranks.
+SBC_T_MAX_ORIGINAL = 5.1390
+SBC_CENSOR_MAX_TRANSFORMED = 150.0
 
 # Tiny, deterministic surrogate for the Section 5.1 data: n = 20 lognormal
 # times with right-censoring at a fixed threshold.  Only three observations are
@@ -174,11 +195,62 @@ def build_golden_fixture() -> dict[str, Any]:
     }
 
 
+def sbc_seeds() -> tuple[list[int], list[int], list[int]]:
+    """Return the per-replicate generation, chain and functional seeds."""
+    children = np.random.SeedSequence(SBC_ROOT_SEED).spawn(3 * SBC_REPLICATES)
+    values = [int(child.generate_state(1, np.uint32)[0]) for child in children]
+    return (
+        values[:SBC_REPLICATES],
+        values[SBC_REPLICATES : 2 * SBC_REPLICATES],
+        values[2 * SBC_REPLICATES :],
+    )
+
+
+def build_sbc_seed_fixture() -> dict[str, Any]:
+    """Describe the seeds and the pinned generation constants of test 17."""
+    replicate_seeds, chain_seeds, functional_seeds = sbc_seeds()
+
+    # Structural sanity: a fixture written from a broken seed stream must not
+    # be committed silently.  The values duplicate tests/test_sbc.py on
+    # purpose (the test is not allowed to import this script).
+    assert len(replicate_seeds) == SBC_REPLICATES
+    assert len(set(replicate_seeds)) == SBC_REPLICATES
+    assert len(set(chain_seeds)) == SBC_REPLICATES
+    assert len(set(functional_seeds)) == SBC_REPLICATES
+
+    return {
+        "fixture": "sbc_seeds",
+        "plan": "docs/research/dp_gibbs_plan.md Section 7.3 test 17",
+        "generated_by": "python tests/fixtures/make_fixtures.py",
+        "root_seed": SBC_ROOT_SEED,
+        "n_replicates": SBC_REPLICATES,
+        "n_observations": 15,
+        "prior": dataclasses.asdict(PRIOR),
+        "generation": {
+            "epsilon_tail": 1e-8,
+            "t_max_original": SBC_T_MAX_ORIGINAL,
+            "censor_max_original": SBC_CENSOR_MAX_TRANSFORMED * SBC_T_MAX_ORIGINAL,
+            "censoring_fraction_bounds": [0.15, 0.25],
+            "evaluation_times_original": [0.7832, 1.1727, 2.1511],
+        },
+        "statistics": ["nu", "gamma", "phi", "S_q25", "S_q50", "S_q75"],
+        "replicate_seeds": replicate_seeds,
+        "chain_seeds": chain_seeds,
+        "functional_seeds": functional_seeds,
+    }
+
+
 def main() -> None:
-    """Write the golden fixture and report where it went."""
+    """Write both fixtures and report where they went."""
     payload = build_golden_fixture()
     GOLDEN_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {GOLDEN_PATH.relative_to(REPO_ROOT)}")
+
+    sbc_payload = build_sbc_seed_fixture()
+    SBC_SEEDS_PATH.write_text(
+        json.dumps(sbc_payload, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"wrote {SBC_SEEDS_PATH.relative_to(REPO_ROOT)}")
 
 
 if __name__ == "__main__":
