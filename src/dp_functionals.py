@@ -40,6 +40,27 @@ hazard carry the ``1 / t_max`` Jacobian.  Dropping that factor is invisible in
 a plot of ``S`` and changes every density and hazard by a constant, which is
 why the map lives in one function and test 26 checks it explicitly.
 
+Prior functionals
+-----------------
+:func:`prior_functionals` applies the same machinery with ``G_b`` drawn from
+the **prior**, ``G_b ~ DP(nu_b G0(. | phi_b, gamma_b))`` and
+``(nu_b, gamma_b, phi_b)`` drawn from their priors with
+:func:`src.dp_weibull.sample_prior_hyperparameters`.  The truncation level
+follows the paper's Section 3 rule for the prior,
+``J_prior = ceil(log(epsilon) / log(max_b nu_b / (1 + max_b nu_b)))``, i.e.
+:func:`src.dp_weibull.truncation_number` at the largest drawn precision; it is
+computed once for the run, exactly like the posterior common-``J`` rule.
+
+Prior functionals are the reference for the prior bands of Figure 2, and they
+are *not* centred on the elicitation guess: the priors are elicited on the
+original time scale but applied to ``t_tilde = 1 + t / t_max``, a shift plus a
+scale.  For the Section 5.1 constants and ``t_max = 4.5518`` the prior median
+of the population median is about ``0.61``, not the elicited ``1.1727``, and
+roughly 43% of prior draws place the population median below zero in original
+time.  That is the paper's own convention (plan Section 10, decision 2); test
+21b pins it so that a later "fix" of the transform or of the priors cannot
+silently make the two scales coincide.
+
 Quantile functionals
 --------------------
 A quantile is **not** a linear functional, so it cannot be read off the
@@ -64,13 +85,14 @@ Scope
 -----
 In scope: posterior survival, CDF, density and hazard functionals, by exact
 mixture evaluation over a pruned DP realisation (``method="exact"``) or by
-the paper's ``L``-atom Monte Carlo estimator (``method="mc"``), and quantile
-functionals by inverting the exact mixture CDF per draw.
+the paper's ``L``-atom Monte Carlo estimator (``method="mc"``); quantile
+functionals by inverting the exact mixture CDF per draw; and prior
+functionals from prior DP realisations, used as the Figure 2 prior bands.
 
-Out of scope (added by later steps or deliberately absent): prior
-functionals, two-population comparisons, plotting, and any re-sampling of
-``theta``.  Nothing here draws from the posterior of the sampler; it consumes
-:class:`DPChains` produced by :mod:`src.dp_gibbs`.
+Out of scope (added by later steps or deliberately absent): two-population
+comparisons, plotting, and any re-sampling of ``theta``.  Nothing here draws
+from the posterior of the sampler; it consumes :class:`DPChains` produced by
+:mod:`src.dp_gibbs`, or a :class:`DPPrior` when there are no data.
 """
 
 from __future__ import annotations
@@ -81,10 +103,13 @@ from typing import Any
 
 import numpy as np
 
-from src.dp_gibbs import DPChains, SurvData, inverse_map, transform_time
+from src.dp_gibbs import DPChains, DPPrior, SurvData, inverse_map, transform_time
 from src.dp_weibull import (
     DPRealization,
     sample_dp_posterior,
+    sample_dp_prior,
+    sample_prior_hyperparameters,
+    truncation_number,
     truncation_number_for_posterior,
 )
 
@@ -95,6 +120,7 @@ __all__ = [
     "functionals_from_realizations",
     "posterior_functionals",
     "posterior_quantiles",
+    "prior_functionals",
     "quantiles_from_realizations",
 ]
 
@@ -792,6 +818,219 @@ def posterior_functionals(
             realizations, t_grid, data, L=settings.L, rng=atom_rng, meta=meta
         )
     return functionals_from_realizations(realizations, t_grid, data, meta=meta)
+
+
+def _scale_only_data(t_max: float) -> SurvData:
+    """Build a one-row stand-in whose only meaningful field is ``t_max``.
+
+    The inverse map is defined on :class:`SurvData`, but prior functionals
+    have no observations: only the time scale matters.  This carries a single
+    synthetic observation whose transformed time ``2`` is the original
+    ``t = t_max``, which is valid for any positive ``t_max`` and keeps the
+    mapping in :func:`src.dp_gibbs.inverse_map` as the single implementation
+    of the Jacobian.
+    """
+    return SurvData(time=np.array([2.0]), event=np.array([True]), t_max=t_max)
+
+
+def _resolve_time_scale(data: object, t_max: object) -> float:
+    """Resolve the original-scale maximum from ``data`` and/or ``t_max``.
+
+    Prior functionals have no data, so the caller supplies the time scale
+    either as a :class:`SurvData` (whose ``t_max`` is used) or as a bare
+    ``t_max``.  Supplying both is allowed only when they agree; otherwise the
+    returned grid would silently mix two units.
+    """
+    data_t_max: float | None = None
+    if data is not None:
+        if not isinstance(data, SurvData):
+            raise ValueError("data must be a SurvData instance or None")
+        data_t_max = float(data.t_max)
+
+    if t_max is None:
+        if data_t_max is None:
+            raise ValueError(
+                "prior functionals need a time scale: pass data=... or "
+                "t_max=... so that the original-scale inverse map is defined"
+            )
+        return data_t_max
+
+    if isinstance(t_max, bool) or not isinstance(
+        t_max, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"t_max must be a number or None, got {t_max!r}")
+    value = float(t_max)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"t_max must be finite and strictly positive, got {t_max!r}")
+    if data_t_max is not None and value != data_t_max:
+        raise ValueError(
+            f"t_max and data.t_max must agree, got {value!r} and {data_t_max!r}"
+        )
+    return value
+
+
+def _as_epsilon(epsilon: object) -> float:
+    """Validate the prior truncation tolerance ``epsilon`` in ``(0, 1)``."""
+    if isinstance(epsilon, bool) or not isinstance(
+        epsilon, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"epsilon must be a number, got {epsilon!r}")
+    value = float(epsilon)
+    if not np.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(f"epsilon must lie strictly between 0 and 1, got {epsilon!r}")
+    return value
+
+
+def prior_functionals(
+    prior: DPPrior,
+    t_grid: object,
+    n_draws: int,
+    *,
+    data: SurvData | None = None,
+    t_max: float | None = None,
+    settings: FunctionalSettings | None = None,
+    epsilon: float = 1e-4,
+    seed: int | None = None,
+) -> Functionals:
+    """Prior functionals ``S``, ``F``, ``f`` and ``h`` for prior bands.
+
+    This is the prior counterpart of :func:`posterior_functionals` (plan
+    Section 4.2): for each of ``n_draws`` replications it
+
+    1. draws ``nu_b``, ``gamma_b``, ``phi_b`` from the priors in ``prior``
+       with :func:`src.dp_weibull.sample_prior_hyperparameters`;
+    2. draws ``G_b ~ DP(nu_b G0(. | phi_b, gamma_b))`` with
+       :func:`src.dp_weibull.sample_dp_prior` at the **prior** common
+       truncation level ``J_prior = ceil(log(epsilon) / log(max_b nu_b /
+       (1 + max_b nu_b)))`` -- the paper's Section 3 rule, evaluated once at
+       the largest drawn precision and never per draw;
+    3. prunes the trailing stick-breaking tail with ``settings.atom_tol``
+       and evaluates the exact mixture ``S``, ``F``, ``f`` and ``h`` on
+       ``t_grid``, mapping them back to the original time scale.
+
+    Priors are elicited on the original time scale but applied on
+    ``t_tilde = 1 + t / t_max`` (plan Section 5).  The resulting prior bands
+    are therefore **not** centred on the elicitation guess: with the Section
+    5.1 constants and ``t_max = 4.5518`` the prior mean of ``S(1.1727)`` is
+    about ``0.43`` and the prior median of the population median is about
+    ``0.61``, not ``1.1727``.  Figure 2 compares the posterior against these
+    bands, so the caveat is part of the specification (decision 2 in the
+    plan), not a defect to be repaired here.
+
+    Only ``settings.method="exact"`` is supported: a prior band is a summary
+    of the distribution of the functional, and the Rao-Blackwellised
+    evaluation of a pruned prior realisation has no additional ``L`` noise to
+    blur it.
+
+    Parameters
+    ----------
+    prior : DPPrior
+        Fixed prior hyperparameters ``(a_nu, b_nu, a_gamma, b_gamma, a_phi,
+        b_phi, d)``.  The priors are not estimated, so this is the same
+        container the sampler takes.
+    t_grid : array-like
+        Original-scale evaluation times, 1-D, finite and strictly positive.
+    n_draws : int
+        Number of prior replications ``B``.  Each costs one DP realisation,
+        not one Markov chain.
+    data : SurvData, optional
+        Dataset whose ``t_max`` defines the inverse map.  Supply this or
+        ``t_max``; supplying both requires them to agree.  The observations
+        themselves are not used: a prior draw does not depend on the data.
+    t_max : float, optional
+        Original-scale maximum, for callers that have no dataset (e.g. a
+        band evaluated at the paper's ``t_max = 4.5518``).
+    settings : FunctionalSettings, optional
+        Functional-inference knobs.  ``atom_tol`` is used for pruning;
+        ``method`` must be ``"exact"``.
+    epsilon : float, optional
+        Target residual DP mass of the prior truncation rule (default
+        ``1e-4``, the paper's value).  This is the prior analogue of the
+        sampler's ``DPSettings.epsilon``; the posterior path takes it from
+        the chains instead.
+    seed : int or None, optional
+        Seed for the hyperparameter and DP-realisation draws.  ``None`` draws
+        a fresh seed from OS entropy, recorded in ``meta["seed"]``.  The
+        same seed and arguments reproduce the arrays exactly.
+
+    Returns
+    -------
+    Functionals
+        ``(n_draws, len(t_grid))`` prior functionals on the original scale,
+        plus provenance in ``meta`` (``J_prior``, ``max_nu``, ``epsilon``,
+        ``atom_tol``, ``seed`` and ``t_max``).
+
+    Raises
+    ------
+    ValueError
+        If ``prior`` is not a :class:`DPPrior`, ``n_draws`` is not a positive
+        integer, no time scale is supplied (or two disagreeing ones are),
+        the grid, ``epsilon`` or ``seed`` is malformed, or
+        ``settings.method`` is not ``"exact"``.
+    """
+    if not isinstance(prior, DPPrior):
+        raise ValueError(
+            f"prior must be a DPPrior instance, got {type(prior).__name__}"
+        )
+    draws = _as_atom_draw_count(n_draws, "n_draws")
+    if settings is None:
+        settings = FunctionalSettings()
+    if not isinstance(settings, FunctionalSettings):
+        raise ValueError("settings must be a FunctionalSettings instance")
+    if settings.method != "exact":
+        raise ValueError(
+            "prior_functionals evaluates exact pruned prior realisations; "
+            f"settings.method must be 'exact', got {settings.method!r}"
+        )
+    scale = _resolve_time_scale(data, t_max)
+    tolerance = _as_epsilon(epsilon)
+    grid = _as_t_grid(t_grid)
+    resolved_seed = _resolve_seed(seed)
+
+    rng = np.random.default_rng(resolved_seed)
+    hyperparameters = [
+        sample_prior_hyperparameters(
+            prior.a_nu,
+            prior.b_nu,
+            prior.a_gamma,
+            prior.b_gamma,
+            prior.a_phi,
+            prior.b_phi,
+            rng=rng,
+        )
+        for _ in range(draws)
+    ]
+
+    # The paper's prior truncation rule, evaluated once at the largest drawn
+    # precision (the prior analogue of the common-J posterior rule).
+    max_nu = max(precision for precision, _, _ in hyperparameters)
+    j_prior = truncation_number(max_nu, tolerance)
+
+    realizations = (
+        sample_dp_prior(
+            precision,
+            gamma,
+            phi,
+            d=prior.d,
+            epsilon=tolerance,
+            n_terms=j_prior,
+            rng=rng,
+        ).pruned(settings.atom_tol)
+        for precision, gamma, phi in hyperparameters
+    )
+
+    meta: dict[str, Any] = {
+        "sample": "prior",
+        "method": "exact",
+        "J_prior": int(j_prior),
+        "max_nu": float(max_nu),
+        "epsilon": float(tolerance),
+        "atom_tol": float(settings.atom_tol),
+        "seed": int(resolved_seed),
+    }
+    return functionals_from_realizations(
+        realizations, grid, _scale_only_data(scale), meta=meta
+    )
 
 
 def _cdf_at(realization: DPRealization, t_tilde: float) -> float:
