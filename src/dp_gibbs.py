@@ -45,12 +45,16 @@ here and in the results note, and made explicit by the prior-functional tests.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import os
+from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 __all__ = [
     "AlphaGrid",
+    "DPChains",
     "DPPrior",
     "DPSettings",
     "DPState",
@@ -75,6 +79,8 @@ __all__ = [
     "refresh_nu",
     "refresh_phi",
     "reset_alpha_bound_guard_count",
+    "sample_chain",
+    "sample_chains",
     "sample_step_a",
     "sample_step_a_for_obs",
     "sample_step_b",
@@ -3077,3 +3083,461 @@ def sweep(
     sample_step_b(state, data, prior, rng=rng)
     sample_step_c(state, data, prior, rng=rng)
     return log_post(state, data, prior)
+
+
+def _as_count(value: object, name: str, minimum: int) -> int:
+    """Normalise a non-negative integer knob, rejecting bools and floats.
+
+    ``bool`` is an ``int`` subclass and ``3.0`` compares equal to ``3``, so a
+    bare ``value < minimum`` check would accept ``thin=True`` (one sweep per
+    draw) or ``n_save=3.7`` (truncated silently).  Both would produce a chain
+    whose length disagrees with the settings, which is exactly the class of
+    error the storage validation in :class:`DPChains` exists to reject.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    out = int(value)
+    if out < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {out}")
+    return out
+
+
+def _as_draw_vector(
+    values: object, name: str, n_draws: int, *, positive: bool = True
+) -> np.ndarray:
+    """Normalise one stored per-draw trace to an owned, finite ``float64`` array."""
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be a 1-D array of one value per draw")
+    if arr.size != n_draws:
+        raise ValueError(
+            f"{name} must have one value per stored draw, got {arr.size} "
+            f"values for {n_draws} draws"
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values (no NaN or inf)")
+    if positive and np.any(arr <= 0.0):
+        raise ValueError(f"{name} must be strictly positive on every stored draw")
+    return np.array(arr, dtype=np.float64, copy=True)
+
+
+@dataclass
+class DPChains:
+    """Stored draws of one chain: what functional inference and diagnostics read.
+
+    This is the storage contract of plan Sections 3.2 and 3.7.  One instance
+    holds one chain -- not a fit, not the whole run -- so that split
+    :math:`\\hat R` and the multi-chain posterior functionals can treat chains
+    as independent replicates.
+
+    Attributes
+    ----------
+    data : SurvData
+        The dataset the chain was fitted to, on the transformed scale.  It is
+        stored rather than re-derived because ``t_max`` is needed for the
+        inverse map of every functional and cannot be recovered from the draws.
+    prior : DPPrior
+        The fixed hyperparameters in force for this chain.
+    settings : DPSettings
+        The knobs in force, with ``seed`` holding the chain group's **base**
+        seed: the resolved seed when the caller passed ``None``.  Chain ``b``
+        of the group was seeded with ``settings.seed + b`` (plan Section 3.6),
+        so the whole chain is replayable from this record.
+    theta : np.ndarray
+        ``float64[B, n, 2]``, the paper's ``theta_b``: ``theta[b, i]`` is
+        ``(alpha_i, lambda_i)`` for observation ``i`` at stored draw ``b``.
+        Per-observation locations (not the ``n_star``-long cluster locations)
+        are stored because ``dp_weibull.sample_dp_posterior`` consumes exactly
+        that ``(n, 2)`` shape and validating a reshaped array would only add a
+        copy.  At :math:`10^4 \\cdot 200 \\cdot 2 \\cdot 8` bytes this is 32 MB
+        per chain (plan Section 3.2).
+    nu, gamma, phi : np.ndarray
+        ``float64[B]`` hyperparameter trace of the stored draws.
+    n_star : np.ndarray
+        ``intp[B]`` number of occupied clusters of each stored draw, the
+        quantity of plan Section 6.3 Fig. 1.
+    log_post : np.ndarray
+        ``float64[B]`` unnormalised collapsed log-posterior of each stored draw,
+        as returned by :func:`sweep`.  A trace diagnostic and the golden
+        regression's scale -- never a model-comparison statistic (plan
+        Section 3.7).
+
+    The cluster labels ``s`` and the cluster locations ``alpha*``/``lambda*``
+    are deliberately *not* stored: the functionals are defined by the
+    observation-level mixture of the ``theta_i`` (plan Section 4.1), so the
+    labels are not needed, and storing them would make each draw's ``s``
+    look like a model quantity rather than a bookkeeping device.  A caller
+    that needs the labels replays the chain from ``settings.seed + b``.
+
+    Validation happens at construction, so a chain that disagrees with its
+    declared dataset, settings or Section 2.1 invariants fails at the storage
+    boundary instead of producing a silently mis-shaped functional array.
+    """
+
+    data: SurvData
+    prior: DPPrior
+    settings: DPSettings
+    theta: np.ndarray
+    nu: np.ndarray
+    gamma: np.ndarray
+    phi: np.ndarray
+    n_star: np.ndarray
+    log_post: np.ndarray
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, SurvData):
+            raise ValueError("data must be a SurvData instance")
+        if not isinstance(self.prior, DPPrior):
+            raise ValueError("prior must be a DPPrior instance")
+        if not isinstance(self.settings, DPSettings):
+            raise ValueError("settings must be a DPSettings instance")
+
+        theta = np.asarray(self.theta, dtype=np.float64)
+        if theta.ndim != 3 or theta.shape[2] != 2:
+            raise ValueError(
+                "theta must have shape (n_draws, n, 2) holding (alpha_i, lam_i), "
+                f"got shape {theta.shape}"
+            )
+        n_draws, n = int(theta.shape[0]), int(theta.shape[1])
+        if n_draws < 1:
+            raise ValueError("theta must hold at least one stored draw")
+        if n != int(self.data.time.size):
+            raise ValueError(
+                "theta must have one row per observation, got "
+                f"{n} rows for {self.data.time.size} observations"
+            )
+        if n_draws != int(self.settings.n_save):
+            raise ValueError(
+                "theta must hold settings.n_save draws, got "
+                f"{n_draws} draws for settings.n_save={self.settings.n_save}"
+            )
+        if not np.all(np.isfinite(theta)):
+            raise ValueError("theta must contain only finite values (no NaN or inf)")
+        if np.any(theta <= 0.0):
+            raise ValueError("theta must be strictly positive (alpha and lam)")
+
+        nu = _as_draw_vector(self.nu, "nu", n_draws)
+        gamma = _as_draw_vector(self.gamma, "gamma", n_draws)
+        phi = _as_draw_vector(self.phi, "phi", n_draws)
+        log_post = _as_draw_vector(self.log_post, "log_post", n_draws, positive=False)
+        if np.any(phi < self.prior.b_phi):
+            raise ValueError(
+                "phi must be at least prior.b_phi on every stored draw "
+                "(Section 2.1 invariant 4)"
+            )
+        if np.any(theta[:, :, 0] > phi[:, None]):
+            raise ValueError(
+                "alpha must not exceed phi on any stored draw (Section 2.1 invariant 3)"
+            )
+
+        n_star = np.asarray(self.n_star)
+        if n_star.ndim != 1 or n_star.size != n_draws:
+            raise ValueError(
+                "n_star must be a 1-D array with one entry per stored draw, got "
+                f"shape {n_star.shape} for {n_draws} draws"
+            )
+        if not np.issubdtype(n_star.dtype, np.integer):
+            raise ValueError("n_star must be an integer array")
+        n_star = n_star.astype(np.intp, copy=True)
+        if np.any(n_star < 1) or np.any(n_star > n):
+            raise ValueError(
+                "n_star must lie in 1..n on every stored draw, got "
+                f"[{int(n_star.min())}, {int(n_star.max())}] for n={n}"
+            )
+
+        self.theta = np.array(theta, dtype=np.float64, copy=True)
+        self.nu = nu
+        self.gamma = gamma
+        self.phi = phi
+        self.n_star = n_star
+        self.log_post = log_post
+
+    @property
+    def n_draws(self) -> int:
+        """Number of stored draws ``B`` (``settings.n_save``)."""
+        return int(self.theta.shape[0])
+
+    @property
+    def n(self) -> int:
+        """Number of observations ``n`` in the fitted dataset."""
+        return int(self.theta.shape[1])
+
+
+def _validate_chain_inputs(data: object, prior: object, settings: object) -> DPSettings:
+    """Check the chain-driver inputs and return the validated settings.
+
+    Failures are ``ValueError`` (bad input, raised before any randomness is
+    consumed) rather than ``StateInvariantError`` (a sampler bug): a chain
+    driver given ``thin=0`` or ``n_save=0`` must not start a sweep it cannot
+    store.
+    """
+    if not isinstance(data, SurvData):
+        raise ValueError("data must be a SurvData instance")
+    if not isinstance(prior, DPPrior):
+        raise ValueError("prior must be a DPPrior instance")
+    if not isinstance(settings, DPSettings):
+        raise ValueError("settings must be a DPSettings instance")
+
+    _as_count(settings.burn_in, "settings.burn_in", 0)
+    _as_count(settings.n_save, "settings.n_save", 1)
+    _as_count(settings.thin, "settings.thin", 1)
+    _as_count(settings.n_alpha, "settings.n_alpha", 2)
+    _as_count(settings.n_chains, "settings.n_chains", 1)
+    if settings.seed is not None:
+        _as_count(settings.seed, "settings.seed", 0)
+    if isinstance(settings.epsilon, bool) or not isinstance(
+        settings.epsilon, (int, float, np.floating)
+    ):
+        raise ValueError(f"settings.epsilon must be a number, got {settings.epsilon!r}")
+    epsilon = float(settings.epsilon)
+    if not np.isfinite(epsilon) or not 0.0 < epsilon < 1.0:
+        raise ValueError(
+            f"settings.epsilon must lie strictly between 0 and 1, got {epsilon!r}"
+        )
+    if not isinstance(settings.preset, str) or not settings.preset:
+        raise ValueError("settings.preset must be a non-empty string")
+    return settings
+
+
+def _draw_base_seed() -> int:
+    """Draw a fresh chain-group seed from OS entropy.
+
+    Only used when ``settings.seed is None``; the result is written into the
+    returned chains' ``settings.seed``, so a run started without a seed is
+    still replayable afterwards.  Kept below ``2**63`` so that ``seed + b``
+    stays a valid seed for :func:`numpy.random.default_rng`.
+    """
+    return int(np.random.default_rng().integers(0, 2**63 - 1))
+
+
+def _sample_one_chain(
+    task: tuple[SurvData, DPPrior, DPSettings, int],
+) -> DPChains:
+    """Run one chain end to end and return its stored draws.
+
+    This is the unit of work of ``sample_chains``, so it is a module-level
+    function taking a single picklable tuple: the same callable runs in the
+    parent process (a single chain, or ``max_workers=1``) and in a
+    ``ProcessPoolExecutor`` worker, which is what makes the serial and parallel
+    results bit-for-bit identical.
+
+    The task tuple is ``(data, prior, settings, seed)`` where ``settings.seed``
+    is already the group's resolved base seed and ``seed`` is ``base + b``.
+    Initialisation and every sweep share **one** generator seeded with ``seed``
+    (plan Section 3.6): ``init_state`` consumes ``2n`` variates and the sweeps
+    consume the rest, so the whole chain -- initial state included -- replays
+    from the seed alone.  A separate generator for initialisation would also be
+    reproducible, but it would split the stream for no gain and make "replay
+    the seed" mean two seeds.
+
+    Exactly ``burn_in + thin * n_save`` sweeps run: ``burn_in`` discarded, then
+    each stored draw is the state after ``thin`` further sweeps.  Storing after
+    a block of ``thin`` sweeps (rather than the state before the block) is what
+    puts the first stored draw ``thin`` sweeps after burn-in, as plan Section
+    3.7 specifies.  ``assert``-style invariant checks run at each *stored*
+    draw, not at every sweep: the cost is O(n) per draw rather than per sweep
+    and a corrupted state cannot survive into the storage.
+    """
+    data, prior, settings, seed = task
+    grid = make_grid(data, int(settings.n_alpha))
+    rng = np.random.default_rng(seed)
+    state = init_state(data, prior, grid=grid, rng=rng)
+
+    n = int(data.time.size)
+    n_save = int(settings.n_save)
+    theta = np.empty((n_save, n, 2), dtype=np.float64)
+    nu = np.empty(n_save, dtype=np.float64)
+    gamma = np.empty(n_save, dtype=np.float64)
+    phi = np.empty(n_save, dtype=np.float64)
+    n_star = np.empty(n_save, dtype=np.intp)
+    log_posterior = np.empty(n_save, dtype=np.float64)
+
+    for _ in range(int(settings.burn_in)):
+        sweep(state, data, prior, grid=grid, rng=rng)
+
+    score = math.nan
+    for b in range(n_save):
+        for _ in range(int(settings.thin)):
+            score = sweep(state, data, prior, grid=grid, rng=rng)
+        state.check_invariants(prior)
+        theta[b, :, 0] = state.alpha
+        theta[b, :, 1] = state.lam
+        nu[b] = state.nu
+        gamma[b] = state.gamma
+        phi[b] = state.phi
+        n_star[b] = state.n_star
+        log_posterior[b] = score
+
+    return DPChains(
+        data=data,
+        prior=prior,
+        settings=settings,
+        theta=theta,
+        nu=nu,
+        gamma=gamma,
+        phi=phi,
+        n_star=n_star,
+        log_post=log_posterior,
+    )
+
+
+def sample_chain(data: SurvData, prior: DPPrior, settings: DPSettings) -> DPChains:
+    """Run one chain and return its stored draws (plan Sections 3.2, 3.6, 3.7).
+
+    The chain starts from :func:`init_state` and runs
+    ``settings.burn_in + settings.thin * settings.n_save`` sweeps of
+    :func:`sweep`, storing the state after every ``thin`` sweeps once burn-in
+    is over.  The stored draw is
+
+        ``theta[b, i] = (alpha_i, lambda_i)``, ``nu[b]``, ``gamma[b]``,
+        ``phi[b]``, ``n_star[b]`` and ``log_post[b]``
+
+    for ``b = 0 .. n_save-1`` -- the schema :class:`DPChains` documents.
+
+    This is chain ``b = 0`` of the group described by ``settings``, i.e. it is
+    seeded with ``settings.seed`` (a fresh OS-entropy seed when that is
+    ``None``).  Use :func:`sample_chains` for the other chains of the group and
+    for more than one settings entry; the two paths share the worker, so
+    ``sample_chains([settings])[0]`` equals ``sample_chain(data, prior,
+    settings)`` bit for bit.
+
+    Parameters
+    ----------
+    data : SurvData
+        Dataset on the transformed scale.
+    prior : DPPrior
+        Fixed hyperparameters.
+    settings : DPSettings
+        Knobs.  ``n_save``, ``thin`` and ``burn_in`` determine the run length;
+        ``n_alpha`` the grid; ``n_chains`` is *not* used here (it is a property
+        of a group of chains) and is validated only.
+
+    Returns
+    -------
+    DPChains
+        One chain.  ``settings.seed`` is the resolved base seed, so the chain
+        can be replayed with ``sample_chain(data, prior, chain.settings)``.
+
+    Raises
+    ------
+    ValueError
+        If ``data``, ``prior`` or ``settings`` have the wrong type, a count
+        knob is not a non-negative integer where it must be, ``n_save`` or
+        ``thin`` is zero, ``epsilon`` is outside ``(0, 1)``, or ``preset`` is
+        empty.  Raised before the first sweep.
+    StateInvariantError
+        If a stored draw violates a Section 2.1 invariant -- a sampler bug,
+        not an input error.
+
+    Notes
+    -----
+    Nothing global is touched: no module-level RNG, no ``plt``, no mutable
+    default.  The storage is 32 MB for the ``paper`` preset at ``n = 200``
+    (plan Section 3.2), which is why ``theta`` is allocated once and filled row
+    by row rather than appended.
+    """
+    _validate_chain_inputs(data, prior, settings)
+    base_seed = _draw_base_seed() if settings.seed is None else int(settings.seed)
+    chain_settings = replace(settings, seed=base_seed)
+    return _sample_one_chain((data, prior, chain_settings, base_seed))
+
+
+def sample_chains(
+    data: SurvData,
+    prior: DPPrior,
+    settings_list: Sequence[DPSettings],
+    *,
+    max_workers: int | None = None,
+) -> list[DPChains]:
+    """Run every chain of every settings entry, in parallel across chains.
+
+    ``settings_list`` carries one entry per fit -- e.g. the seven fits of plan
+    Section 6.2 (Section 5.1 under three priors, Section 5.2 arm A under three
+    and arm B under one) -- and each entry's ``n_chains`` chains use the seeds
+    ``settings.seed + 0 .. + n_chains - 1`` (plan Section 3.6: "four chains
+    with seeds ``seed + 0..3`` for anything reported").  The result is the flat
+    list of chains in ``(settings_list index, chain index)`` order, so a single
+    entry with ``n_chains = 4`` yields the four chains that split
+    :math:`\\hat R` (plan Section 7.3 test 18) needs, and the full figure set
+    yields 28 chains.
+
+    Parallelism is **across chains only** (plan Section 8, implementation gate
+    2): the pool's unit of work is one :func:`_sample_one_chain` task, so the
+    grouping and the per-group seed stream are unaffected by the worker count
+    and the output does not depend on scheduling order.  ``max_workers``
+    defaults to ``min(number of chains, os.cpu_count())``; ``max_workers=1``
+    runs everything in the parent process, which is also what happens when the
+    run has a single chain.
+
+    A settings entry whose ``seed`` is ``None`` gets one fresh base seed, drawn
+    in the parent **before** any task is submitted and stored in the returned
+    chains' ``settings.seed`` -- so even an unseeded invocation is replayable
+    afterwards, and the draw order does not depend on the pool.
+
+    Parameters
+    ----------
+    data : SurvData
+        Dataset on the transformed scale, shared by every chain.
+    prior : DPPrior
+        Fixed hyperparameters, shared by every chain.  To compare priors, pass
+        several settings entries -- the prior is a model input, not a knob.
+    settings_list : sequence of DPSettings
+        One entry per fit.  Must not be empty and must not be a bare
+        ``DPSettings`` (a common mistake that would silently fit one chain
+        instead of ``n_chains``).
+    max_workers : int, optional
+        Pool size.  ``None`` uses every core up to the number of chains;
+        ``1`` disables the pool.  Only affects speed, never the draws.
+
+    Returns
+    -------
+    list of DPChains
+        ``sum(settings.n_chains for settings in settings_list)`` chains.
+
+    Raises
+    ------
+    ValueError
+        If ``data`` or ``prior`` has the wrong type, ``settings_list`` is
+        empty or is a single ``DPSettings``, any entry is invalid, or
+        ``max_workers`` is not a positive integer.
+
+    Notes
+    -----
+    A worker exception propagates unchanged to the caller.  ``DPChains`` is
+    picklable (plain dataclass plus NumPy arrays), which is what allows the
+    result to cross the process boundary; no shared memory or global is needed.
+    """
+    if not isinstance(data, SurvData):
+        raise ValueError("data must be a SurvData instance")
+    if not isinstance(prior, DPPrior):
+        raise ValueError("prior must be a DPPrior instance")
+    if isinstance(settings_list, DPSettings):
+        raise ValueError(
+            "settings_list must be a sequence of DPSettings (one per fit); "
+            "wrap a single entry in a list, e.g. ``[settings]``"
+        )
+    try:
+        plans = list(settings_list)
+    except TypeError as exc:
+        raise ValueError("settings_list must be a sequence of DPSettings") from exc
+    if not plans:
+        raise ValueError("settings_list must contain at least one DPSettings")
+
+    tasks: list[tuple[SurvData, DPPrior, DPSettings, int]] = []
+    for settings in plans:
+        validated = _validate_chain_inputs(data, prior, settings)
+        base_seed = _draw_base_seed() if validated.seed is None else int(validated.seed)
+        group_settings = replace(validated, seed=base_seed)
+        for b in range(int(validated.n_chains)):
+            tasks.append((data, prior, group_settings, base_seed + b))
+
+    n_tasks = len(tasks)
+    if max_workers is None:
+        workers = min(n_tasks, os.cpu_count() or 1)
+    else:
+        workers = min(_as_count(max_workers, "max_workers", 1), n_tasks)
+
+    if workers == 1:
+        return [_sample_one_chain(task) for task in tasks]
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(_sample_one_chain, tasks))
