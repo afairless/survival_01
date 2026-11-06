@@ -40,16 +40,37 @@ hazard carry the ``1 / t_max`` Jacobian.  Dropping that factor is invisible in
 a plot of ``S`` and changes every density and hazard by a constant, which is
 why the map lives in one function and test 26 checks it explicitly.
 
+Quantile functionals
+--------------------
+A quantile is **not** a linear functional, so it cannot be read off the
+``S``/``F`` arrays: the paper's Section 3 warns that the quantile functional
+must be obtained by inverting the CDF of each draw separately.
+:func:`posterior_quantiles` therefore evaluates the mixture CDF of ``G_b`` on
+the supplied grid, inverts it per draw and then applies the affine inverse
+map ``eta_p = t_max * (eta_tilde_p - 1)``.  Inversion uses the (monotone)
+grid CDF for a piecewise-linear first guess and then polishes the root on the
+*exact* mixture CDF with a bisection-safeguarded Newton iteration.  The polish
+is what makes a single-atom draw exact to machine precision instead of the
+``O(h**2)`` error a pure grid interpolation leaves behind; it also means the
+inverted quantiles satisfy ``F_b(eta_p^{(b)}) = p`` far more tightly than the
+``1e-6`` in ``t`` the plan asks for.
+
+The CDF is only defined on the grid that is passed in, so a probability the
+grid does not bracket is an error rather than a silent clamp: at ``t = 0``
+the transformed time is ``1`` and the mixture CDF is already positive, which
+is exactly why small probabilities may be unreachable on a positive grid.
+
 Scope
 -----
 In scope: posterior survival, CDF, density and hazard functionals, by exact
 mixture evaluation over a pruned DP realisation (``method="exact"``) or by
-the paper's ``L``-atom Monte Carlo estimator (``method="mc"``).
+the paper's ``L``-atom Monte Carlo estimator (``method="mc"``), and quantile
+functionals by inverting the exact mixture CDF per draw.
 
-Out of scope (added by later steps or deliberately absent): quantile
-functionals, prior functionals, two-population comparisons, plotting, and any
-re-sampling of ``theta``.  Nothing here draws from the posterior of the
-sampler; it consumes :class:`DPChains` produced by :mod:`src.dp_gibbs`.
+Out of scope (added by later steps or deliberately absent): prior
+functionals, two-population comparisons, plotting, and any re-sampling of
+``theta``.  Nothing here draws from the posterior of the sampler; it consumes
+:class:`DPChains` produced by :mod:`src.dp_gibbs`.
 """
 
 from __future__ import annotations
@@ -73,6 +94,8 @@ __all__ = [
     "functionals_from_mc_realizations",
     "functionals_from_realizations",
     "posterior_functionals",
+    "posterior_quantiles",
+    "quantiles_from_realizations",
 ]
 
 
@@ -239,8 +262,9 @@ def _as_t_grid(t_grid: object) -> np.ndarray:
     A positive, finite grid is required because this module returns the
     density and the hazard as well as the survival function: at ``t = 0`` a
     Weibull density is infinite for ``alpha < 1`` and the hazard is then not a
-    usable number.  Quantile inversion (a later step) uses the CDF only and is
-    free to start its own grid at zero.
+    usable number.  Quantile inversion uses the CDF only, so
+    :func:`_as_quantile_grid` allows the zero endpoint and only insists on a
+    strictly increasing grid.
     """
     grid = np.asarray(t_grid, dtype=np.float64)
     if grid.ndim != 1:
@@ -255,6 +279,54 @@ def _as_t_grid(t_grid: object) -> np.ndarray:
             "the density and hazard are not finite at t=0 for every atom"
         )
     return np.array(grid, dtype=np.float64, copy=True)
+
+
+def _as_quantile_grid(t_grid: object) -> np.ndarray:
+    """Validate a strictly increasing, non-negative original-scale grid.
+
+    Quantile inversion differs from functional evaluation in two ways.  The
+    zero endpoint is allowed, because the CDF (unlike the density and the
+    hazard) is finite and equal to ``1 - exp(-1 / lambda**alpha)`` there on
+    the transformed scale.  And the grid must be *strictly increasing*, since
+    the inversion locates ``p`` in the grid CDF with a search and interpolates
+    between neighbouring points; an unsorted or duplicated grid would make
+    that search meaningless.
+    """
+    grid = np.asarray(t_grid, dtype=np.float64)
+    if grid.ndim != 1:
+        raise ValueError(f"t_grid must be a 1-D array, got shape {grid.shape}")
+    if grid.size < 2:
+        raise ValueError("t_grid must hold at least two points to invert a CDF")
+    if not np.all(np.isfinite(grid)):
+        raise ValueError("t_grid must contain only finite values (no NaN or inf)")
+    if np.any(grid < 0.0):
+        raise ValueError(
+            "t_grid must be non-negative on the original time scale; the "
+            "quantile grid starts at the origin"
+        )
+    if np.any(np.diff(grid) <= 0.0):
+        raise ValueError(
+            "t_grid must be strictly increasing for CDF inversion, got a "
+            "duplicate or descending pair"
+        )
+    return np.array(grid, dtype=np.float64, copy=True)
+
+
+def _as_probability(p: object) -> float:
+    """Validate a single probability in the open interval ``(0, 1)``.
+
+    ``p = 0`` and ``p = 1`` are rejected rather than clamped: the ``0 %`` and
+    ``100 %`` points of a Weibull mixture are ``-inf``/``+inf`` on the
+    transformed scale, so the inverse map would produce nonsense (or
+    ``t = -t_max``) instead of a quantile.  Booleans are rejected explicitly
+    because ``True`` is an ``int`` in Python and would silently mean ``p = 1``.
+    """
+    if isinstance(p, bool) or not isinstance(p, (int, float, np.integer, np.floating)):
+        raise ValueError(f"p must be a single probability number, got {p!r}")
+    value = float(p)
+    if not np.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(f"p must lie strictly between 0 and 1, got {p!r}")
+    return value
 
 
 def _as_chain_sequence(chains: object) -> list[DPChains]:
@@ -577,6 +649,51 @@ def functionals_from_mc_realizations(
     )
 
 
+def _common_truncation(sequence: Sequence[DPChains]) -> tuple[int, float]:
+    """The one ``J`` and ``epsilon`` that drive every ``G_b`` of a run.
+
+    ``truncation_number_for_posterior`` is increasing in the precision, so
+    the largest ``nu`` gives the conservative level; taking the smallest
+    ``epsilon`` is conservative in the same way if a caller passes chains
+    whose settings disagree.  Computing this once (never per draw) is the
+    plan's common-``J`` rule, test 24.
+    """
+    max_nu = max(float(np.max(chain.nu)) for chain in sequence)
+    epsilon = min(float(chain.settings.epsilon) for chain in sequence)
+    j_common = truncation_number_for_posterior(max_nu, sequence[0].n, epsilon)
+    return int(j_common), float(epsilon)
+
+
+def _posterior_realizations(
+    sequence: Sequence[DPChains],
+    *,
+    j_common: int,
+    epsilon: float,
+    atom_tol: float,
+    rng: np.random.Generator,
+) -> Iterable[DPRealization]:
+    """Draw and prune one ``G_b`` per stored posterior draw, chain by chain.
+
+    Every draw uses the same truncation level ``j_common`` and the same
+    random stream, so two calls with the same seed produce the same sequence
+    of realisations -- which is what lets the quantile path be checked against
+    the CDF of :func:`posterior_functionals` on identical ``G_b`` draws.
+    """
+    for chain in sequence:
+        for b in range(chain.n_draws):
+            draw = sample_dp_posterior(
+                float(chain.nu[b]),
+                float(chain.gamma[b]),
+                float(chain.phi[b]),
+                chain.theta[b],
+                d=chain.prior.d,
+                epsilon=epsilon,
+                n_terms=j_common,
+                rng=rng,
+            )
+            yield draw.pruned(atom_tol)
+
+
 def posterior_functionals(
     chains: DPChains | Sequence[DPChains],
     t_grid: object,
@@ -637,15 +754,8 @@ def posterior_functionals(
 
     sequence = _as_chain_sequence(chains)
     data = sequence[0].data
-    n = sequence[0].n
 
-    # One J for the whole run.  ``truncation_number_for_posterior`` is
-    # increasing in the precision, so the largest nu gives the conservative
-    # level; taking the smallest epsilon is conservative in the same way if a
-    # caller passes chains whose settings disagree.
-    max_nu = max(float(np.max(chain.nu)) for chain in sequence)
-    epsilon = min(float(chain.settings.epsilon) for chain in sequence)
-    j_common = truncation_number_for_posterior(max_nu, n, epsilon)
+    j_common, epsilon = _common_truncation(sequence)
 
     resolved_seed = _resolve_seed(seed)
     if settings.method == "mc":
@@ -659,20 +769,13 @@ def posterior_functionals(
         rng = np.random.default_rng(resolved_seed)
         atom_rng = None
 
-    def realizations() -> Iterable[DPRealization]:
-        for chain in sequence:
-            for b in range(chain.n_draws):
-                draw = sample_dp_posterior(
-                    float(chain.nu[b]),
-                    float(chain.gamma[b]),
-                    float(chain.phi[b]),
-                    chain.theta[b],
-                    d=chain.prior.d,
-                    epsilon=epsilon,
-                    n_terms=j_common,
-                    rng=rng,
-                )
-                yield draw.pruned(settings.atom_tol)
+    realizations = _posterior_realizations(
+        sequence,
+        j_common=j_common,
+        epsilon=epsilon,
+        atom_tol=settings.atom_tol,
+        rng=rng,
+    )
 
     meta: dict[str, Any] = {
         "method": settings.method,
@@ -686,6 +789,260 @@ def posterior_functionals(
     if settings.method == "mc":
         meta["L"] = int(settings.L)
         return functionals_from_mc_realizations(
-            realizations(), t_grid, data, L=settings.L, rng=atom_rng, meta=meta
+            realizations, t_grid, data, L=settings.L, rng=atom_rng, meta=meta
         )
-    return functionals_from_realizations(realizations(), t_grid, data, meta=meta)
+    return functionals_from_realizations(realizations, t_grid, data, meta=meta)
+
+
+def _cdf_at(realization: DPRealization, t_tilde: float) -> float:
+    """Mixture CDF of one realisation at a scalar transformed time."""
+    return float(np.asarray(realization.cdf(np.array([t_tilde])))[0])
+
+
+def _pdf_at(realization: DPRealization, t_tilde: float) -> float:
+    """Mixture density of one realisation at a scalar transformed time."""
+    return float(np.asarray(realization.pdf(np.array([t_tilde])))[0])
+
+
+def _invert_cdf(
+    realization: DPRealization,
+    t_tilde_grid: np.ndarray,
+    t_grid: np.ndarray,
+    p: float,
+) -> float:
+    """Invert the mixture CDF of one realisation at probability ``p``.
+
+    The grid CDF gives a piecewise-linear first guess, which on a 300-point
+    grid is only accurate to order ``h**2`` in ``t``.  That guess is then
+    polished on the *exact* mixture CDF with a Newton step safeguarded by the
+    bracket the grid provides: where the density is positive and the step
+    stays inside the bracket Newton is used, otherwise the step bisects.  The
+    safeguard is what makes the routine terminate on flat regions of the CDF
+    (underflowed tail, flat first grid interval) and the Newton refinement is
+    what makes a single-atom draw exact to machine precision rather than
+    ``O(h**2)``.
+
+    Returns the quantile on the ``t_tilde`` scale; mapping to the original
+    scale happens once, in :func:`inverse_map`, so the affine inverse map is
+    never applied twice.
+
+    Raises
+    ------
+    ValueError
+        If ``p`` lies outside the range of the grid CDF.  Clamping would
+        silently report the grid edge as a quantile; the failure names the
+        attained CDF range so a caller knows how far to extend the grid.
+    """
+    cdf = np.asarray(realization.cdf(t_tilde_grid), dtype=np.float64)
+    if not np.all(np.isfinite(cdf)):
+        raise ValueError("the realisation CDF is not finite on t_grid")
+    if p < cdf[0] or p > cdf[-1]:
+        raise ValueError(
+            f"p={p!r} is not bracketed by the CDF on t_grid: F ranges over "
+            f"[{cdf[0]!r}, {cdf[-1]!r}] on the supplied grid.  Extend t_grid "
+            "(a Weibull mixture is already positive at t=0 on the original "
+            "scale) so that it spans the requested probability."
+        )
+
+    # Bracket from the grid CDF: ``index`` is the first grid point whose CDF
+    # reaches p, so the root lies in [t[index-1], t[index]].
+    index = int(np.searchsorted(cdf, p, side="left"))
+    index = min(max(index, 0), t_grid.size - 1)
+    lo = float(t_tilde_grid[max(index - 1, 0)])
+    hi = float(t_tilde_grid[index])
+    if lo >= hi:
+        return lo
+
+    t = float(np.interp(p, cdf, t_tilde_grid))
+    t = min(max(t, lo), hi)
+    for _ in range(200):
+        value = _cdf_at(realization, t) - p
+        if value == 0.0:
+            return t
+        if value < 0.0:
+            lo = t
+        else:
+            hi = t
+        density = _pdf_at(realization, t)
+        candidate = np.nan
+        if np.isfinite(density) and density > 0.0:
+            candidate = t - value / density
+        if not (lo < candidate < hi):
+            candidate = 0.5 * (lo + hi)
+        if abs(candidate - t) <= 1e-15 * max(1.0, abs(t)):
+            return float(candidate)
+        if hi - lo <= 1e-15 * max(1.0, hi):
+            return float(candidate)
+        t = float(candidate)
+    return t
+
+
+def quantiles_from_realizations(
+    realizations: Iterable[DPRealization],
+    t_grid: object,
+    p: object,
+    data: SurvData,
+) -> np.ndarray:
+    """Invert the mixture CDF of already-drawn DP realisations (test 27).
+
+    This is the lower-level engine behind :func:`posterior_quantiles`, shared
+    with tests that need a synthetic, known ``G_b``.  For each realisation it
+    evaluates ``F_tilde(. | G_b)`` on the transformed grid
+    ``t_tilde = 1 + t_grid / t_max``, solves ``F_tilde(eta) = p`` for the
+    quantile ``eta`` on that scale (see :func:`_invert_cdf`) and maps every
+    row back with :func:`src.dp_gibbs.inverse_map`,
+    ``eta_p = t_max * (eta_p_tilde - 1)``.
+
+    The quantile is not a linear functional of ``S``/``F``: inverting the
+    cross-sectional mean of the CDF would give the quantile of a different
+    distribution, so one inversion is performed per realisation and the
+    mapping is applied once, to the quantiles only.
+
+    Parameters
+    ----------
+    realizations : iterable of DPRealization
+        One ``G_b`` per quantile, as in :func:`functionals_from_realizations`.
+        Weights must sum to one, otherwise the "CDF" is not a CDF.  A
+        generator is consumed once.
+    t_grid : array-like
+        Original-scale times, 1-D, finite, non-negative and strictly
+        increasing.  It must bracket the requested probability: ``F`` is
+        already positive at ``t = 0`` because the transformed time there is
+        ``1``, so small probabilities may be unreachable.
+    p : float
+        Target probability, strictly inside ``(0, 1)``.
+    data : SurvData
+        The dataset whose ``t_max`` defines the inverse map.
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n_draws]`` quantiles on the original time scale, one per
+        realisation.
+
+    Raises
+    ------
+    ValueError
+        If the grid or ``p`` is malformed, a realisation is not a proper
+        distribution, or ``p`` is outside the CDF range of a realisation.
+    """
+    if not isinstance(data, SurvData):
+        raise ValueError("data must be a SurvData instance")
+    grid = _as_quantile_grid(t_grid)
+    probability = _as_probability(p)
+    t_tilde = transform_time(data, grid)
+
+    quantiles_tilde: list[float] = []
+    for realization in realizations:
+        if not isinstance(realization, DPRealization):
+            raise ValueError(
+                "realizations must contain only DPRealization instances, "
+                f"got {type(realization).__name__}"
+            )
+        total = float(np.sum(realization.weights))
+        if not np.isclose(total, 1.0, rtol=0.0, atol=1e-10):
+            raise ValueError(
+                "realisation weights must sum to one, got "
+                f"{total!r}; call DPRealization.pruned or use a proper draw"
+            )
+        quantiles_tilde.append(_invert_cdf(realization, t_tilde, grid, probability))
+
+    if not quantiles_tilde:
+        raise ValueError("realizations must contain at least one realisation")
+
+    mapped = inverse_map(data, grid, quantiles=np.asarray(quantiles_tilde))
+    return np.asarray(mapped["quantiles"], dtype=np.float64)
+
+
+def posterior_quantiles(
+    chains: DPChains | Sequence[DPChains],
+    t_grid: object,
+    p: object,
+    *,
+    settings: FunctionalSettings | None = None,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Posterior quantile functional ``eta_p`` by CDF inversion (test 27).
+
+    For each stored draw ``b`` this
+
+    1. draws ``G_b ~ [G | theta_b, nu_b, gamma_b, phi_b]`` with the common
+       truncation level ``J_common`` and prunes it with
+       ``settings.atom_tol`` -- exactly the ``G_b`` that
+       :func:`posterior_functionals` evaluates, so the same seed gives the
+       same realisations;
+    2. evaluates the mixture CDF ``F_b`` of ``G_b`` on ``t_grid``;
+    3. inverts ``F_b(eta_p^{(b)}) = p`` per draw and maps the result back to
+       the original time scale, ``eta_p = t_max * (eta_tilde_p - 1)``.
+
+    Inversion is per draw on purpose.  The paper (Section 3) warns that the
+    quantile functional is not a function of linear functionals: inverting an
+    averaged survival curve would summarise a different distribution and
+    would not commute with the mean.  Percentile bands are therefore taken
+    over the ``B`` inverted quantiles, not formed from the CDF band.
+
+    The inversion is always done on the exact truncated mixture CDF, so
+    ``settings.method`` must be ``"exact"``; the ``L``-atom Monte Carlo
+    estimator of the paper's step (ii) would give a step-function CDF whose
+    quantiles are the drawn atoms themselves and are not comparable with the
+    Rao-Blackwellised functionals of :func:`posterior_functionals`.
+
+    Parameters
+    ----------
+    chains : DPChains or sequence of DPChains
+        One chain or several posterior draws of the same dataset.  All chains
+        must share ``n`` and ``data.t_max``.
+    t_grid : array-like
+        Original-scale evaluation grid, 1-D, non-negative and strictly
+        increasing.  It must bracket ``p``: ``F`` is positive already at
+        ``t = 0``, so a tiny ``p`` may be unreachable and raises rather than
+        being clamped to the grid edge.  The plan's conventional grid is 300
+        points from 0 to ``1.15 * max(t)``.
+    p : float
+        Target probability, strictly inside ``(0, 1)``.
+    settings : FunctionalSettings, optional
+        Functional-inference knobs; ``atom_tol`` is used for pruning and
+        ``method`` must be ``"exact"``.  Defaults to ``FunctionalSettings()``.
+    seed : int or None, optional
+        Seed for the DP-realisation draws, with the same meaning and replay
+        guarantees as in :func:`posterior_functionals`.  ``None`` draws a
+        fresh seed from OS entropy.
+
+    Returns
+    -------
+    np.ndarray
+        ``float64[n_draws]`` quantiles on the original time scale, stacked
+        chain by chain.
+
+    Raises
+    ------
+    ValueError
+        If the chains are incompatible, the grid or ``p`` is malformed,
+        ``settings.method`` is not ``"exact"``, or ``p`` is not bracketed by
+        the CDF of some draw.
+    """
+    if settings is None:
+        settings = FunctionalSettings()
+    if not isinstance(settings, FunctionalSettings):
+        raise ValueError("settings must be a FunctionalSettings instance")
+    if settings.method != "exact":
+        raise ValueError(
+            "posterior_quantiles inverts the exact mixture CDF per draw; "
+            f"settings.method must be 'exact', got {settings.method!r}"
+        )
+
+    sequence = _as_chain_sequence(chains)
+    data = sequence[0].data
+    grid = _as_quantile_grid(t_grid)
+    probability = _as_probability(p)
+
+    j_common, epsilon = _common_truncation(sequence)
+    rng = np.random.default_rng(_resolve_seed(seed))
+    realizations = _posterior_realizations(
+        sequence,
+        j_common=j_common,
+        epsilon=epsilon,
+        atom_tol=settings.atom_tol,
+        rng=rng,
+    )
+    return quantiles_from_realizations(realizations, grid, probability, data)
