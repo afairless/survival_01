@@ -51,6 +51,8 @@ import numpy as np
 __all__ = [
     "DPPrior",
     "DPSettings",
+    "DPState",
+    "StateInvariantError",
     "SurvData",
     "inverse_map",
     "inverse_time",
@@ -337,3 +339,344 @@ class DPSettings:
     n_chains: int = 4
     seed: int | None = None
     preset: str = "custom"
+
+
+class StateInvariantError(AssertionError):
+    """Raised when a :class:`DPState` violates one of the Section 2.1 invariants.
+
+    The class subclasses ``AssertionError`` so that debug ``assert`` calls and
+    explicit checks raise the same exception type, and so that a caller can
+    catch a state corruption without also swallowing ordinary ``ValueError``
+    input-validation failures.
+    """
+
+
+def _as_float_vector(values: object, name: str) -> np.ndarray:
+    """Normalise a state vector to an owned, finite ``float64`` 1-D array."""
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be a 1-D array")
+    if arr.size == 0:
+        raise ValueError(f"{name} must not be empty")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values (no NaN or inf)")
+    return np.array(arr, dtype=np.float64, copy=True)
+
+
+def _as_index_vector(values: object, name: str) -> np.ndarray:
+    """Normalise a non-negative integer state vector to an owned 1-D array."""
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be a 1-D array")
+    if arr.size == 0:
+        raise ValueError(f"{name} must not be empty")
+    if not np.issubdtype(arr.dtype, np.integer):
+        raise ValueError(f"{name} must contain integers")
+    out = arr.astype(np.intp, copy=True)
+    if np.any(out < 0):
+        raise ValueError(f"{name} must be non-negative")
+    return out
+
+
+def _as_positive_scalar(value: float, name: str) -> float:
+    """Normalise a strictly positive, finite scalar state entry."""
+    out = float(value)
+    if not np.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{name} must be a finite, strictly positive number")
+    return out
+
+
+@dataclass
+class DPState:
+    """Latent state of one collapsed Polya-urn chain (plan Section 2.1).
+
+    Fields
+    ------
+    alpha, lam : np.ndarray
+        ``float64[n]`` per-observation Weibull shape and scale (the paper's
+        ``lambda`` parameterisation).
+    s : np.ndarray
+        ``int[n]`` cluster label of each observation, ``0 <= s_i < n_star``.
+    alpha_star, lam_star : np.ndarray
+        ``float64[n_star]`` cluster location shape and scale.
+    n_j : np.ndarray
+        ``int[n_star]`` cluster sizes, ``sum(n_j) == n`` whenever every
+        observation is assigned.
+    nu, gamma, phi : float
+        DP precision and the two ``G0`` hyperparameters.
+
+    The Section 2.1 invariants are checked at construction and by
+    :meth:`check_invariants`:
+
+    1. ``alpha == alpha_star[s]`` and ``lam == lam_star[s]``;
+    2. ``n_j == bincount(s)``, no empty cluster, labels are ``0..n_star-1``;
+    3. ``0 < alpha <= phi`` and ``0 < alpha_star <= phi``;
+    4. ``lam > 0``, ``lam_star > 0``, ``nu > 0``, ``gamma > 0`` and
+       ``phi >= prior.b_phi`` when a prior is supplied.
+
+    Bookkeeping follows the deferred-compaction variant explicitly allowed by
+    plan Section 3.4: :meth:`remove_observation` decrements a cluster count but
+    leaves the observation labelled (so the caller can form the urn weights
+    against the pre-removal labels), and :meth:`compact` performs the single
+    relabel pass that drops empty clusters and renumbers the rest.  Invariants
+    1 and 4 hold at all times; invariants 2 and 3 hold once every removed
+    observation has been reassigned and :meth:`compact` has run.
+    """
+
+    alpha: np.ndarray
+    lam: np.ndarray
+    s: np.ndarray
+    alpha_star: np.ndarray
+    lam_star: np.ndarray
+    n_j: np.ndarray
+    nu: float
+    gamma: float
+    phi: float
+
+    def __post_init__(self) -> None:
+        alpha = _as_float_vector(self.alpha, "alpha")
+        lam = _as_float_vector(self.lam, "lam")
+        s = _as_index_vector(self.s, "s")
+        alpha_star = _as_float_vector(self.alpha_star, "alpha_star")
+        lam_star = _as_float_vector(self.lam_star, "lam_star")
+        n_j = _as_index_vector(self.n_j, "n_j")
+        nu = _as_positive_scalar(self.nu, "nu")
+        gamma = _as_positive_scalar(self.gamma, "gamma")
+        phi = _as_positive_scalar(self.phi, "phi")
+
+        if alpha.size != s.size:
+            raise ValueError(
+                f"alpha and s must have the same length, got {alpha.size} and {s.size}"
+            )
+        if lam.size != s.size:
+            raise ValueError(
+                f"lam and s must have the same length, got {lam.size} and {s.size}"
+            )
+        if alpha_star.size != lam_star.size:
+            raise ValueError(
+                "alpha_star and lam_star must have the same length, "
+                f"got {alpha_star.size} and {lam_star.size}"
+            )
+        if alpha_star.size != n_j.size:
+            raise ValueError(
+                "alpha_star and n_j must have the same length, "
+                f"got {alpha_star.size} and {n_j.size}"
+            )
+
+        self.alpha = alpha
+        self.lam = lam
+        self.s = s
+        self.alpha_star = alpha_star
+        self.lam_star = lam_star
+        self.n_j = n_j
+        self.nu = nu
+        self.gamma = gamma
+        self.phi = phi
+        self.check_invariants()
+
+    @property
+    def n(self) -> int:
+        """Number of observations in the chain."""
+        return int(self.s.size)
+
+    @property
+    def n_star(self) -> int:
+        """Number of clusters currently carried by the state."""
+        return int(self.alpha_star.size)
+
+    def check_invariants(self, prior: DPPrior | None = None) -> None:
+        """Raise :class:`StateInvariantError` unless Section 2.1 holds.
+
+        Parameters
+        ----------
+        prior : DPPrior, optional
+            When supplied, the ``phi >= b_phi`` part of invariant 4 is also
+            enforced.  Without a prior the state cannot know the Pareto lower
+            bound, so that single bound is skipped.
+
+        Notes
+        -----
+        This is deliberately a full, explicit check: it is cheap enough to run
+        at the end of a sweep in debug mode and its messages name the violated
+        invariant, which makes a bookkeeping bug point at the operation that
+        caused it rather than at a later ``NaN``.
+        """
+        if self.alpha.shape != (self.n,) or self.lam.shape != (self.n,):
+            raise StateInvariantError(
+                "invariant 1 violated: alpha and lam must be 1-D arrays of length n"
+            )
+        if self.s.shape != (self.n,):
+            raise StateInvariantError(
+                "invariant 2 violated: s must be a 1-D array of length n"
+            )
+        if self.alpha_star.shape != (self.n_star,):
+            raise StateInvariantError(
+                "invariant 1 violated: alpha_star must be 1-D of length n_star"
+            )
+        if self.lam_star.shape != (self.n_star,) or self.n_j.shape != (self.n_star,):
+            raise StateInvariantError(
+                "invariant 2 violated: lam_star and n_j must have length n_star"
+            )
+        if self.n_star == 0:
+            raise StateInvariantError("invariant 2 violated: the state has no clusters")
+        if np.any(self.s < 0) or np.any(self.s >= self.n_star):
+            raise StateInvariantError(
+                "invariant 2 violated: cluster labels must lie in 0..n_star-1"
+            )
+        if not np.array_equal(self.alpha, self.alpha_star[self.s]):
+            raise StateInvariantError(
+                "invariant 1 violated: alpha is not alpha_star[s]"
+            )
+        if not np.array_equal(self.lam, self.lam_star[self.s]):
+            raise StateInvariantError("invariant 1 violated: lam is not lam_star[s]")
+        counts = np.bincount(self.s, minlength=self.n_star)
+        if not np.array_equal(self.n_j, counts):
+            raise StateInvariantError("invariant 2 violated: n_j is not bincount(s)")
+        if np.any(self.n_j == 0):
+            raise StateInvariantError(
+                "invariant 2 violated: every cluster must be non-empty"
+            )
+        if int(self.n_j.sum()) != self.n:
+            raise StateInvariantError(
+                "invariant 2 violated: sum(n_j) must equal the number of observations"
+            )
+        if np.any(self.alpha <= 0.0) or np.any(self.alpha_star <= 0.0):
+            raise StateInvariantError(
+                "invariant 3 violated: alpha and alpha_star must be positive"
+            )
+        if np.any(self.alpha > self.phi) or np.any(self.alpha_star > self.phi):
+            raise StateInvariantError(
+                "invariant 3 violated: alpha and alpha_star must not exceed phi"
+            )
+        if np.any(self.lam <= 0.0) or np.any(self.lam_star <= 0.0):
+            raise StateInvariantError(
+                "invariant 4 violated: lam, lam_star, nu and gamma must be positive"
+            )
+        finite_scalars = (
+            np.isfinite(self.nu) and np.isfinite(self.gamma) and np.isfinite(self.phi)
+        )
+        if not finite_scalars:
+            raise StateInvariantError(
+                "invariant 4 violated: nu, gamma and phi must be finite"
+            )
+        if self.nu <= 0.0 or self.gamma <= 0.0 or self.phi <= 0.0:
+            raise StateInvariantError(
+                "invariant 4 violated: nu, gamma and phi must be positive"
+            )
+        if prior is not None and self.phi < prior.b_phi:
+            raise StateInvariantError(
+                "invariant 4 violated: phi must be at least prior.b_phi"
+            )
+
+    def compact(self) -> np.ndarray:
+        """Drop empty clusters and relabel the rest to ``0..m-1``.
+
+        Returns
+        -------
+        np.ndarray
+            ``int[n_star_old]`` map from pre-compaction labels to post-
+            compaction labels.  A dropped (empty) cluster maps to ``-1``.  A
+            caller holding an ``(n, n_star)`` matrix (the cached ``log q``
+            columns of plan Section 3.4) permutes its columns with
+            ``old_to_new[old_to_new >= 0]``.
+
+        Raises
+        ------
+        StateInvariantError
+            If an observation still carries the label of a cluster whose count
+            has already reached zero.  That means compaction ran between
+            :meth:`remove_observation` and the matching reassignment, which
+            would silently drop a live observation.
+        """
+        keep = np.flatnonzero(self.n_j > 0)
+        old_to_new = np.full(self.n_star, -1, dtype=np.intp)
+        old_to_new[keep] = np.arange(keep.size, dtype=np.intp)
+        remapped = old_to_new[self.s]
+        if np.any(remapped < 0):
+            raise StateInvariantError(
+                "cannot compact: an observation still labels an empty cluster; "
+                "reassign every removed observation first"
+            )
+        if int(self.n_j.sum()) != self.n:
+            raise StateInvariantError(
+                "cannot compact: sum(n_j) does not equal the number of observations"
+            )
+        self.s = remapped
+        self.alpha_star = self.alpha_star[keep]
+        self.lam_star = self.lam_star[keep]
+        self.n_j = self.n_j[keep]
+        self.check_invariants()
+        return old_to_new
+
+    def remove_observation(self, i: int) -> int:
+        """Decrement the count of observation ``i``'s cluster.
+
+        The observation keeps its old label and latent values: this is the
+        deferred-compaction variant of plan Section 3.4, so the caller can
+        keep indexing the candidate clusters by pre-removal labels while it
+        forms the urn weights.  Reassign the observation with
+        :meth:`assign_existing` or :meth:`assign_new`, then :meth:`compact`
+        once per sweep.
+
+        Returns
+        -------
+        int
+            The observation's old (pre-removal) cluster label.
+        """
+        if not 0 <= i < self.n:
+            raise IndexError(f"observation index {i} is out of range for n={self.n}")
+        j = int(self.s[i])
+        if self.n_j[j] <= 0:
+            raise StateInvariantError(
+                f"observation {i} is not counted in cluster {j}; already removed?"
+            )
+        self.n_j[j] -= 1
+        return j
+
+    def assign_existing(self, i: int, j: int) -> int:
+        """Assign removed observation ``i`` to existing cluster ``j``.
+
+        Copies the cluster location into the per-observation latent values, so
+        invariant 1 holds immediately.  The observation must have been removed
+        first; the guard on ``sum(n_j)`` catches the common double-count bug.
+        """
+        if not 0 <= i < self.n:
+            raise IndexError(f"observation index {i} is out of range for n={self.n}")
+        if not 0 <= j < self.n_star:
+            raise IndexError(
+                f"cluster index {j} is out of range for n_star={self.n_star}"
+            )
+        if int(self.n_j.sum()) >= self.n:
+            raise StateInvariantError(
+                "assign_existing called before remove_observation"
+            )
+        self.s[i] = j
+        self.alpha[i] = self.alpha_star[j]
+        self.lam[i] = self.lam_star[j]
+        self.n_j[j] += 1
+        return j
+
+    def append_cluster(self, alpha: float, lam: float) -> int:
+        """Append an empty cluster at location ``(alpha, lam)``.
+
+        Returns the new label, ``n_star - 1``.  The caller must assign one or
+        more observations to it before :meth:`compact`, or the new cluster is
+        dropped as empty.
+        """
+        alpha = _as_positive_scalar(alpha, "alpha")
+        lam = _as_positive_scalar(lam, "lam")
+        if alpha > self.phi:
+            raise StateInvariantError("invariant 3 violated: alpha must not exceed phi")
+        self.alpha_star = np.append(self.alpha_star, alpha)
+        self.lam_star = np.append(self.lam_star, lam)
+        self.n_j = np.append(self.n_j, np.intp(0))
+        return self.n_star - 1
+
+    def assign_new(self, i: int, alpha: float, lam: float) -> int:
+        """Assign removed observation ``i`` to a fresh cluster.
+
+        Appends the cluster and assigns the observation in one step, returning
+        the new label.  This is the step-(a) "new cluster" branch.
+        """
+        j = self.append_cluster(alpha, lam)
+        return self.assign_existing(i, j)
