@@ -80,6 +80,10 @@ The CDF is only defined on the grid that is passed in, so a probability the
 grid does not bracket is an error rather than a silent clamp: at ``t = 0``
 the transformed time is ``1`` and the mixture CDF is already positive, which
 is exactly why small probabilities may be unreachable on a positive grid.
+(The two-population comparison of :func:`compare` is the one exception: it
+ranks per-draw medians, and a median below its grid's first point is
+interpolated from the origin rather than rejected — see
+:func:`_grid_quantiles`.)
 
 Two-population comparisons
 --------------------------
@@ -1410,21 +1414,22 @@ def _grid_quantiles(
     :func:`posterior_quantiles` polishes the same root on the exact mixture CDF
     and is the right tool when the quantile value itself is the deliverable.
 
-    A ``p`` the grid does not bracket is an error rather than a clamp: the
-    quantile would lie outside the evaluated times, and silently returning the
-    grid edge would make the A-versus-B ranking an artefact of the grid.
+    The left edge is **not** a truncation.  A survival CDF is exactly zero at
+    ``t = 0``, so a quantile whose level lies below ``cdf[:, 0]`` is bracketed
+    by the origin and the first grid point; it is interpolated on the segment
+    ``(0, 0) -> (t_grid[0], cdf[:, 0])``.  This is what lets a figure use a
+    positive, density-safe grid (the functional path cannot evaluate ``f`` or
+    ``h`` at zero) while still ranking per-draw medians, which can fall below
+    that grid's first point for a few of the 40,000 draws of a reported run.
+    Without it, a single such draw would abort the whole comparison.
+
+    The right edge *is* a truncation: a ``p`` above the last grid value is an
+    error rather than a clamp, because the quantile lies beyond the evaluated
+    times and returning the grid edge would make the ranking an artefact of
+    the grid's length.
     """
     n_draws, n_grid = cdf.shape
-    first = cdf[:, 0]
     last = cdf[:, -1]
-    if np.any(first > p):
-        worst = float(np.max(first))
-        raise ValueError(
-            f"p={p!r} is not bracketed by {name}.F on t_grid: the first grid "
-            f"point already has F up to {worst!r}, so the quantile lies below "
-            "t_grid[0].  Extend t_grid to the left (t=0 is allowed for a "
-            "quantile grid)"
-        )
     if np.any(last < p):
         best = float(np.min(last))
         raise ValueError(
@@ -1433,18 +1438,23 @@ def _grid_quantiles(
         )
 
     # For a non-decreasing row, the number of entries below ``p`` is the first
-    # index at or above it (``searchsorted(..., side="left")``).
+    # index at or above it (``searchsorted(..., side="left")``).  ``index = 0``
+    # means the quantile is below the first grid point; its lower bracket is the
+    # origin ``(0, 0)`` rather than the (nonexistent) previous grid point.
     index = np.clip(np.sum(cdf < p, axis=1), 0, n_grid - 1)
     rows = np.arange(n_draws)
+    at_origin = index == 0
     lower = np.maximum(index - 1, 0)
     upper = index
-    f_lower = cdf[rows, lower]
+    f_lower = np.where(at_origin, 0.0, cdf[rows, lower])
     f_upper = cdf[rows, upper]
+    t_lower = np.where(at_origin, 0.0, t_grid[lower])
+    t_upper = t_grid[upper]
     span = f_upper - f_lower
     fraction = np.divide(
         p - f_lower, span, out=np.zeros(n_draws, dtype=np.float64), where=span > 0.0
     )
-    return t_grid[lower] + fraction * (t_grid[upper] - t_grid[lower])
+    return t_lower + fraction * (t_upper - t_lower)
 
 
 def _hazard_ratio(h_a: np.ndarray, h_b: np.ndarray) -> np.ndarray:
@@ -1546,7 +1556,9 @@ def compare(
         If either argument is not a :class:`Functionals`, the same object is
         passed twice, the draw counts differ, the grids do not match, the two
         fits record different ``t_max``, ``p`` is not in ``(0, 1)``, a CDF is
-        not non-decreasing, or ``p`` is not bracketed by a fit's CDF.
+        not non-decreasing, or ``p`` is above the last grid point of a fit's
+        CDF (a ``p`` below the first grid point is interpolated from the
+        origin, where the CDF is exactly zero).
     """
     fit_a = _as_comparison_fit(fit_a, "fit_a")
     fit_b = _as_comparison_fit(fit_b, "fit_b")

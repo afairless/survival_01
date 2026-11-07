@@ -25,10 +25,14 @@ The tests pin four things that are easy to get wrong silently:
   ``b`` of B, which is valid only for independent fits of equal length; the
   ranking of the two populations, and hence the probability, must not change
   under the strictly increasing time transform of plan Section 2.3.
-* **loud failures.**  Different draw counts, grids or ``t_max`` values, a
-  non-monotone CDF, a probability the grid does not bracket and a malformed
-  ``p`` are errors.  Silently interpolating, clamping, or comparing weeks with
-  months would all produce plausible-looking Figure 5 output.
+* **edge behaviour.**  Different draw counts, grids or ``t_max`` values, a
+  non-monotone CDF, a probability above the last grid point and a malformed
+  ``p`` are errors.  A probability *below* the first grid point is not: a
+  survival CDF is exactly zero at the origin, so the quantile is interpolated
+  on ``(0, 0) -> (t_grid[0], F[0])`` -- otherwise one extreme draw among the
+  40,000 of a reported run would abort the whole comparison.  Silently
+  comparing weeks with months would still produce plausible-looking Figure 5
+  output, which is why the scale checks stay errors.
 """
 
 from typing import Any
@@ -401,14 +405,24 @@ class TestValidation:
         with pytest.raises(ValueError, match="non-decreasing"):
             compare(fit_a, fit_b, grid)
 
-    def test_rejects_probability_below_the_grid(self) -> None:
-        grid = np.array([0.5, 1.0, 1.5, 2.0])
-        F = np.tile(np.linspace(0.6, 0.9, grid.size), (1, 1))
-        h = np.ones_like(F)
-        fit_a = _fit_from_cdf(F, grid, h)
-        fit_b = _fit_from_cdf(F, grid, h)
-        with pytest.raises(ValueError, match="lies below"):
-            compare(fit_a, fit_b, grid)
+    def test_interpolates_a_median_below_the_first_grid_point(self) -> None:
+        """A quantile below the grid is bracketed by the origin, not an error.
+
+        A survival CDF is exactly zero at ``t = 0``, so the segment
+        ``(0, 0) -> (t_grid[0], F[0])`` brackets the median exactly when
+        ``F`` is linear there.  ``_linear_cdf_fit`` makes it linear by
+        construction, so this checks the interpolation against hand-computed
+        medians rather than against the implementation's own convention.
+        """
+        grid = np.array([1.0, 2.0, 3.0, 4.0])
+        fit_a = _linear_cdf_fit(np.array([0.5]), grid, hazard=np.ones(grid.size))
+        fit_b = _linear_cdf_fit(np.array([0.6]), grid, hazard=np.ones(grid.size))
+
+        comparison = compare(fit_a, fit_b, grid)
+
+        np.testing.assert_allclose(comparison["eta_a"], [0.5], rtol=1e-12)
+        np.testing.assert_allclose(comparison["eta_b"], [0.6], rtol=1e-12)
+        assert comparison["prob_eta_a_gt_eta_b"] == 0.0
 
     def test_rejects_probability_above_the_grid(self) -> None:
         grid = np.array([0.5, 1.0, 1.5, 2.0])
