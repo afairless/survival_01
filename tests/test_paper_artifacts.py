@@ -36,6 +36,18 @@ What each test would catch:
 * silent compression drift: the default must be ``savez_compressed`` (R8's
   starting point) while ``compressed=False`` stays a supported escape hatch.
 
+Step 3 adds the functional round-trip of plan §5.1.  ``functionals.npz`` and
+``prior-band.npz`` share one schema -- a band is a ``Functionals`` -- so the
+same writer serves both and the provenance dict is stored *verbatim* rather
+than through a field list (``method``/``J_common``/``L`` for the posterior,
+``sample``/``J_prior``/``max_nu`` for the band).  The tests pin the array
+contract the loader enforces before the container is built (a transposed
+``S``, a shape disagreement between two of the four arrays, a grid whose size
+does not match the column count), that an infinite hazard survives bit-exactly
+(it is the correct limit where ``S`` underflows), and that the one-draw /
+one-grid-point case round-trips -- this is the container that introduces the
+single-grid-point edge case.
+
 Step 2 adds the chain round-trip of plan §5.1.  ``chain-<b>.npz`` is the
 storage contract a reviewer loads without the fitting process, so the tests
 pin the whole schema boundary: every array is bit-exact, the ``meta`` blob is
@@ -61,6 +73,7 @@ import numpy as np
 import pytest
 
 from src import paper_artifacts
+from src.dp_functionals import Functionals
 from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData
 from src.paper_artifacts import (
     SCHEMA_VERSION,
@@ -69,7 +82,9 @@ from src.paper_artifacts import (
     _jsonable,
     atomic_savez,
     load_chain,
+    load_functionals,
     save_chain,
+    save_functionals,
     slug,
 )
 
@@ -526,7 +541,7 @@ def archive_members(path: Path) -> dict[str, np.ndarray]:
         return {key: archive[key] for key in archive.files}
 
 
-def rewrite_chain(
+def rewrite_archive(
     path: Path, *, drop: tuple[str, ...] = (), **changes: np.ndarray
 ) -> None:
     """Replace or drop archive members, keeping the write atomic."""
@@ -537,13 +552,21 @@ def rewrite_chain(
     atomic_savez(path, arrays)
 
 
-def rewrite_chain_meta(path: Path, mutate: object) -> None:
+#: The chain tests read naturally with this name; the helper is archive-generic.
+rewrite_chain = rewrite_archive
+
+
+def rewrite_meta(path: Path, mutate: object) -> None:
     """Apply ``mutate`` to the JSON ``meta`` object and rewrite the archive."""
     arrays = archive_members(path)
     record = json.loads(str(arrays["meta"][()]))
     mutate(record)  # type: ignore[operator]
     arrays["meta"] = np.asarray(json.dumps(record))
     atomic_savez(path, arrays)
+
+
+#: See :data:`rewrite_chain`.
+rewrite_chain_meta = rewrite_meta
 
 
 def saved_chain(tmp_path: Path, **kwargs: object) -> tuple[DPChains, Path]:
@@ -1068,3 +1091,520 @@ def test_chain_round_trip_property_random_provenance(tmp_path: Path) -> None:
         assert loaded.prior == prior
         assert loaded.settings == chain.settings
         assert_chains_equal(loaded, chain)
+
+
+# ---------------------------------------------------------------------------
+# Functional round-trip (plan §5.1)
+# ---------------------------------------------------------------------------
+
+#: The per-chain seeds a fit records; JSON has to turn the tuple into a list.
+CHAIN_SEEDS: tuple[int, ...] = (20240601, 20240602, 20240603, 20240604)
+
+#: The posterior provenance dict of a §5.1/§5.2 fit.
+FUNCTIONALS_META: dict[str, object] = {
+    "method": "exact",
+    "J_common": 8,
+    "atom_tol": 1e-6,
+    "seed": 20240601,
+    "epsilon": 1e-4,
+    "n_chains": 4,
+    "chain_seeds": CHAIN_SEEDS,
+    "n_draws": 4,
+    "t_max": 4.5518,
+}
+
+#: The prior-band provenance dict of a §5.1 fit.
+PRIOR_BAND_META: dict[str, object] = {
+    "sample": "prior",
+    "method": "exact",
+    "J_prior": 12,
+    "max_nu": 27.5,
+    "epsilon": 1e-4,
+    "atom_tol": 1e-6,
+    "seed": 20240613,
+    "n_draws": 100,
+    "t_max": 4.5518,
+}
+
+
+def make_functionals(
+    *,
+    n_draws: int = 4,
+    n_grid: int = 5,
+    seed: int = 20261115,
+    meta: dict[str, object] | None = None,
+    hazard_inf: bool = False,
+) -> Functionals:
+    """A small ``Functionals`` that satisfies every container invariant.
+
+    ``S`` and ``F = 1 - S`` stay in ``[0, 1]``, ``f`` and ``h`` are
+    non-negative and ``S``/``F``/``f`` finite, so the only way to make the
+    container reject these arrays is to change them deliberately.
+    """
+    rng = np.random.default_rng(seed)
+    survival = rng.uniform(0.05, 0.95, size=(n_draws, n_grid))
+    density = rng.uniform(0.0, 2.0, size=(n_draws, n_grid))
+    hazard = rng.uniform(0.0, 3.0, size=(n_draws, n_grid))
+    if hazard_inf:
+        # The documented limit where S underflows to zero while f > 0.
+        hazard[0, -1] = np.inf
+    return Functionals(
+        t_grid=np.linspace(0.5, 3.5, n_grid),
+        S=survival,
+        F=1.0 - survival,
+        f=density,
+        h=hazard,
+        meta=dict(FUNCTIONALS_META if meta is None else meta),
+    )
+
+
+def saved_functionals(
+    tmp_path: Path, *, name: str = "functionals.npz", **kwargs: object
+) -> tuple[Functionals, Path]:
+    """Save :func:`make_functionals` into a per-fit draws directory."""
+    func = make_functionals(**kwargs)  # type: ignore[arg-type]
+    path = tmp_path / "5.1" / "draws" / "A-nu_Gamma_2_0.9" / name
+    save_functionals(path, func)
+    return func, path
+
+
+def assert_functionals_equal(loaded: Functionals, expected: Functionals) -> None:
+    """Every stored array and the reconstructed grid survive bit-exactly."""
+    np.testing.assert_array_equal(loaded.t_grid, expected.t_grid)
+    assert loaded.t_grid.dtype == expected.t_grid.dtype
+    for name in ("S", "F", "f", "h"):
+        actual = getattr(loaded, name)
+        wanted = getattr(expected, name)
+        assert actual.dtype == wanted.dtype, name
+        np.testing.assert_array_equal(actual, wanted, err_msg=name)
+
+
+# --- round-trip -----------------------------------------------------------
+
+
+def test_save_functionals_round_trips_every_array(tmp_path: Path) -> None:
+    """``t_grid`` and the four ``(B, M)`` arrays are bit-exact."""
+    func = make_functionals()
+    path = tmp_path / "functionals.npz"
+    written = save_functionals(path, func)
+    assert written == path
+
+    loaded = load_functionals(path)
+    assert_functionals_equal(loaded, func)
+    assert loaded.n_draws == func.n_draws
+    assert loaded.n_grid == func.n_grid
+
+
+def test_saved_functionals_match_the_plan_schema(tmp_path: Path) -> None:
+    """Plan §5.1: the exact key set, dtypes, shapes and a 0-d ``meta``."""
+    func, path = saved_functionals(tmp_path)
+    expected_shapes = {
+        "t_grid": (func.n_grid,),
+        "S": (func.n_draws, func.n_grid),
+        "F": (func.n_draws, func.n_grid),
+        "f": (func.n_draws, func.n_grid),
+        "h": (func.n_draws, func.n_grid),
+        "meta": (),
+    }
+    with np.load(path, allow_pickle=False) as archive:
+        assert set(archive.files) == set(expected_shapes)
+        for key, shape in expected_shapes.items():
+            assert archive[key].shape == shape, key
+        for key in ("t_grid", "S", "F", "f", "h"):
+            assert archive[key].dtype == np.float64, key
+        assert archive["meta"].dtype.kind == "U"
+
+
+def test_functionals_meta_blob_wraps_the_provenance_dict(tmp_path: Path) -> None:
+    """``{"schema_version", "meta"}``: the version cannot shadow a meta key."""
+    _, path = saved_functionals(tmp_path)
+    record = json.loads(str(archive_members(path)["meta"][()]))
+    assert set(record) == {"schema_version", "meta"}
+    assert record["schema_version"] == SCHEMA_VERSION
+    assert isinstance(record["meta"], dict)
+
+
+def test_functionals_meta_round_trips_verbatim(tmp_path: Path) -> None:
+    """The posterior dict survives without a hand-written field list."""
+    func, path = saved_functionals(tmp_path)
+    loaded = load_functionals(path)
+    assert loaded.meta == _jsonable(FUNCTIONALS_META)
+    # A tuple is the one documented conversion: JSON has no tuple type.
+    assert loaded.meta["chain_seeds"] == list(CHAIN_SEEDS)
+    assert isinstance(loaded.meta["chain_seeds"], list)
+
+
+def test_prior_band_round_trips_with_its_own_meta(tmp_path: Path) -> None:
+    """``prior-band.npz`` is a ``Functionals``: one schema serves both."""
+    func, path = saved_functionals(
+        tmp_path, name="prior-band.npz", meta=PRIOR_BAND_META
+    )
+    loaded = load_functionals(path)
+    assert_functionals_equal(loaded, func)
+    assert loaded.meta == _jsonable(PRIOR_BAND_META)
+    assert set(loaded.meta) == set(PRIOR_BAND_META)
+
+
+def test_functionals_meta_survives_numpy_scalars_and_nesting(tmp_path: Path) -> None:
+    """Provenance holds NumPy scalars and nested dicts in practice."""
+    meta: dict[str, object] = {
+        "seed": np.int64(7),
+        "atom_tol": np.float64(1e-6),
+        "nested": {"seeds": (np.intp(1), np.intp(2)), "flag": np.bool_(True)},
+    }
+    func, path = saved_functionals(tmp_path, meta=meta)
+    loaded = load_functionals(path)
+    assert_functionals_equal(loaded, func)
+    assert loaded.meta == {
+        "seed": 7,
+        "atom_tol": 1e-6,
+        "nested": {"seeds": [1, 2], "flag": True},
+    }
+
+
+def test_functionals_round_trip_preserves_an_infinite_hazard(
+    tmp_path: Path,
+) -> None:
+    """``h = inf`` where ``S`` underflows is the correct limit, not a NaN."""
+    func = make_functionals(hazard_inf=True)
+    path = tmp_path / "functionals.npz"
+    save_functionals(path, func)
+    loaded = load_functionals(path)
+    assert np.isinf(loaded.h[0, -1])
+    assert_functionals_equal(loaded, func)
+    assert np.array_equal(loaded.h, func.h)
+
+
+def test_functionals_round_trip_with_one_draw_and_one_grid_point(
+    tmp_path: Path,
+) -> None:
+    """None/One edge case: ``n_save=1`` and a single grid point."""
+    func = make_functionals(n_draws=1, n_grid=1)
+    path = tmp_path / "functionals.npz"
+    save_functionals(path, func)
+    loaded = load_functionals(path)
+    assert loaded.n_draws == 1
+    assert loaded.n_grid == 1
+    assert_functionals_equal(loaded, func)
+    with np.load(path, allow_pickle=False) as archive:
+        assert archive["t_grid"].shape == (1,)
+        assert archive["S"].shape == (1, 1)
+
+
+def test_save_functionals_does_not_mutate_the_input(tmp_path: Path) -> None:
+    """Saving reads the container; it never converts arrays in place."""
+    func = make_functionals()
+    before = func.S.copy()
+    save_functionals(tmp_path / "functionals.npz", func)
+    np.testing.assert_array_equal(func.S, before)
+    assert func.S.dtype == np.float64
+    assert func.t_grid.dtype == np.float64
+
+
+def test_functionals_loader_needs_no_side_information(tmp_path: Path) -> None:
+    """The archive is self-contained: no ``fit-meta.json`` is required."""
+    func, path = saved_functionals(tmp_path)
+    elsewhere = tmp_path / "standalone" / "functionals.npz"
+    elsewhere.parent.mkdir()
+    elsewhere.write_bytes(path.read_bytes())
+    path.unlink()
+    assert_functionals_equal(load_functionals(elsewhere), func)
+
+
+# --- loader validation -----------------------------------------------------
+
+
+def test_load_functionals_rejects_a_missing_file(tmp_path: Path) -> None:
+    """The error names the path; a silently empty result is impossible."""
+    path = tmp_path / "does-not-exist.npz"
+    with pytest.raises(ArtifactError, match="does not exist") as excinfo:
+        load_functionals(path)
+    assert str(path) in str(excinfo.value)
+
+
+def test_load_functionals_rejects_a_directory(tmp_path: Path) -> None:
+    """A directory is not an archive, and the message says so."""
+    with pytest.raises(ArtifactError, match="is not a file"):
+        load_functionals(tmp_path)
+
+
+def test_load_functionals_rejects_a_non_npz_file(tmp_path: Path) -> None:
+    """A truncated or renamed file is an integrity error naming the path."""
+    path = tmp_path / "functionals.npz"
+    path.write_bytes(b"not an npz archive")
+    with pytest.raises(ArtifactIntegrityError, match="npz") as excinfo:
+        load_functionals(path)
+    assert str(path) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("key", ["t_grid", "S", "F", "f", "h", "meta"])
+def test_load_functionals_rejects_a_missing_array(tmp_path: Path, key: str) -> None:
+    """A missing schema member is caught before any container is built."""
+    _, path = saved_functionals(tmp_path)
+    rewrite_archive(path, drop=(key,))
+    with pytest.raises(ArtifactIntegrityError, match=key):
+        load_functionals(path)
+
+
+def test_load_functionals_rejects_an_unexpected_array(tmp_path: Path) -> None:
+    """An extra member means the schema moved; refuse to guess."""
+    _, path = saved_functionals(tmp_path)
+    rewrite_archive(path, surprise=np.array([1.0]))
+    with pytest.raises(ArtifactIntegrityError, match="surprise"):
+        load_functionals(path)
+
+
+def test_load_functionals_rejects_schema_version_mismatch(tmp_path: Path) -> None:
+    """There is no migration path (plan §5.1): the version must match."""
+    _, path = saved_functionals(tmp_path)
+
+    def bump(record: dict[str, object]) -> None:
+        record["schema_version"] = SCHEMA_VERSION + 1
+
+    rewrite_meta(path, bump)
+    with pytest.raises(ArtifactIntegrityError, match="schema version"):
+        load_functionals(path)
+
+
+@pytest.mark.parametrize("key", ["t_grid", "S", "F", "f", "h"])
+def test_load_functionals_rejects_a_wrong_array_dtype(tmp_path: Path, key: str) -> None:
+    """The plan's dtype table is enforced before NumPy can widen silently."""
+    _, path = saved_functionals(tmp_path)
+    arrays = archive_members(path)
+    arrays[key] = arrays[key].astype(np.float32)
+    atomic_savez(path, arrays)
+    with pytest.raises(ArtifactIntegrityError, match="dtype"):
+        load_functionals(path)
+
+
+@pytest.mark.parametrize("key", ["S", "F", "f", "h"])
+def test_load_functionals_rejects_a_transposed_array(tmp_path: Path, key: str) -> None:
+    """A transposed ``S`` is the failure mode this schema check exists for."""
+    _, path = saved_functionals(tmp_path, n_draws=4, n_grid=5)
+    arrays = archive_members(path)
+    arrays[key] = arrays[key].transpose(1, 0)
+    atomic_savez(path, arrays)
+    with pytest.raises(ArtifactIntegrityError, match="shape|columns") as excinfo:
+        load_functionals(path)
+    assert key in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("key", "broken"),
+    [
+        ("S", lambda value: value.reshape(-1)),
+        ("F", lambda value: value[:, :-1]),
+        ("f", lambda value: value[:, :-1]),
+        ("h", lambda value: value[:, :-1]),
+    ],
+)
+def test_load_functionals_rejects_a_shape_disagreement(
+    tmp_path: Path, key: str, broken: object
+) -> None:
+    """The four arrays must share one ``(n_draws, n_grid)`` shape."""
+    _, path = saved_functionals(tmp_path, n_draws=4, n_grid=5)
+    value = archive_members(path)[key]
+    rewrite_archive(path, **{key: broken(value)})  # type: ignore[operator]
+    with pytest.raises(ArtifactIntegrityError, match="shape|columns"):
+        load_functionals(path)
+
+
+def test_load_functionals_rejects_a_grid_size_mismatch(tmp_path: Path) -> None:
+    """``n_grid`` is declared by ``t_grid``; one extra point must fail."""
+    _, path = saved_functionals(tmp_path, n_draws=4, n_grid=5)
+    grid = archive_members(path)["t_grid"]
+    rewrite_archive(path, t_grid=np.append(grid, 4.0))
+    with pytest.raises(ArtifactIntegrityError, match="t_grid point"):
+        load_functionals(path)
+
+
+def test_load_functionals_rejects_an_empty_draw_count(tmp_path: Path) -> None:
+    """A zero-row functional has no mean or quantile; refuse it."""
+    _, path = saved_functionals(tmp_path, n_draws=4, n_grid=5)
+    arrays = archive_members(path)
+    rewrite_archive(
+        path,
+        S=arrays["S"][:0],
+        F=arrays["F"][:0],
+        f=arrays["f"][:0],
+        h=arrays["h"][:0],
+    )
+    with pytest.raises(ArtifactIntegrityError, match="at least one draw"):
+        load_functionals(path)
+
+
+@pytest.mark.parametrize(
+    "t_grid",
+    [
+        np.array([]),
+        np.array([[0.5, 1.0]]),
+        np.array([0.0, 1.0]),
+        np.array([0.5, np.nan]),
+        np.array([0.5, -1.0]),
+    ],
+)
+def test_load_functionals_rejects_an_invalid_grid(
+    tmp_path: Path, t_grid: np.ndarray
+) -> None:
+    """The grid must be 1-D, finite and strictly positive on write and read."""
+    _, path = saved_functionals(tmp_path)
+    rewrite_archive(path, t_grid=t_grid)
+    with pytest.raises(ArtifactIntegrityError, match="t_grid"):
+        load_functionals(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record.update(meta="not-an-object"),
+        lambda record: record.update(meta=[1, 2]),
+        lambda record: record.update(meta=None),
+        lambda record: record.pop("meta"),
+        lambda record: record.update(unknown=1),
+    ],
+)
+def test_load_functionals_rejects_a_broken_meta_record(
+    tmp_path: Path, mutate: object
+) -> None:
+    """A nested field with the wrong structure must not reach a constructor."""
+    _, path = saved_functionals(tmp_path)
+
+    def apply(record: dict[str, object]) -> None:
+        mutate(record)  # type: ignore[operator]
+
+    rewrite_meta(path, apply)
+    with pytest.raises(ArtifactIntegrityError, match="meta"):
+        load_functionals(path)
+
+
+def test_load_functionals_rejects_a_non_object_meta_blob(tmp_path: Path) -> None:
+    """The blob is a JSON object, not an array or a string."""
+    _, path = saved_functionals(tmp_path)
+    rewrite_archive(path, meta=np.asarray("[1, 2]"))
+    with pytest.raises(ArtifactIntegrityError, match="JSON object"):
+        load_functionals(path)
+
+
+def test_load_functionals_rejects_invalid_meta_json(tmp_path: Path) -> None:
+    """Invalid JSON is an integrity error, not a bare ``JSONDecodeError``."""
+    _, path = saved_functionals(tmp_path)
+    rewrite_archive(path, meta=np.asarray("{not json"))
+    with pytest.raises(ArtifactIntegrityError, match="valid JSON"):
+        load_functionals(path)
+
+
+def test_load_functionals_rejects_a_container_invariant_violation(
+    tmp_path: Path,
+) -> None:
+    """Right shapes can still violate the container; report it, do not crash."""
+    _, path = saved_functionals(tmp_path)
+    arrays = archive_members(path)
+    rewrite_archive(path, S=np.full(arrays["S"].shape, 1.5))
+    with pytest.raises(ArtifactIntegrityError, match="Functionals contract"):
+        load_functionals(path)
+
+
+# --- writer validation -----------------------------------------------------
+
+
+def test_save_functionals_rejects_a_non_functionals(tmp_path: Path) -> None:
+    """A dict with the right keys is not a ``Functionals``; fail at the writer."""
+    with pytest.raises(ArtifactError, match="Functionals"):
+        save_functionals(tmp_path / "functionals.npz", object())  # type: ignore[arg-type]
+
+
+def test_save_functionals_requires_an_npz_path(tmp_path: Path) -> None:
+    """The plan's layout is ``*.npz``; never invent another extension."""
+    with pytest.raises(ArtifactError, match=r"must end in '\.npz'"):
+        save_functionals(tmp_path / "functionals", make_functionals())
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"bad": object()},
+        {"bad": {1, 2}},
+        [("method", "exact")],
+    ],
+)
+def test_save_functionals_rejects_unusable_meta(tmp_path: Path, meta: object) -> None:
+    """A meta the loader could not read back must not be written."""
+    func = make_functionals()
+    func.meta = meta  # type: ignore[assignment]
+    with pytest.raises(ArtifactError, match="meta"):
+        save_functionals(tmp_path / "functionals.npz", func)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_functionals_rejects_arrays_outside_the_schema(
+    tmp_path: Path,
+) -> None:
+    """The writer applies the loader's dtype/shape rules, so they cannot drift."""
+    func = make_functionals()
+    func.S = func.S.astype(np.float32)
+    with pytest.raises(ArtifactError, match="artifact schema"):
+        save_functionals(tmp_path / "functionals.npz", func)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "grid",
+    [
+        np.array([[0.5, 1.0]]),
+        np.array([]),
+        np.array([0.0, 1.0]),
+        np.array([0.5, np.nan]),
+        np.array([0.5, -1.0]),
+    ],
+)
+def test_save_functionals_rejects_an_invalid_grid(
+    tmp_path: Path, grid: np.ndarray
+) -> None:
+    """The grid is validated before any bytes are written."""
+    func = make_functionals()
+    func.t_grid = grid
+    with pytest.raises(ArtifactError, match="t_grid"):
+        save_functionals(tmp_path / "functionals.npz", func)
+    assert list(tmp_path.iterdir()) == []
+
+
+# --- property-based --------------------------------------------------------
+
+
+def test_functionals_round_trip_property_random_arrays(tmp_path: Path) -> None:
+    """Random draw counts, grid sizes and hazards round-trip bit-exactly."""
+    rng = np.random.default_rng(20261116)
+    for case in range(20):
+        n_draws = int(rng.integers(1, 7))
+        n_grid = int(rng.integers(1, 8))
+        func = make_functionals(
+            n_draws=n_draws,
+            n_grid=n_grid,
+            seed=int(rng.integers(0, 10**9)),
+            hazard_inf=bool(rng.integers(0, 2)),
+            meta={"case": case, "seeds": (case, case + 1)},
+        )
+        # A random grid whose size matches the arrays, strictly positive.
+        func.t_grid = np.sort(rng.uniform(0.01, 9.0, size=n_grid))
+        path = tmp_path / f"case-{case}" / "functionals.npz"
+        save_functionals(path, func)
+        loaded = load_functionals(path)
+        assert_functionals_equal(loaded, func)
+        assert loaded.meta == _jsonable(func.meta)
+
+
+def test_functionals_meta_property_round_trips_random_dicts(
+    tmp_path: Path,
+) -> None:
+    """Random nested provenance dicts survive the verbatim JSON round-trip."""
+    rng = np.random.default_rng(20261117)
+    for case in range(20):
+        value, expected = _random_jsonable(rng)
+        meta = {"provenance": value}
+        func = make_functionals(meta=meta)
+        path = tmp_path / f"case-{case}.npz"
+        save_functionals(path, func)
+        loaded = load_functionals(path)
+        assert loaded.meta == {"provenance": expected}
+        assert loaded.meta == _jsonable(meta)
+        assert_functionals_equal(loaded, func)

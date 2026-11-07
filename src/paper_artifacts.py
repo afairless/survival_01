@@ -25,7 +25,11 @@ functional, fit and run writers are built on, plus the chain round-trip:
 * :func:`atomic_savez` -- an ``npz`` write that is either complete or absent;
 * :func:`save_chain` / :func:`load_chain` -- one self-contained ``DPChains``
   (plan §5.1): every stored array, the dataset, the prior and the settings,
-  so a reviewer can load a chain without the fitting process.
+  so a reviewer can load a chain without the fitting process;
+* :func:`save_functionals` / :func:`load_functionals` -- one ``Functionals``
+  (plan §5.1): ``t_grid`` and the four ``(B, M)`` arrays plus the provenance
+  dict verbatim, so a prior band and a posterior functional of the same shape
+  are stored by one rule.
 
 Why the write helper exists
 ---------------------------
@@ -39,11 +43,12 @@ readable-but-truncated archive and never leaves a stray ``*.npz.npz`` behind.
 
 Scope
 -----
-This module imports NumPy, the standard library and the ``dp_gibbs`` container
-types it reconstructs on load.  It must never import ``matplotlib`` or any
-plotting code (plan §6.1), and it never runs the sampler or the functional
-code -- it only owns the containers.  The functional, fit, run-writer and
-manifest units of plan §6.1 are layered on top of the primitives here.
+This module imports NumPy, the standard library and the container types it
+reconstructs on load (``DPChains`` and friends from ``dp_gibbs``, and
+``Functionals`` from ``dp_functionals``).  It must never import ``matplotlib``
+or any plotting code (plan §6.1), and it never runs the sampler or evaluates a
+functional -- it only owns the containers.  The fit, run-writer and manifest
+units of plan §6.1 are layered on top of the primitives here.
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ from typing import IO, Any
 
 import numpy as np
 
+from src.dp_functionals import Functionals
 from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData
 
 __all__ = [
@@ -66,7 +72,9 @@ __all__ = [
     "ArtifactIntegrityError",
     "atomic_savez",
     "load_chain",
+    "load_functionals",
     "save_chain",
+    "save_functionals",
     "slug",
 ]
 
@@ -746,3 +754,246 @@ def load_chain(path: str | os.PathLike[str]) -> DPChains:
                 f"{target}: stored chain violates the DPChains contract: {exc}"
             ) from exc
     return chain
+
+
+# ---------------------------------------------------------------------------
+# Functional serialisation (plan §5.1)
+# ---------------------------------------------------------------------------
+
+#: Keys of one ``functionals.npz`` (plan §5.1).  The same five array keys are
+#: used by ``prior-band.npz``: a band is a ``Functionals`` and needs no second
+#: schema.
+_FUNCTIONALS_KEYS = frozenset({"t_grid", "S", "F", "f", "h", "meta"})
+
+#: Top-level keys of the ``meta`` blob.  The container's own ``meta`` dict is
+#: stored *inside* ``meta`` rather than merged with these, so a provenance key
+#: named ``schema_version`` cannot shadow the version stamp.
+_FUNCTIONALS_META_KEYS = frozenset({"schema_version", "meta"})
+
+#: The four per-draw ``(n_draws, n_grid)`` ``float64`` arrays.
+_FUNCTIONAL_ARRAY_FIELDS = ("S", "F", "f", "h")
+
+
+def _require_jsonable_meta(meta: object, target: Path) -> dict[str, Any]:
+    """Convert a container's ``meta`` dict to the JSON object that is stored.
+
+    The dict is stored verbatim (plan §5.1): its keys are not enumerated,
+    because a posterior functional carries ``method``/``J_common``/``L`` and a
+    prior band carries ``sample``/``J_prior``/``max_nu``.  :func:`_jsonable`
+    is the only conversion applied, so NumPy scalars become Python scalars and
+    a tuple becomes a JSON list; a value with no JSON form is rejected instead
+    of being stringified.
+
+    Raises
+    ------
+    ArtifactIntegrityError
+        If ``meta`` is not a mapping or holds a value with no JSON form.
+    """
+    if not isinstance(meta, Mapping):
+        raise ArtifactIntegrityError(
+            f"{target}: functionals meta must be a JSON object, "
+            f"got {type(meta).__name__}"
+        )
+    try:
+        converted = _jsonable(dict(meta))
+    except ArtifactError as exc:
+        raise ArtifactIntegrityError(
+            f"{target}: functionals meta is not JSON-serialisable: {exc}"
+        ) from exc
+    if not isinstance(converted, dict):
+        raise ArtifactIntegrityError(
+            f"{target}: functionals meta must be a JSON object, "
+            f"got {type(converted).__name__}"
+        )
+    return converted
+
+
+def _check_functional_arrays(
+    arrays: Mapping[str, np.ndarray], grid: np.ndarray, target: Path
+) -> tuple[int, int]:
+    """Validate the dtype/shape contract the loader and writer share.
+
+    Every one of ``S``, ``F``, ``f`` and ``h`` must be a ``float64`` matrix of
+    the same ``(n_draws, n_grid)`` shape, with ``n_grid == t_grid.size``.  The
+    check is made against the archive headers *before* the container is built,
+    so a transposed ``S`` fails here rather than inside ``Functionals``, and it
+    is run by the writer too, so the two directions cannot drift apart.
+
+    Returns
+    -------
+    tuple of int
+        ``(n_draws, n_grid)``.
+
+    Raises
+    ------
+    ArtifactIntegrityError
+        If a member's dtype or shape disagrees with the schema.
+    """
+    for name in _FUNCTIONAL_ARRAY_FIELDS:
+        array = arrays[name]
+        if array.dtype != np.dtype(np.float64):
+            raise ArtifactIntegrityError(
+                f"{target}: array {name!r} has dtype {array.dtype}, expected float64"
+            )
+        if array.ndim != 2:
+            raise ArtifactIntegrityError(
+                f"{target}: array {name!r} has shape {array.shape}, "
+                f"expected a 2-D (n_draws, n_grid) array"
+            )
+    n_draws = int(arrays["S"].shape[0])
+    if n_draws < 1:
+        raise ArtifactIntegrityError(
+            f"{target}: functional arrays must hold at least one draw, "
+            f"got shape {arrays['S'].shape}"
+        )
+    expected = (n_draws, int(grid.size))
+    for name in _FUNCTIONAL_ARRAY_FIELDS:
+        if arrays[name].shape != expected:
+            raise ArtifactIntegrityError(
+                f"{target}: array {name!r} has shape {arrays[name].shape}, "
+                f"expected {expected} (one column per t_grid point)"
+            )
+    return n_draws, int(grid.size)
+
+
+def _read_functionals_meta(
+    archive: np.lib.npyio.NpzFile, target: Path
+) -> dict[str, Any]:
+    """Parse the ``meta`` blob and return the stored provenance dict."""
+    text = _require_string_scalar(archive, "meta", target)
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ArtifactIntegrityError(
+            f"{target}: meta blob is not valid JSON: {exc}"
+        ) from exc
+    record = _require_record(record, _FUNCTIONALS_META_KEYS, "meta", target)
+
+    version = _as_meta_int(
+        record["schema_version"], "schema_version", target, minimum=1
+    )
+    if version != SCHEMA_VERSION:
+        raise ArtifactIntegrityError(
+            f"{target}: schema version {version} is not the supported "
+            f"version {SCHEMA_VERSION} (no migration path)"
+        )
+    return _require_jsonable_meta(record["meta"], target)
+
+
+def save_functionals(path: str | os.PathLike[str], func: Functionals) -> Path:
+    """Write one :class:`Functionals` as a ``functionals.npz`` archive.
+
+    The archive holds the evaluation grid, the four ``(n_draws, n_grid)``
+    arrays and the provenance dict, which is stored **verbatim** through
+    :func:`_jsonable` inside a ``{"schema_version", "meta"}`` record.  The same
+    writer stores a §5.1 prior band (``prior-band.npz``): a band is a
+    ``Functionals`` like any other, so it needs no second schema and its
+    ``sample``/``J_prior``/``max_nu`` keys survive without a hand-written
+    field list.
+
+    The write is atomic (see :func:`atomic_savez`) and the input is not
+    mutated: the arrays are written from the object that owns them, without an
+    up-front copy.
+
+    Parameters
+    ----------
+    path:
+        Destination ending in ``.npz``.
+    func:
+        The functional arrays to store.
+
+    Returns
+    -------
+    pathlib.Path
+        The path actually written.
+
+    Raises
+    ------
+    ArtifactError
+        If ``func`` is not a :class:`Functionals`, its grid or arrays are
+        outside the declared schema, its ``meta`` has no JSON form, or
+        ``path`` does not end in ``.npz``.
+    """
+    if not isinstance(func, Functionals):
+        raise ArtifactError(
+            f"save_functionals expects a Functionals, got {type(func).__name__}"
+        )
+    target = Path(path)
+    grid = _validated_t_grid(func.t_grid)
+    arrays = {
+        "t_grid": grid,
+        "S": func.S,
+        "F": func.F,
+        "f": func.f,
+        "h": func.h,
+    }
+    try:
+        _check_functional_arrays(arrays, grid, target)
+        inner_meta = _require_jsonable_meta(func.meta, target)
+    except ArtifactIntegrityError as exc:
+        raise ArtifactError(
+            f"functionals are outside the artifact schema: {exc}"
+        ) from exc
+
+    meta = {"schema_version": SCHEMA_VERSION, "meta": inner_meta}
+    return atomic_savez(
+        target, {**arrays, "meta": np.asarray(json.dumps(meta, sort_keys=True))}
+    )
+
+
+def load_functionals(path: str | os.PathLike[str]) -> Functionals:
+    """Load a functional archive written by :func:`save_functionals`.
+
+    Every member is checked against the plan §5.1 schema -- exact key set,
+    dtype, rank and shape -- **before** the container is built, so a corrupt
+    header fails with an :class:`ArtifactIntegrityError` instead of reaching
+    ``Functionals.__post_init__``.  ``S``, ``F``, ``f`` and ``h`` must share
+    one ``(n_draws, n_grid)`` shape and ``n_grid`` must equal ``t_grid.size``;
+    that is what rejects the transposed-``S`` failure mode the plan calls out.
+
+    The provenance dict is returned exactly as stored, so a posterior
+    functional keeps ``method``/``J_common``/``chain_seeds`` and a prior band
+    keeps ``sample``/``J_prior``/``max_nu``.  Values that were tuples in the
+    original dict are JSON lists, which is the documented consequence of
+    storing the dict verbatim.
+
+    Raises
+    ------
+    ArtifactError
+        If ``path`` is missing, is not a file, or is not a readable ``npz``.
+    ArtifactIntegrityError
+        If the archive disagrees with the declared schema (keys, dtypes,
+        shapes, metadata fields, schema version) or the stored arrays violate
+        the ``Functionals`` contract.
+    """
+    target = Path(path)
+    with _open_npz(target) as archive:
+        _require_exact_keys(archive, _FUNCTIONALS_KEYS, target, kind="functionals")
+        meta = _read_functionals_meta(archive, target)
+
+        grid = _require_array(archive, "t_grid", target, dtype=np.float64, ndim=1)
+        if grid.size == 0:
+            raise ArtifactIntegrityError(f"{target}: array 't_grid' must not be empty")
+        if not np.all(np.isfinite(grid)) or np.any(grid <= 0.0):
+            raise ArtifactIntegrityError(
+                f"{target}: array 't_grid' must contain only finite, "
+                "strictly positive times"
+            )
+        arrays = {
+            name: _member(archive, name, target) for name in _FUNCTIONAL_ARRAY_FIELDS
+        }
+        _check_functional_arrays(arrays, grid, target)
+
+        try:
+            return Functionals(
+                t_grid=np.array(grid, dtype=np.float64, copy=True),
+                S=arrays["S"],
+                F=arrays["F"],
+                f=arrays["f"],
+                h=arrays["h"],
+                meta=meta,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                f"{target}: stored functionals violate the Functionals contract: {exc}"
+            ) from exc

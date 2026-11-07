@@ -398,10 +398,12 @@ committed record is the code, the report and the checksums, never the binaries
 (R5).
 
 This module owns serialisation and nothing else: it imports NumPy, the
-standard library and the `dp_gibbs` container types it reconstructs on load,
-never `matplotlib` or the functional module, and it never runs the sampler.
-The primitives and the chain unit are introduced first; the functional, fit,
-event-log and manifest units of plan §6.1 layer on top of them.
+standard library and the container types it reconstructs on load (`DPChains`
+and friends from `dp_gibbs`, `Functionals` from `dp_functionals`), never
+`matplotlib` or any plotting code, and it never runs the sampler or evaluates
+a functional. The primitives, chain and functional units are introduced
+first; the fit, event-log and manifest units of plan §6.1 layer on top of
+them.
 
 | name | role |
 | --- | --- |
@@ -413,6 +415,8 @@ event-log and manifest units of plan §6.1 layer on top of them.
 | `atomic_savez(path, arrays, *, compressed=True)` | write one `npz` archive atomically |
 | `save_chain(path, chain, *, t_grid, label=None, chain_index=None)` | write one `DPChains` as `chain-<b>.npz` with the self-contained `meta` blob |
 | `load_chain(path)` | validate the archive against the schema, then reconstruct `SurvData`/`DPPrior`/`DPSettings`/`DPChains` explicitly (no pickle) |
+| `save_functionals(path, func)` | write one `Functionals` as `functionals.npz` (or `prior-band.npz`): grid, four arrays, verbatim `meta` |
+| `load_functionals(path)` | validate the archive against the schema, then build `Functionals` explicitly with the stored `meta` |
 
 ### 6.1 Why the write helper is not `np.savez(tmp_name)`
 
@@ -459,6 +463,35 @@ header, so a corrupt file cannot make the loader allocate a huge array, and
 `allow_pickle=False` is explicit. A container invariant violation (for
 example `phi < prior.b_phi`) is reported as an artifact error naming the
 path, never as a bare `ValueError` from the middle of construction.
+
+### 6.3 The functional file (`functionals.npz`, `prior-band.npz`)
+
+A prior band is a `Functionals` returned by `prior_functionals`, so it uses
+the same schema as the posterior functional instead of a second one: one
+writer and one loader cover both files. The archive holds `t_grid (M,)` and
+`S`, `F`, `f`, `h` as `float64 (B, M)`, plus a 0-d unicode `meta` blob of the
+form `{"schema_version": N, "meta": {...}}`. The provenance dict sits under
+its own key rather than being merged with the version stamp, so a meta key
+named `schema_version` cannot shadow the version; its keys are otherwise
+**not** enumerated. That is what lets the posterior dict
+(`method`, `J_common`, `L`, `epsilon`, `chain_seeds`, `t_max`) and the band
+dict (`sample`, `J_prior`, `max_nu`, `epsilon`, `seed`) round-trip verbatim
+through `_jsonable`.
+
+Loading stores the dict exactly as written, so the one conversion to expect is
+that a tuple (`chain_seeds`) comes back as a JSON list. `load_functionals`
+checks the member names exactly, then the dtypes and the shared `(B, M)`
+shape of the four arrays against `t_grid.size`, and only then constructs the
+container. Because the check is made on the archive headers, a transposed `S`
+-- or an `F`/`f`/`h` whose shape drifted from `S` -- fails with an
+`ArtifactIntegrityError` naming the array, not with a `ValueError` from inside
+`Functionals`. The writer runs the same checks, so a `Functionals` whose
+arrays were mutated out of the schema cannot produce a file the loader would
+reject.
+
+`h` may hold `inf` (the correct limit where `S` underflows to zero while
+`f > 0`), and an infinite value survives `savez_compressed` and
+`np.array_equal` bit-exactly; only `S`, `F` and `f` are required finite.
 
 ---
 
