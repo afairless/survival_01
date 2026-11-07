@@ -6,6 +6,10 @@
 # binaries (plan decision 8).
 docs/research/figures/
 
+# Replication artifacts (plan R5): draws, figures, logs and the manifest
+# stay local; the committed record is the code, the report and its hashes.
+output/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml

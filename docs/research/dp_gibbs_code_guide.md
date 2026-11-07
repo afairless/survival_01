@@ -19,12 +19,13 @@ It has two companions:
 
 ---
 
-## 1. Scope: what the two modules do and do not do
+## 1. Scope: what the modules do and do not do
 
 | file | responsibility | does *not* do |
 | --- | --- | --- |
 | `src/dp_gibbs.py` | ingestion validation and the time transform, state and bookkeeping, the $\alpha$ quadrature grid, the three full conditionals, one sweep, chain storage, initialisation, the collapsed log-posterior, diagnostics | plotting, data generation, functionals |
 | `src/dp_functionals.py` | the paper's §3 steps (i)–(iii) for posterior *and* prior, survival/CDF/density/hazard/quantile functionals on the original scale, two-population comparisons | drawing $\theta$ |
+| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion and atomic `npz` writes; later units add the chain, functional, fit, event-log and manifest round-trips | fitting, plotting, recomputing summaries |
 
 Two rules hold everywhere and are enforced by tests, not by convention:
 
@@ -386,7 +387,56 @@ the presets, the prior band, the smoothing and the `plt` import.
 
 ---
 
-## 6. Gotcha checklist
+## 6. Artifact I/O (`src/paper_artifacts.py`)
+
+The artifact-backed replication run
+(`docs/research/dp_gibbs_replication_artifacts_plan.md` §5–§6.1) writes every
+stored draw, functional array, summary and figure under a git-ignored
+`output/` tree, so that a reviewer can inspect the chains and recompute every
+acceptance value without fitting anything. `output/` is in `.gitignore`; the
+committed record is the code, the report and the checksums, never the binaries
+(R5).
+
+This module owns serialisation and nothing else: it imports NumPy and the
+standard library, never `matplotlib`, the sampler or the functional module.
+The primitives are introduced first; the chain, functional, fit, event-log and
+manifest units of plan §6.1 layer on top of them.
+
+| name | role |
+| --- | --- |
+| `SCHEMA_VERSION` | version stamped into every `meta` blob, section `meta.json` and run `MANIFEST.json`; loaders reject a mismatch (there is no migration path) |
+| `ArtifactError` | base error for reading, writing and metadata failures |
+| `ArtifactIntegrityError` | subclass raised when a file disagrees with its schema, size or checksum |
+| `slug(label)` | the directory-name rule: every run outside `[A-Za-z0-9._-]` becomes `_`, then boundary `_` are trimmed, so `"nu ~ Gamma(2, 0.9)"` → `nu_Gamma_2_0.9` and an arm is `A-` + that |
+| `_jsonable(value)` | NumPy scalars/arrays, tuples, lists, mappings and `None` → values `json.dumps` accepts; mapping keys are stringified, unsupported types raise `ArtifactError` |
+| `atomic_savez(path, arrays, *, compressed=True)` | write one `npz` archive atomically |
+
+### 6.1 Why the write helper is not `np.savez(tmp_name)`
+
+NumPy appends `.npz` to names that lack it, so handing `chain-0.npz.tmp` to
+`np.savez` produces `chain-0.npz.tmp.npz` and `os.replace` would rename the
+wrong name. `atomic_savez` instead:
+
+1. creates the parent directory and opens `path.with_suffix(path.suffix +
+   ".tmp")` as a binary **handle** (so NumPy never touches the name);
+2. writes through `np.savez_compressed` (or `np.savez` when
+   `compressed=False`), then `flush()` + `os.fsync()` and closes;
+3. calls `os.replace(tmp, path)` only after the bytes are durable.
+
+A failure at any point unlinks the temporary file, so a crash cannot leave a
+readable-but-truncated archive or a stray `*.npz.npz`, and a failed overwrite
+leaves the previous archive untouched. The helper never appends an extension:
+a path not ending in `.npz` is an `ArtifactError`. Arrays are written one at a
+time from the objects that already own them, so a 96 MB trace is not copied up
+front.
+
+The `compressed=True` default is R8's starting point; the `savez` versus
+`savez_compressed` size/CPU measurement on one representative fit decides
+whether it stays, and the numbers are recorded as R8's outcome in the plan.
+
+---
+
+## 7. Gotcha checklist
 
 - **Two `lambda`s.** $\lambda$ is the paper's scale in
   $e^{-t^\alpha/\lambda}$, not the standard Weibull scale
@@ -421,7 +471,7 @@ the presets, the prior band, the smoothing and the `plt` import.
 
 ---
 
-## 7. How correctness is established
+## 8. How correctness is established
 
 The test suite of plan §7 is the argument. In the order it is worth reading:
 
@@ -447,13 +497,15 @@ and calibration of the sampler's own posterior. If one of them fails, do not
 
 ---
 
-## 8. See also
+## 9. See also
 
 - `docs/research/dp_gibbs_plan.md` — the design and test plan, including the
   §6.3 acceptance table and its amendments A1–A4.
 - `docs/research/dp_weibull_code_guide.md` — $G_0$, truncation and
   `DPRealization`.
 - `docs/research/dp_gibbs_results.md` — the reproduction numbers.
+- `docs/research/dp_gibbs_replication_artifacts_plan.md` — the artifact
+  layout, the serialisation schema and the runbook referenced by §6.
 - `docs/research/dirichlet_process_concepts.md` — partitions, the EPPF and
   what $\nu$ does.
 - `docs/dp_weibull_explanation.md` — the model in the paper's notation.
