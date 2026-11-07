@@ -1423,14 +1423,19 @@ def _grid_quantiles(
     that grid's first point for a few of the 40,000 draws of a reported run.
     Without it, a single such draw would abort the whole comparison.
 
-    The right edge *is* a truncation: a ``p`` above the last grid value is an
-    error rather than a clamp, because the quantile lies beyond the evaluated
-    times and returning the grid edge would make the ranking an artefact of
-    the grid's length.
+    The right edge *is* a truncation, and a row whose CDF has not reached
+    ``p`` by the last grid point has a quantile beyond the evaluated times.
+    Such a row is censored to ``+inf`` rather than clamped to the edge: for
+    the A-versus-B ranking that is the correct limit (it is larger than every
+    finite median and ties with another censored row), while clamping would
+    manufacture ties with finite medians.  Censoring is counted in ``meta`` so
+    a run can report how many draws it affected.  If *every* row of a fit is
+    censored, the grid is useless and the call fails loudly.
     """
     n_draws, n_grid = cdf.shape
     last = cdf[:, -1]
-    if np.any(last < p):
+    above = last < p
+    if np.all(above):
         best = float(np.min(last))
         raise ValueError(
             f"p={p!r} is not bracketed by {name}.F on t_grid: the last grid "
@@ -1454,7 +1459,8 @@ def _grid_quantiles(
     fraction = np.divide(
         p - f_lower, span, out=np.zeros(n_draws, dtype=np.float64), where=span > 0.0
     )
-    return t_lower + fraction * (t_upper - t_lower)
+    eta = t_lower + fraction * (t_upper - t_lower)
+    return np.where(above, np.inf, eta)
 
 
 def _hazard_ratio(h_a: np.ndarray, h_b: np.ndarray) -> np.ndarray:
@@ -1548,7 +1554,11 @@ def compare(
         ``eta_a``, ``eta_b``, ``eta_difference`` (``(B,)``),
         ``prob_eta_a_gt_eta_b`` (float), ``p`` and ``meta`` (``p``, the number
         of draws and grid points, both fits' method/seed provenance when
-        present, and the shared ``t_max`` when known).
+        present, the shared ``t_max`` when known, and
+        ``n_eta_above_grid`` with the number of per-draw quantiles censored to
+        ``+inf`` because the grid's last point had not reached ``p``).  A
+        censored ``eta`` is ``+inf``; the difference of two censored draws is
+        ``nan``, and both count as "not greater" in the probability.
 
     Raises
     ------
@@ -1583,7 +1593,10 @@ def compare(
 
     eta_a = _grid_quantiles(fit_a.F, grid, probability_level, "fit_a")
     eta_b = _grid_quantiles(fit_b.F, grid, probability_level, "fit_b")
-    eta_difference = eta_a - eta_b
+    with np.errstate(invalid="ignore"):
+        # Two draws censored at ``+inf`` give ``inf - inf = nan``; both count as
+        # "not greater" below, exactly like any other tie.
+        eta_difference = eta_a - eta_b
     prob_eta_a_gt_eta_b = float(np.mean(eta_a > eta_b))
 
     meta: dict[str, Any] = {
@@ -1593,6 +1606,10 @@ def compare(
         "ratio": "h_B(t) / h_A(t)",
         "difference": "F_B(t) - F_A(t)",
         "pairing": "draw b of A paired with draw b of B (independent fits)",
+        "n_eta_above_grid": {
+            "fit_a": int(np.count_nonzero(np.isinf(eta_a))),
+            "fit_b": int(np.count_nonzero(np.isinf(eta_b))),
+        },
     }
     for suffix, fit in (("a", fit_a), ("b", fit_b)):
         for key in ("method", "seed"):

@@ -674,8 +674,12 @@ def figure_5(fit_a: Fit, fit_b: Fit, *, path: Path, p: float = 0.5) -> Path:
     axes[1].set_title("difference in CDF")
 
     probability = float(comparison["prob_eta_a_gt_eta_b"])
+    # A per-draw median beyond the evaluation grid is censored to +inf by
+    # ``compare``; the histogram needs the finite values only (the censored
+    # pairs are counted in ``prob_eta_a_gt_eta_b`` and in ``meta``).
+    eta_difference = np.asarray(comparison["eta_difference"], dtype=np.float64)
     axes[2].hist(
-        comparison["eta_difference"],
+        eta_difference[np.isfinite(eta_difference)],
         bins=30,
         density=True,
         histtype="step",

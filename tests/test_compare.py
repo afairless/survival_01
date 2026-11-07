@@ -424,7 +424,7 @@ class TestValidation:
         np.testing.assert_allclose(comparison["eta_b"], [0.6], rtol=1e-12)
         assert comparison["prob_eta_a_gt_eta_b"] == 0.0
 
-    def test_rejects_probability_above_the_grid(self) -> None:
+    def test_rejects_probability_above_the_grid_for_every_draw(self) -> None:
         grid = np.array([0.5, 1.0, 1.5, 2.0])
         F = np.tile(np.linspace(0.1, 0.4, grid.size), (1, 1))
         h = np.ones_like(F)
@@ -432,3 +432,40 @@ class TestValidation:
         fit_b = _fit_from_cdf(F, grid, h)
         with pytest.raises(ValueError, match="Extend t_grid to the right"):
             compare(fit_a, fit_b, grid)
+
+    def test_censors_a_single_median_above_the_grid_to_infinity(self) -> None:
+        """A draw whose median is beyond the grid ranks as ``+inf``.
+
+        Clamping it to the grid edge would manufacture ties with finite
+        medians; ``+inf`` is the correct limit for the ranking.  Two censored
+        draws tie and therefore count as "not greater", which is the same
+        convention as any other tie.
+        """
+        grid = np.array([0.5, 1.0, 1.5, 2.0])
+        F_a = np.array(
+            [
+                [0.1, 0.2, 0.3, 0.9],
+                [0.05, 0.1, 0.2, 0.4],
+                [0.05, 0.1, 0.2, 0.4],
+            ]
+        )
+        F_b = np.array(
+            [
+                [0.2, 0.4, 0.6, 0.95],
+                [0.6, 0.65, 0.7, 0.75],
+                [0.05, 0.1, 0.2, 0.45],
+            ]
+        )
+        h = np.ones_like(F_a)
+        comparison = compare(
+            _fit_from_cdf(F_a, grid, h), _fit_from_cdf(F_b, grid, h), grid
+        )
+
+        eta_a = np.asarray(comparison["eta_a"])
+        eta_b = np.asarray(comparison["eta_b"])
+        assert np.isfinite(eta_a[0]) and np.isfinite(eta_b[0])
+        assert eta_a[0] > eta_b[0]
+        assert np.isinf(eta_a[1]) and np.isfinite(eta_b[1])
+        assert np.isinf(eta_a[2]) and np.isinf(eta_b[2])
+        assert comparison["meta"]["n_eta_above_grid"] == {"fit_a": 2, "fit_b": 1}
+        assert comparison["prob_eta_a_gt_eta_b"] == pytest.approx(2.0 / 3.0)
