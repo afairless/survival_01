@@ -1,4 +1,4 @@
-"""Plan §6.1: the artifact primitives (``src/paper_artifacts.py``).
+"""Plan §6.1: the artifact primitives and the chain round-trip.
 
 Step 1 of the replication-artifact plan introduces the pieces every later
 writer and loader share, so this module pins them in isolation:
@@ -36,6 +36,15 @@ What each test would catch:
 * silent compression drift: the default must be ``savez_compressed`` (R8's
   starting point) while ``compressed=False`` stays a supported escape hatch.
 
+Step 2 adds the chain round-trip of plan §5.1.  ``chain-<b>.npz`` is the
+storage contract a reviewer loads without the fitting process, so the tests
+pin the whole schema boundary: every array is bit-exact, the ``meta`` blob is
+self-contained (schema version, provenance, prior, settings), and the loader
+rejects a wrong key set, dtype, shape, draw count, schema version or metadata
+field *before* ``DPChains`` is built.  The one-draw/one-grid-point and
+all-censored cases are covered here because this is the container that
+introduces them.
+
 The property-based tests use seeded NumPy generators; the repository has no
 Hypothesis dependency.  The inputs are random, the invariants are
 deterministic.
@@ -45,18 +54,22 @@ import json
 import os
 import re
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from src import paper_artifacts
+from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData
 from src.paper_artifacts import (
     SCHEMA_VERSION,
     ArtifactError,
     ArtifactIntegrityError,
     _jsonable,
     atomic_savez,
+    load_chain,
+    save_chain,
     slug,
 )
 
@@ -416,3 +429,642 @@ def test_atomic_savez_property_random_archives_round_trip(tmp_path: Path) -> Non
         with np.load(path, allow_pickle=False) as loaded:
             assert loaded["value"].dtype == array.dtype
             assert np.array_equal(loaded["value"], array)
+
+
+# ---------------------------------------------------------------------------
+# Chain round-trip (plan §5.1)
+# ---------------------------------------------------------------------------
+
+CHAIN_PRIOR = DPPrior(
+    a_nu=2.0,
+    b_nu=0.9,
+    a_gamma=1.0,
+    b_gamma=0.232235,
+    a_phi=2.0,
+    b_phi=1.0,
+    d=2,
+)
+
+
+def make_chain(
+    *,
+    n_draws: int = 4,
+    n: int = 6,
+    seed: int = 20240601,
+    event: np.ndarray | None = None,
+    prior: DPPrior = CHAIN_PRIOR,
+    burn_in: int = 5,
+    thin: int = 1,
+    n_alpha: int = 16,
+    epsilon: float = 1e-4,
+    n_chains: int = 4,
+    settings_seed: int | None = 20240601,
+    preset: str = "quick",
+) -> DPChains:
+    """A small chain that satisfies every ``DPChains`` invariant.
+
+    ``alpha`` stays below one and ``phi`` above the prior's ``b_phi``, so the
+    Section 2.1 bounds hold for the default and for every random prior the
+    property test builds (``b_phi <= 1``).
+    """
+    rng = np.random.default_rng(seed)
+    time = np.linspace(1.05, 1.9, n)
+    if event is None:
+        event = np.ones(n, dtype=bool)
+    data = SurvData(time=time, event=np.asarray(event, dtype=bool), t_max=3.75)
+    alpha = rng.uniform(0.4, 0.9, size=(n_draws, n))
+    phi = rng.uniform(1.2, 2.0, size=n_draws)
+    lam = rng.uniform(0.5, 3.0, size=(n_draws, n))
+    theta = np.stack([alpha, lam], axis=2)
+    settings = DPSettings(
+        burn_in=burn_in,
+        n_save=n_draws,
+        thin=thin,
+        n_alpha=n_alpha,
+        epsilon=epsilon,
+        n_chains=n_chains,
+        seed=settings_seed,
+        preset=preset,
+    )
+    return DPChains(
+        data=data,
+        prior=prior,
+        settings=settings,
+        theta=theta,
+        nu=rng.uniform(0.5, 3.0, size=n_draws),
+        gamma=rng.uniform(0.2, 1.5, size=n_draws),
+        phi=phi,
+        n_star=rng.integers(1, n + 1, size=n_draws).astype(np.intp),
+        log_post=-rng.uniform(1.0, 10.0, size=n_draws),
+    )
+
+
+def chain_grid(size: int = 5) -> np.ndarray:
+    """An original-scale grid of ``size`` strictly positive points."""
+    return np.linspace(0.25, 4.0, size)
+
+
+def assert_chains_equal(loaded: DPChains, expected: DPChains) -> None:
+    """Every stored value, dtype and provenance scalar survives bit-exactly."""
+    assert loaded.prior == expected.prior
+    assert loaded.settings == expected.settings
+    assert loaded.data.t_max == expected.data.t_max
+    for name in ("time", "event"):
+        np.testing.assert_array_equal(
+            getattr(loaded.data, name), getattr(expected.data, name)
+        )
+    for name in ("theta", "nu", "gamma", "phi", "n_star", "log_post"):
+        actual = getattr(loaded, name)
+        wanted = getattr(expected, name)
+        assert actual.dtype == wanted.dtype, name
+        np.testing.assert_array_equal(actual, wanted, err_msg=name)
+
+
+def archive_members(path: Path) -> dict[str, np.ndarray]:
+    """Read every member of an ``npz`` archive into memory."""
+    with np.load(path, allow_pickle=False) as archive:
+        return {key: archive[key] for key in archive.files}
+
+
+def rewrite_chain(
+    path: Path, *, drop: tuple[str, ...] = (), **changes: np.ndarray
+) -> None:
+    """Replace or drop archive members, keeping the write atomic."""
+    arrays = archive_members(path)
+    for key in drop:
+        arrays.pop(key)
+    arrays.update(changes)
+    atomic_savez(path, arrays)
+
+
+def rewrite_chain_meta(path: Path, mutate: object) -> None:
+    """Apply ``mutate`` to the JSON ``meta`` object and rewrite the archive."""
+    arrays = archive_members(path)
+    record = json.loads(str(arrays["meta"][()]))
+    mutate(record)  # type: ignore[operator]
+    arrays["meta"] = np.asarray(json.dumps(record))
+    atomic_savez(path, arrays)
+
+
+def saved_chain(tmp_path: Path, **kwargs: object) -> tuple[DPChains, Path]:
+    """Save :func:`make_chain` and return the chain and its path."""
+    chain = make_chain(**kwargs)  # type: ignore[arg-type]
+    path = tmp_path / "draws" / "A-nu_Gamma_2_0.9" / "chain-0.npz"
+    save_chain(
+        path,
+        chain,
+        t_grid=chain_grid(),
+        label="nu ~ Gamma(2, 0.9)",
+        chain_index=0,
+    )
+    return chain, path
+
+
+# --- round-trip ------------------------------------------------------------
+
+
+def test_save_chain_round_trips_every_stored_array(tmp_path: Path) -> None:
+    """All seven draw arrays plus the dataset and ``t_grid`` are bit-exact."""
+    chain = make_chain()
+    grid = chain_grid()
+    path = tmp_path / "chain-0.npz"
+    written = save_chain(
+        path,
+        chain,
+        t_grid=grid,
+        label="nu ~ Gamma(2, 0.9)",
+        chain_index=3,
+    )
+    assert written == path
+
+    loaded = load_chain(path)
+    assert_chains_equal(loaded, chain)
+    with np.load(path, allow_pickle=False) as archive:
+        np.testing.assert_array_equal(archive["t_grid"], grid)
+        assert archive["n_star"].dtype == np.int64
+        assert archive["event"].dtype == np.bool_
+        assert archive["t_max"].shape == ()
+
+
+def test_saved_chain_matches_the_plan_schema(tmp_path: Path) -> None:
+    """Plan §5.1: the exact key set, dtypes and shapes of ``chain-<b>.npz``."""
+    chain, path = saved_chain(tmp_path)
+    expected_shapes = {
+        "theta": (chain.n_draws, chain.n, 2),
+        "nu": (chain.n_draws,),
+        "gamma": (chain.n_draws,),
+        "phi": (chain.n_draws,),
+        "n_star": (chain.n_draws,),
+        "log_post": (chain.n_draws,),
+        "time": (chain.n,),
+        "event": (chain.n,),
+        "t_max": (),
+        "t_grid": (5,),
+        "meta": (),
+    }
+    with np.load(path, allow_pickle=False) as archive:
+        assert set(archive.files) == set(expected_shapes)
+        for key, shape in expected_shapes.items():
+            assert archive[key].shape == shape, key
+        assert archive["theta"].dtype == np.float64
+        assert archive["nu"].dtype == np.float64
+        assert archive["gamma"].dtype == np.float64
+        assert archive["phi"].dtype == np.float64
+        assert np.issubdtype(archive["n_star"].dtype, np.integer)
+        assert archive["log_post"].dtype == np.float64
+        assert archive["time"].dtype == np.float64
+        assert archive["event"].dtype == np.bool_
+        assert archive["t_max"].dtype == np.float64
+        assert archive["t_grid"].dtype == np.float64
+        assert archive["meta"].dtype.kind == "U"
+
+
+def test_chain_meta_round_trips_prior_settings_and_provenance(
+    tmp_path: Path,
+) -> None:
+    """The per-chain blob is self-contained and reconstructs exactly."""
+    chain, path = saved_chain(tmp_path)
+    record = json.loads(str(archive_members(path)["meta"][()]))
+    assert set(record) == {
+        "schema_version",
+        "label",
+        "chain_index",
+        "prior",
+        "settings",
+    }
+    assert record["schema_version"] == SCHEMA_VERSION
+    assert record["label"] == "nu ~ Gamma(2, 0.9)"
+    assert record["chain_index"] == 0
+    assert record["prior"] == {
+        "a_nu": 2.0,
+        "b_nu": 0.9,
+        "a_gamma": 1.0,
+        "b_gamma": 0.232235,
+        "a_phi": 2.0,
+        "b_phi": 1.0,
+        "d": 2,
+    }
+    assert record["settings"] == {
+        "burn_in": 5,
+        "n_save": chain.n_draws,
+        "thin": 1,
+        "n_alpha": 16,
+        "epsilon": 1e-4,
+        "n_chains": 4,
+        "seed": 20240601,
+        "preset": "quick",
+    }
+    loaded = load_chain(path)
+    assert loaded.prior == chain.prior
+    assert loaded.settings == chain.settings
+
+
+def test_load_chain_needs_no_side_information(tmp_path: Path) -> None:
+    """A chain copied out of its fit directory still round-trips."""
+    chain, path = saved_chain(tmp_path)
+    elsewhere = tmp_path / "standalone" / "chain-2.npz"
+    elsewhere.parent.mkdir()
+    elsewhere.write_bytes(path.read_bytes())
+    assert path.exists()
+    path.unlink()
+    assert_chains_equal(load_chain(elsewhere), chain)
+
+
+def test_save_chain_records_null_provenance_when_omitted(tmp_path: Path) -> None:
+    """A bare chain has no fit context; ``null`` is the honest record."""
+    chain = make_chain()
+    path = tmp_path / "chain-1.npz"
+    save_chain(path, chain, t_grid=chain_grid())
+    record = json.loads(str(archive_members(path)["meta"][()]))
+    assert record["label"] is None
+    assert record["chain_index"] is None
+    assert_chains_equal(load_chain(path), chain)
+
+
+def test_chain_round_trip_with_one_draw_and_one_grid_point(
+    tmp_path: Path,
+) -> None:
+    """None/One edge case: ``n_save=1``, one observation, one grid point."""
+    chain = make_chain(n_draws=1, n=1, event=np.array([False]))
+    path = tmp_path / "chain-0.npz"
+    save_chain(path, chain, t_grid=np.array([0.5]))
+    loaded = load_chain(path)
+    assert loaded.n_draws == 1
+    assert loaded.n == 1
+    assert_chains_equal(loaded, chain)
+    with np.load(path, allow_pickle=False) as archive:
+        assert archive["t_grid"].shape == (1,)
+        assert archive["theta"].shape == (1, 1, 2)
+
+
+def test_chain_round_trip_all_censored_dataset(tmp_path: Path) -> None:
+    """A dataset with no events is valid and must stay valid on disk."""
+    chain = make_chain(n=7, event=np.zeros(7, dtype=bool))
+    path = tmp_path / "chain-0.npz"
+    save_chain(path, chain, t_grid=chain_grid(3))
+    loaded = load_chain(path)
+    assert not loaded.data.event.any()
+    assert_chains_equal(loaded, chain)
+
+
+def test_save_chain_does_not_mutate_the_chain(tmp_path: Path) -> None:
+    """Saving is a read of the container, never a conversion in place."""
+    chain = make_chain()
+    before = chain.theta.copy()
+    save_chain(tmp_path / "chain-0.npz", chain, t_grid=chain_grid())
+    np.testing.assert_array_equal(chain.theta, before)
+    assert chain.theta.dtype == np.float64
+    assert chain.n_star.dtype == np.intp
+
+
+# --- loader validation -----------------------------------------------------
+
+
+def test_load_chain_rejects_a_missing_file(tmp_path: Path) -> None:
+    """The error names the path; a silent empty chain must be impossible."""
+    path = tmp_path / "does-not-exist.npz"
+    with pytest.raises(ArtifactError, match="does not exist") as excinfo:
+        load_chain(path)
+    assert str(path) in str(excinfo.value)
+
+
+def test_load_chain_rejects_a_directory(tmp_path: Path) -> None:
+    """A directory is not an archive, and the message says so."""
+    with pytest.raises(ArtifactError, match="is not a file"):
+        load_chain(tmp_path)
+
+
+def test_load_chain_rejects_a_non_npz_file(tmp_path: Path) -> None:
+    """A truncated or renamed file is an integrity error naming the path."""
+    path = tmp_path / "chain-0.npz"
+    path.write_bytes(b"not an npz archive")
+    with pytest.raises(ArtifactIntegrityError, match="npz") as excinfo:
+        load_chain(path)
+    assert str(path) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("key", ["theta", "nu", "n_star", "time", "meta"])
+def test_load_chain_rejects_a_missing_array(tmp_path: Path, key: str) -> None:
+    """A missing schema member is caught before any container is built."""
+    _, path = saved_chain(tmp_path)
+    rewrite_chain(path, drop=(key,))
+    with pytest.raises(ArtifactIntegrityError, match=key):
+        load_chain(path)
+
+
+def test_load_chain_rejects_an_unexpected_array(tmp_path: Path) -> None:
+    """An extra member means the schema moved; refuse to guess."""
+    _, path = saved_chain(tmp_path)
+    rewrite_chain(path, surprise=np.array([1.0]))
+    with pytest.raises(ArtifactIntegrityError, match="surprise"):
+        load_chain(path)
+
+
+def test_load_chain_rejects_schema_version_mismatch(tmp_path: Path) -> None:
+    """There is no migration path (plan §5.1): the version must match."""
+    _, path = saved_chain(tmp_path)
+
+    def bump(record: dict[str, object]) -> None:
+        record["schema_version"] = SCHEMA_VERSION + 1
+
+    rewrite_chain_meta(path, bump)
+    with pytest.raises(ArtifactIntegrityError, match="schema version"):
+        load_chain(path)
+
+
+@pytest.mark.parametrize(
+    ("key", "convert"),
+    [
+        ("theta", lambda value: value.astype(np.float32)),
+        ("nu", lambda value: value.astype(np.int64)),
+        ("gamma", lambda value: value.astype(np.float32)),
+        ("phi", lambda value: value.astype(np.float32)),
+        ("n_star", lambda value: value.astype(np.float64)),
+        ("log_post", lambda value: value.astype(np.float32)),
+        ("time", lambda value: value.astype(np.float32)),
+        ("event", lambda value: value.astype(np.int64)),
+        ("t_max", lambda value: value.astype(np.float32)),
+        ("t_grid", lambda value: value.astype(np.float32)),
+    ],
+)
+def test_load_chain_rejects_a_wrong_array_dtype(
+    tmp_path: Path, key: str, convert: object
+) -> None:
+    """The plan's dtype table is enforced before NumPy can widen silently."""
+    _, path = saved_chain(tmp_path)
+    value = archive_members(path)[key]
+    rewrite_chain(path, **{key: convert(value)})  # type: ignore[operator]
+    with pytest.raises(ArtifactIntegrityError, match="dtype"):
+        load_chain(path)
+
+
+@pytest.mark.parametrize(
+    ("key", "broken"),
+    [
+        ("theta", lambda value: value.transpose(1, 0, 2)),
+        ("theta", lambda value: value[:, :, :1]),
+        ("nu", lambda value: value[:-1]),
+        ("n_star", lambda value: value.reshape(-1, 1)),
+        ("event", lambda value: value[:-1]),
+        ("time", lambda value: value.reshape(-1, 1)),
+        ("t_max", lambda value: value.reshape(1)),
+        ("t_grid", lambda value: value.reshape(1, -1)),
+    ],
+)
+def test_load_chain_rejects_a_wrong_array_shape(
+    tmp_path: Path, key: str, broken: object
+) -> None:
+    """A transposed array is the failure mode the schema check exists for."""
+    _, path = saved_chain(tmp_path, n_draws=4, n=6)
+    value = archive_members(path)[key]
+    rewrite_chain(path, **{key: broken(value)})  # type: ignore[operator]
+    with pytest.raises(ArtifactIntegrityError, match="shape|dtype"):
+        load_chain(path)
+
+
+def test_load_chain_rejects_a_draw_count_not_matching_settings(
+    tmp_path: Path,
+) -> None:
+    """``settings.n_save`` is the declared draw count; a short trace fails."""
+    _, path = saved_chain(tmp_path, n_draws=4)
+    arrays = archive_members(path)
+    rewrite_chain(
+        path,
+        theta=arrays["theta"][:-1],
+        nu=arrays["nu"][:-1],
+        gamma=arrays["gamma"][:-1],
+        phi=arrays["phi"][:-1],
+        n_star=arrays["n_star"][:-1],
+        log_post=arrays["log_post"][:-1],
+    )
+    with pytest.raises(ArtifactIntegrityError, match="expected \\(4"):
+        load_chain(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record.update(meta="not-an-object"),
+        lambda record: record.update(prior="not-an-object"),
+    ],
+)
+def test_load_chain_rejects_a_structurally_broken_meta(
+    tmp_path: Path, mutate: object
+) -> None:
+    """A nested field with the wrong structure must not reach a constructor."""
+    _, path = saved_chain(tmp_path)
+
+    def apply(record: dict[str, object]) -> None:
+        mutate(record)  # type: ignore[operator]
+
+    rewrite_chain_meta(path, apply)
+    with pytest.raises(ArtifactIntegrityError, match="meta|schema"):
+        load_chain(path)
+
+
+def test_load_chain_rejects_a_non_object_meta_blob(tmp_path: Path) -> None:
+    """The blob is a JSON object, not an array or a string."""
+    _, path = saved_chain(tmp_path)
+    rewrite_chain(path, meta=np.asarray("[1, 2]"))
+    with pytest.raises(ArtifactIntegrityError, match="JSON object"):
+        load_chain(path)
+
+
+def test_load_chain_rejects_invalid_meta_json(tmp_path: Path) -> None:
+    """Invalid JSON is an integrity error, not an unhandled ``JSONDecodeError``."""
+    _, path = saved_chain(tmp_path)
+    rewrite_chain(path, meta=np.asarray("{not json"))
+    with pytest.raises(ArtifactIntegrityError, match="valid JSON"):
+        load_chain(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record["prior"].update(unknown_field=1.0),
+        lambda record: record["prior"].pop("a_nu"),
+        lambda record: record["prior"].update(d=2.5),
+        lambda record: record["settings"].update(unknown_field=1),
+        lambda record: record["settings"].pop("seed"),
+        lambda record: record["settings"].update(epsilon=2.0),
+        lambda record: record["settings"].update(preset=""),
+        lambda record: record["settings"].update(seed=-1),
+        lambda record: record.update(label=7),
+        lambda record: record.update(chain_index=-1),
+        lambda record: record.pop("settings"),
+    ],
+)
+def test_load_chain_rejects_invalid_metadata_fields(
+    tmp_path: Path, mutate: object
+) -> None:
+    """Every meta field is validated against its declared type and bounds."""
+    _, path = saved_chain(tmp_path)
+
+    def apply(record: dict[str, object]) -> None:
+        mutate(record)  # type: ignore[operator]
+
+    rewrite_chain_meta(path, apply)
+    with pytest.raises(ArtifactIntegrityError, match="meta|settings|prior|label"):
+        load_chain(path)
+
+
+def test_load_chain_rejects_a_container_invariant_violation(
+    tmp_path: Path,
+) -> None:
+    """Arrays of the right shape can still violate Section 2.1; report it."""
+    _, path = saved_chain(tmp_path)
+    arrays = archive_members(path)
+    rewrite_chain(path, phi=np.full(arrays["phi"].shape, 0.5))
+    with pytest.raises(ArtifactIntegrityError, match="DPChains contract"):
+        load_chain(path)
+
+
+# --- writer validation -----------------------------------------------------
+
+
+def test_save_chain_rejects_a_non_chain(tmp_path: Path) -> None:
+    """A dict with the right keys is not a chain; fail at the writer."""
+    with pytest.raises(ArtifactError, match="DPChains"):
+        save_chain(tmp_path / "chain-0.npz", object(), t_grid=chain_grid())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "grid",
+    [
+        np.array([[0.5, 1.0]]),
+        np.array([]),
+        np.array([0.0, 1.0]),
+        np.array([0.5, np.nan]),
+        np.array([0.5, -1.0]),
+    ],
+)
+def test_save_chain_rejects_an_invalid_grid(tmp_path: Path, grid: np.ndarray) -> None:
+    """The grid is a fit-level input; validate it before writing bytes."""
+    with pytest.raises(ArtifactError, match="t_grid"):
+        save_chain(tmp_path / "chain-0.npz", make_chain(), t_grid=grid)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("label", "chain_index"),
+    [
+        (7, None),
+        (None, -1),
+        (None, True),
+        (None, 1.5),
+    ],
+)
+def test_save_chain_rejects_invalid_provenance(
+    tmp_path: Path, label: object, chain_index: object
+) -> None:
+    """Provenance fields are checked with the same care as the arrays."""
+    with pytest.raises(ArtifactError, match="label|chain_index"):
+        save_chain(
+            tmp_path / "chain-0.npz",
+            make_chain(),
+            t_grid=chain_grid(),
+            label=label,  # type: ignore[arg-type]
+            chain_index=chain_index,  # type: ignore[arg-type]
+        )
+
+
+def test_save_chain_requires_an_npz_path(tmp_path: Path) -> None:
+    """The plan's layout is ``*.npz``; never invent another extension."""
+    with pytest.raises(ArtifactError, match=r"must end in '\.npz'"):
+        save_chain(tmp_path / "chain-0", make_chain(), t_grid=chain_grid())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("epsilon", 2.0),
+        ("n_alpha", 1),
+        ("preset", ""),
+        ("burn_in", -1),
+    ],
+)
+def test_save_chain_rejects_settings_outside_the_schema(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """The writer validates provenance with the loader's own rules."""
+    chain = make_chain()
+    broken = replace(chain, settings=replace(chain.settings, **{field: value}))
+    with pytest.raises(ArtifactError, match="metadata"):
+        save_chain(tmp_path / "chain-0.npz", broken, t_grid=chain_grid())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_chain_rejects_a_non_finite_prior(tmp_path: Path) -> None:
+    """A NaN hyperparameter must not be written as an unloadable archive."""
+    chain = make_chain()
+    broken = replace(chain, prior=replace(chain.prior, a_nu=float("nan")))
+    with pytest.raises(ArtifactError, match="metadata"):
+        save_chain(tmp_path / "chain-0.npz", broken, t_grid=chain_grid())
+    assert list(tmp_path.iterdir()) == []
+
+
+# --- property-based --------------------------------------------------------
+
+
+def test_chain_round_trip_property_random_chains(tmp_path: Path) -> None:
+    """Random sizes, censoring patterns and grids all round-trip bit-exactly."""
+    rng = np.random.default_rng(20261113)
+    for case in range(20):
+        n_draws = int(rng.integers(1, 7))
+        n = int(rng.integers(1, 9))
+        n_grid = int(rng.integers(1, 7))
+        event = rng.integers(0, 2, size=n).astype(bool)
+        chain = make_chain(
+            n_draws=n_draws,
+            n=n,
+            event=event,
+            seed=int(rng.integers(0, 10**9)),
+            n_chains=int(rng.integers(1, 6)),
+            settings_seed=None
+            if bool(rng.integers(0, 2))
+            else int(rng.integers(0, 10**9)),
+        )
+        grid = np.sort(rng.uniform(0.05, 6.0, size=n_grid))
+        path = tmp_path / f"case-{case}" / "chain-0.npz"
+        save_chain(path, chain, t_grid=grid, chain_index=case)
+        loaded = load_chain(path)
+        assert_chains_equal(loaded, chain)
+        with np.load(path, allow_pickle=False) as archive:
+            np.testing.assert_array_equal(archive["t_grid"], grid)
+
+
+def test_chain_round_trip_property_random_provenance(tmp_path: Path) -> None:
+    """Random priors and sampler knobs survive the JSON meta round-trip."""
+    rng = np.random.default_rng(20261114)
+    for case in range(20):
+        prior = DPPrior(
+            a_nu=float(rng.uniform(0.1, 5.0)),
+            b_nu=float(rng.uniform(0.01, 3.0)),
+            a_gamma=float(rng.uniform(0.1, 4.0)),
+            b_gamma=float(rng.uniform(0.01, 2.0)),
+            a_phi=float(rng.uniform(0.1, 4.0)),
+            b_phi=float(rng.uniform(0.01, 1.0)),
+            d=int(rng.integers(1, 5)),
+        )
+        n_draws = int(rng.integers(1, 5))
+        chain = make_chain(
+            n_draws=n_draws,
+            n=int(rng.integers(1, 8)),
+            prior=prior,
+            burn_in=int(rng.integers(0, 1000)),
+            thin=int(rng.integers(1, 10)),
+            n_alpha=int(rng.integers(2, 65)),
+            epsilon=float(rng.uniform(1e-6, 0.5)),
+            n_chains=int(rng.integers(1, 6)),
+            settings_seed=None
+            if bool(rng.integers(0, 2))
+            else int(rng.integers(0, 10**9)),
+            preset=str(rng.choice(["quick", "paper", "paper-lite", "custom"])),
+            seed=int(rng.integers(0, 10**9)),
+        )
+        path = tmp_path / f"case-{case}.npz"
+        save_chain(path, chain, t_grid=chain_grid(int(rng.integers(1, 5))))
+        loaded = load_chain(path)
+        assert loaded.prior == prior
+        assert loaded.settings == chain.settings
+        assert_chains_equal(loaded, chain)

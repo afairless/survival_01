@@ -8,7 +8,7 @@ will reconstruct containers explicitly (never via pickle) and validate every
 array against the declared schema first.
 
 This unit contributes the schema-independent primitives that the chain,
-functional, fit and run writers are built on:
+functional, fit and run writers are built on, plus the chain round-trip:
 
 * :data:`SCHEMA_VERSION` -- stamped into every ``meta`` blob, section
   ``meta.json`` and run ``MANIFEST.json``; a loader rejects an unknown value
@@ -22,7 +22,10 @@ functional, fit and run writers are built on:
 * :func:`_jsonable` -- converts NumPy scalars, arrays and the metadata
   containers into values ``json.dumps`` accepts, because the meta dicts are
   stored verbatim rather than through a hand-written field list;
-* :func:`atomic_savez` -- an ``npz`` write that is either complete or absent.
+* :func:`atomic_savez` -- an ``npz`` write that is either complete or absent;
+* :func:`save_chain` / :func:`load_chain` -- one self-contained ``DPChains``
+  (plan §5.1): every stored array, the dataset, the prior and the settings,
+  so a reviewer can load a chain without the fitting process.
 
 Why the write helper exists
 ---------------------------
@@ -36,27 +39,34 @@ readable-but-truncated archive and never leaves a stray ``*.npz.npz`` behind.
 
 Scope
 -----
-Pure I/O plus NumPy: this module must not import ``matplotlib`` or any
-plotting code (plan §6.1), and it must not import the sampler or the
-functional modules.  The chain, functional, fit, run-writer and manifest
-units of plan §6.1 are layered on top of the primitives here.
+This module imports NumPy, the standard library and the ``dp_gibbs`` container
+types it reconstructs on load.  It must never import ``matplotlib`` or any
+plotting code (plan §6.1), and it never runs the sampler or the functional
+code -- it only owns the containers.  The functional, fit, run-writer and
+manifest units of plan §6.1 are layered on top of the primitives here.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import zipfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, Any
 
 import numpy as np
 
+from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData
+
 __all__ = [
     "SCHEMA_VERSION",
     "ArtifactError",
     "ArtifactIntegrityError",
     "atomic_savez",
+    "load_chain",
+    "save_chain",
     "slug",
 ]
 
@@ -204,3 +214,535 @@ def atomic_savez(
         tmp.unlink(missing_ok=True)
         raise
     return target
+
+
+# ---------------------------------------------------------------------------
+# Chain serialisation (plan §5.1)
+# ---------------------------------------------------------------------------
+
+#: The ``DPPrior`` fields stored in a ``meta`` blob, in declaration order.
+_PRIOR_FIELDS = ("a_nu", "b_nu", "a_gamma", "b_gamma", "a_phi", "b_phi", "d")
+
+#: The ``DPSettings`` fields stored in a ``meta`` blob.
+_SETTINGS_FIELDS = (
+    "burn_in",
+    "n_save",
+    "thin",
+    "n_alpha",
+    "epsilon",
+    "n_chains",
+    "seed",
+    "preset",
+)
+
+#: Keys of one ``chain-<b>.npz`` (plan §5.1).  Extra keys are rejected so a
+#: typo cannot hide behind an ignored array.
+_CHAIN_KEYS = frozenset(
+    {
+        "theta",
+        "nu",
+        "gamma",
+        "phi",
+        "n_star",
+        "log_post",
+        "time",
+        "event",
+        "t_max",
+        "t_grid",
+        "meta",
+    }
+)
+
+#: Keys of the per-chain ``meta`` JSON object.
+_CHAIN_META_KEYS = frozenset(
+    {"schema_version", "label", "chain_index", "prior", "settings"}
+)
+
+#: The array fields ``DPChains`` stores per draw; all are ``float64``.
+_DRAW_FLOAT_FIELDS = ("nu", "gamma", "phi", "log_post")
+
+
+def _open_npz(path: str | os.PathLike[str]) -> np.lib.npyio.NpzFile:
+    """Open ``path`` as an ``npz`` archive without ever unpickling.
+
+    The file is checked first, so a missing path produces an
+    :class:`ArtifactError` naming it instead of NumPy's bare ``FileNotFoundError``
+    from the middle of a loader.  A file that is not a readable ``npz`` -- a
+    truncated download, a plain ``.npy`` renamed to ``.npz`` -- is an
+    :class:`ArtifactIntegrityError`, because the archive disagrees with the
+    declared schema.
+    """
+    target = Path(path)
+    if not target.exists():
+        raise ArtifactError(f"artifact does not exist: {target}")
+    if not target.is_file():
+        raise ArtifactError(f"artifact is not a file: {target}")
+    try:
+        archive = np.load(target, allow_pickle=False)
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:
+        raise ArtifactIntegrityError(
+            f"{target}: cannot read npz archive: {exc}"
+        ) from exc
+    if not isinstance(archive, np.lib.npyio.NpzFile):
+        raise ArtifactIntegrityError(
+            f"{target}: not an npz archive (np.load returned {type(archive).__name__})"
+        )
+    return archive
+
+
+def _require_exact_keys(
+    archive: np.lib.npyio.NpzFile,
+    expected: frozenset[str],
+    target: Path,
+    *,
+    kind: str,
+) -> None:
+    """Reject an archive whose member names disagree with the schema."""
+    present = set(archive.files)
+    missing = sorted(expected - present)
+    extra = sorted(present - expected)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if extra:
+            details.append(f"unexpected {extra}")
+        raise ArtifactIntegrityError(
+            f"{target}: {kind} schema mismatch ({', '.join(details)})"
+        )
+
+
+def _member(archive: np.lib.npyio.NpzFile, key: str, target: Path) -> np.ndarray:
+    """Read one array member, turning a corrupt member into an artifact error."""
+    try:
+        return archive[key]
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile, KeyError) as exc:
+        raise ArtifactIntegrityError(
+            f"{target}: cannot read array {key!r}: {exc}"
+        ) from exc
+
+
+def _require_array(
+    archive: np.lib.npyio.NpzFile,
+    key: str,
+    target: Path,
+    *,
+    dtype: type,
+    ndim: int,
+    expected_shape: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    """Validate one array's dtype, rank and shape *before* it is used.
+
+    The dtype is checked against the plan §5.1 table: ``float64`` for every
+    real-valued array, ``bool`` for ``event`` and any integer type for
+    ``n_star`` (Linux ``intp`` is ``int64``; the container casts back).  Shape
+    checks are performed against the header only, so a corrupt archive cannot
+    make the loader allocate an arbitrarily large array.
+    """
+    array = _member(archive, key, target)
+    if dtype is np.integer:
+        dtype_ok = np.issubdtype(array.dtype, np.integer)
+        expected_dtype = "an integer dtype"
+    else:
+        dtype_ok = array.dtype == np.dtype(dtype)
+        expected_dtype = str(np.dtype(dtype))
+    if not dtype_ok:
+        raise ArtifactIntegrityError(
+            f"{target}: array {key!r} has dtype {array.dtype}, "
+            f"expected {expected_dtype}"
+        )
+    if array.ndim != ndim:
+        raise ArtifactIntegrityError(
+            f"{target}: array {key!r} has shape {array.shape}, "
+            f"expected a {ndim}-D array"
+        )
+    if expected_shape is not None and array.shape != expected_shape:
+        raise ArtifactIntegrityError(
+            f"{target}: array {key!r} has shape {array.shape}, "
+            f"expected {expected_shape}"
+        )
+    return array
+
+
+def _require_string_scalar(
+    archive: np.lib.npyio.NpzFile, key: str, target: Path
+) -> str:
+    """Return the 0-d unicode member ``key`` as a Python string."""
+    array = _member(archive, key, target)
+    if array.dtype.kind != "U" or array.ndim != 0:
+        raise ArtifactIntegrityError(
+            f"{target}: array {key!r} must be a 0-d unicode string, "
+            f"got dtype {array.dtype} and shape {array.shape}"
+        )
+    return str(array[()])
+
+
+def _as_meta_number(value: Any, name: str, target: Path) -> float | int:
+    """Validate one finite numeric metadata value."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} must be a number, got {value!r}"
+        )
+    if not np.isfinite(float(value)):
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} must be finite, got {value!r}"
+        )
+    return value
+
+
+def _as_meta_int(
+    value: Any, name: str, target: Path, *, minimum: int | None = None
+) -> int:
+    """Validate one integer metadata value, optionally bounded below."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} must be an integer, got {value!r}"
+        )
+    if minimum is not None and value < minimum:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} must be at least {minimum}, got {value!r}"
+        )
+    return value
+
+
+def _require_record(
+    value: Any, expected: tuple[str, ...] | frozenset[str], name: str, target: Path
+) -> Mapping[str, Any]:
+    """Validate a nested JSON object against an exact key set."""
+    if not isinstance(value, Mapping):
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} must be a JSON object, "
+            f"got {type(value).__name__}"
+        )
+    keys = set(value)
+    expected_keys = set(expected)
+    missing = sorted(expected_keys - keys)
+    extra = sorted(keys - expected_keys)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if extra:
+            details.append(f"unexpected {extra}")
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} schema mismatch ({', '.join(details)})"
+        )
+    return value
+
+
+def _prior_from_record(record: Any, target: Path) -> DPPrior:
+    """Validate a stored ``DPPrior`` record and rebuild it."""
+    record = _require_record(record, _PRIOR_FIELDS, "prior", target)
+    values: dict[str, Any] = {
+        name: _as_meta_number(record[name], f"prior.{name}", target)
+        for name in _PRIOR_FIELDS[:-1]
+    }
+    values["d"] = _as_meta_int(record["d"], "prior.d", target, minimum=1)
+    return DPPrior(**values)
+
+
+def _settings_from_record(record: Any, target: Path) -> DPSettings:
+    """Validate a stored ``DPSettings`` record and rebuild it."""
+    record = _require_record(record, _SETTINGS_FIELDS, "settings", target)
+    values: dict[str, Any] = {
+        "burn_in": _as_meta_int(
+            record["burn_in"], "settings.burn_in", target, minimum=0
+        ),
+        "n_save": _as_meta_int(record["n_save"], "settings.n_save", target, minimum=1),
+        "thin": _as_meta_int(record["thin"], "settings.thin", target, minimum=1),
+        "n_alpha": _as_meta_int(
+            record["n_alpha"], "settings.n_alpha", target, minimum=2
+        ),
+        "epsilon": _as_meta_number(record["epsilon"], "settings.epsilon", target),
+        "n_chains": _as_meta_int(
+            record["n_chains"], "settings.n_chains", target, minimum=1
+        ),
+        "seed": None
+        if record["seed"] is None
+        else _as_meta_int(record["seed"], "settings.seed", target, minimum=0),
+        "preset": record["preset"],
+    }
+    epsilon = float(values["epsilon"])
+    if not 0.0 < epsilon < 1.0:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field 'settings.epsilon' must lie strictly "
+            f"between 0 and 1, got {epsilon!r}"
+        )
+    preset = values["preset"]
+    if not isinstance(preset, str) or not preset:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field 'settings.preset' must be a non-empty "
+            f"string, got {preset!r}"
+        )
+    return DPSettings(**values)
+
+
+def _read_chain_meta(
+    archive: np.lib.npyio.NpzFile, target: Path
+) -> tuple[str | None, int | None, DPPrior, DPSettings]:
+    """Parse and validate the self-contained per-chain metadata blob."""
+    text = _require_string_scalar(archive, "meta", target)
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ArtifactIntegrityError(
+            f"{target}: meta blob is not valid JSON: {exc}"
+        ) from exc
+    record = _require_record(record, _CHAIN_META_KEYS, "meta", target)
+
+    version = _as_meta_int(
+        record["schema_version"], "schema_version", target, minimum=1
+    )
+    if version != SCHEMA_VERSION:
+        raise ArtifactIntegrityError(
+            f"{target}: schema version {version} is not the supported "
+            f"version {SCHEMA_VERSION} (no migration path)"
+        )
+
+    label = record["label"]
+    if label is not None and not isinstance(label, str):
+        raise ArtifactIntegrityError(
+            f"{target}: meta field 'label' must be a string or null, got {label!r}"
+        )
+    chain_index = record["chain_index"]
+    if chain_index is not None:
+        chain_index = _as_meta_int(chain_index, "chain_index", target, minimum=0)
+
+    return (
+        label,
+        chain_index,
+        _prior_from_record(record["prior"], target),
+        _settings_from_record(record["settings"], target),
+    )
+
+
+def _validated_t_grid(t_grid: object) -> np.ndarray:
+    """Validate an original-scale evaluation grid before it is written."""
+    try:
+        grid = np.asarray(t_grid, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactError(f"t_grid must be a 1-D array of times: {exc}") from exc
+    if grid.ndim != 1 or grid.size == 0:
+        raise ArtifactError(
+            f"t_grid must be a non-empty 1-D array, got shape {grid.shape}"
+        )
+    if not np.all(np.isfinite(grid)):
+        raise ArtifactError("t_grid must contain only finite times")
+    if np.any(grid <= 0.0):
+        raise ArtifactError(
+            "t_grid must be strictly positive on the original time scale"
+        )
+    return np.array(grid, dtype=np.float64, copy=True)
+
+
+def save_chain(
+    path: str | os.PathLike[str],
+    chain: DPChains,
+    *,
+    t_grid: object,
+    label: str | None = None,
+    chain_index: int | None = None,
+) -> Path:
+    """Write one :class:`DPChains` as a self-contained ``chain-<b>.npz``.
+
+    The archive holds every stored array of the chain plus ``time``, ``event``,
+    ``t_max`` and the fit's ``t_grid``, and a ``meta`` string with the schema
+    version, the provenance (``label``, ``chain_index``), the seven
+    ``DPPrior`` scalars and the eight ``DPSettings`` knobs.  :func:`load_chain`
+    therefore needs no side information and no pickle.
+
+    ``t_grid`` is a ``Fit`` field rather than a ``DPChains`` field (plan §5.1),
+    so it is explicit keyword-only input; ``save_fit`` passes the fit's grid.
+    ``label`` and ``chain_index`` are optional provenance only -- they are not
+    part of ``DPChains`` and are recorded so a bare chain file can be traced
+    back to its fit and chain number.
+
+    Parameters
+    ----------
+    path:
+        Destination ending in ``.npz``.  The write is atomic (see
+        :func:`atomic_savez`).
+    chain:
+        The chain to store.  It is not mutated.
+    t_grid:
+        Original-scale evaluation grid of the fit, 1-D, finite and strictly
+        positive.
+    label:
+        The fit's un-slugged prior label, e.g. ``"nu ~ Gamma(2, 0.9)"``.
+    chain_index:
+        Index of this chain within its fit (``0``-based), or ``None`` when the
+        caller has no fit context.
+
+    Returns
+    -------
+    pathlib.Path
+        The path actually written.
+
+    Raises
+    ------
+    ArtifactError
+        If ``chain`` is not a :class:`DPChains`, ``t_grid`` is not a valid
+        original-scale grid, ``label``/``chain_index`` have the wrong type, or
+        ``path`` does not end in ``.npz``.
+    """
+    if not isinstance(chain, DPChains):
+        raise ArtifactError(
+            f"save_chain expects a DPChains, got {type(chain).__name__}"
+        )
+    grid = _validated_t_grid(t_grid)
+    if label is not None and not isinstance(label, str):
+        raise ArtifactError(
+            f"label must be a string or None, got {type(label).__name__}"
+        )
+    if chain_index is not None:
+        if (
+            isinstance(chain_index, bool)
+            or not isinstance(chain_index, (int, np.integer))
+            or int(chain_index) < 0
+        ):
+            raise ArtifactError(
+                f"chain_index must be a non-negative integer or None, "
+                f"got {chain_index!r}"
+            )
+        chain_index = int(chain_index)
+
+    meta = {
+        "schema_version": SCHEMA_VERSION,
+        "label": label,
+        "chain_index": chain_index,
+        "prior": {
+            name: _jsonable(getattr(chain.prior, name)) for name in _PRIOR_FIELDS
+        },
+        "settings": {
+            name: _jsonable(getattr(chain.settings, name)) for name in _SETTINGS_FIELDS
+        },
+    }
+    # Validate the provenance with the same rules the loader applies, so the
+    # writer cannot produce an archive that ``load_chain`` would reject.
+    try:
+        _prior_from_record(meta["prior"], Path(path))
+        _settings_from_record(meta["settings"], Path(path))
+    except ArtifactIntegrityError as exc:
+        raise ArtifactError(
+            f"chain metadata is outside the artifact schema: {exc}"
+        ) from exc
+
+    arrays = {
+        "theta": chain.theta,
+        "nu": chain.nu,
+        "gamma": chain.gamma,
+        "phi": chain.phi,
+        "n_star": np.asarray(chain.n_star, dtype=np.int64),
+        "log_post": chain.log_post,
+        "time": chain.data.time,
+        "event": chain.data.event,
+        "t_max": np.asarray(chain.data.t_max, dtype=np.float64),
+        "t_grid": grid,
+        "meta": np.asarray(json.dumps(_jsonable(meta), sort_keys=True)),
+    }
+    return atomic_savez(path, arrays)
+
+
+def load_chain(path: str | os.PathLike[str]) -> DPChains:
+    """Load a chain written by :func:`save_chain`.
+
+    Every member is checked against the plan §5.1 schema -- exact key set,
+    dtype, rank and shape -- **before** any container is built, so a corrupt
+    header fails with an :class:`ArtifactIntegrityError` instead of reaching
+    ``DPChains.__post_init__`` or allocating a wrongly-shaped trace.  The
+    dataset, prior and settings are reconstructed explicitly from their stored
+    scalars (no pickle, ``allow_pickle=False``), then ``DPChains`` validates
+    its own Section 2.1 invariants.  A container violation is reported as an
+    artifact error naming ``path``.
+
+    The provenance fields ``label`` and ``chain_index`` are validated but not
+    returned: they are not part of ``DPChains``, and the fit-level loader reads
+    them from ``fit-meta.json``.
+
+    Raises
+    ------
+    ArtifactError
+        If ``path`` is missing, is not a file, or is not a readable ``npz``.
+    ArtifactIntegrityError
+        If the archive disagrees with the declared schema (keys, dtypes,
+        shapes, metadata fields, schema version) or the stored arrays violate
+        the ``DPChains`` invariants.
+    """
+    target = Path(path)
+    with _open_npz(target) as archive:
+        _require_exact_keys(archive, _CHAIN_KEYS, target, kind="chain")
+        _, _, prior, settings = _read_chain_meta(archive, target)
+
+        time = _require_array(archive, "time", target, dtype=np.float64, ndim=1)
+        if time.size == 0:
+            raise ArtifactIntegrityError(f"{target}: array 'time' must not be empty")
+        event = _require_array(
+            archive,
+            "event",
+            target,
+            dtype=np.bool_,
+            ndim=1,
+            expected_shape=(time.size,),
+        )
+        t_max = _require_array(archive, "t_max", target, dtype=np.float64, ndim=0)
+        grid = _require_array(archive, "t_grid", target, dtype=np.float64, ndim=1)
+        if grid.size == 0:
+            raise ArtifactIntegrityError(f"{target}: array 't_grid' must not be empty")
+        if not np.all(np.isfinite(grid)) or np.any(grid <= 0.0):
+            raise ArtifactIntegrityError(
+                f"{target}: array 't_grid' must contain only finite, "
+                "strictly positive times"
+            )
+
+        n_draws = int(settings.n_save)
+        theta = _require_array(
+            archive,
+            "theta",
+            target,
+            dtype=np.float64,
+            ndim=3,
+            expected_shape=(n_draws, int(time.size), 2),
+        )
+        draw_shape = (n_draws,)
+        draw_arrays = {
+            name: _require_array(
+                archive,
+                name,
+                target,
+                dtype=np.float64,
+                ndim=1,
+                expected_shape=draw_shape,
+            )
+            for name in _DRAW_FLOAT_FIELDS
+        }
+        n_star = _require_array(
+            archive,
+            "n_star",
+            target,
+            dtype=np.integer,
+            ndim=1,
+            expected_shape=draw_shape,
+        )
+
+        try:
+            data = SurvData(
+                time=np.array(time, dtype=np.float64, copy=True),
+                event=np.array(event, dtype=bool, copy=True),
+                t_max=float(t_max[()]),
+            )
+            chain = DPChains(
+                data=data,
+                prior=prior,
+                settings=settings,
+                theta=theta,
+                nu=draw_arrays["nu"],
+                gamma=draw_arrays["gamma"],
+                phi=draw_arrays["phi"],
+                n_star=n_star,
+                log_post=draw_arrays["log_post"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                f"{target}: stored chain violates the DPChains contract: {exc}"
+            ) from exc
+    return chain

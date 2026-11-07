@@ -25,7 +25,7 @@ It has two companions:
 | --- | --- | --- |
 | `src/dp_gibbs.py` | ingestion validation and the time transform, state and bookkeeping, the $\alpha$ quadrature grid, the three full conditionals, one sweep, chain storage, initialisation, the collapsed log-posterior, diagnostics | plotting, data generation, functionals |
 | `src/dp_functionals.py` | the paper's §3 steps (i)–(iii) for posterior *and* prior, survival/CDF/density/hazard/quantile functionals on the original scale, two-population comparisons | drawing $\theta$ |
-| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion and atomic `npz` writes; later units add the chain, functional, fit, event-log and manifest round-trips | fitting, plotting, recomputing summaries |
+| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz` writes and the self-contained chain round-trip; later units add the functional, fit, event-log and manifest round-trips | fitting, plotting, recomputing summaries |
 
 Two rules hold everywhere and are enforced by tests, not by convention:
 
@@ -397,10 +397,11 @@ acceptance value without fitting anything. `output/` is in `.gitignore`; the
 committed record is the code, the report and the checksums, never the binaries
 (R5).
 
-This module owns serialisation and nothing else: it imports NumPy and the
-standard library, never `matplotlib`, the sampler or the functional module.
-The primitives are introduced first; the chain, functional, fit, event-log and
-manifest units of plan §6.1 layer on top of them.
+This module owns serialisation and nothing else: it imports NumPy, the
+standard library and the `dp_gibbs` container types it reconstructs on load,
+never `matplotlib` or the functional module, and it never runs the sampler.
+The primitives and the chain unit are introduced first; the functional, fit,
+event-log and manifest units of plan §6.1 layer on top of them.
 
 | name | role |
 | --- | --- |
@@ -410,6 +411,8 @@ manifest units of plan §6.1 layer on top of them.
 | `slug(label)` | the directory-name rule: every run outside `[A-Za-z0-9._-]` becomes `_`, then boundary `_` are trimmed, so `"nu ~ Gamma(2, 0.9)"` → `nu_Gamma_2_0.9` and an arm is `A-` + that |
 | `_jsonable(value)` | NumPy scalars/arrays, tuples, lists, mappings and `None` → values `json.dumps` accepts; mapping keys are stringified, unsupported types raise `ArtifactError` |
 | `atomic_savez(path, arrays, *, compressed=True)` | write one `npz` archive atomically |
+| `save_chain(path, chain, *, t_grid, label=None, chain_index=None)` | write one `DPChains` as `chain-<b>.npz` with the self-contained `meta` blob |
+| `load_chain(path)` | validate the archive against the schema, then reconstruct `SurvData`/`DPPrior`/`DPSettings`/`DPChains` explicitly (no pickle) |
 
 ### 6.1 Why the write helper is not `np.savez(tmp_name)`
 
@@ -433,6 +436,29 @@ front.
 The `compressed=True` default is R8's starting point; the `savez` versus
 `savez_compressed` size/CPU measurement on one representative fit decides
 whether it stays, and the numbers are recorded as R8's outcome in the plan.
+
+### 6.2 The chain file (`chain-<b>.npz`)
+
+One file holds one `DPChains` and nothing else is needed to read it. The
+arrays are the plan §5.1 table: `theta (B, n, 2)`, `nu`, `gamma`, `phi`,
+`n_star`, `log_post` (`B = settings.n_save`), plus the dataset (`time`,
+`event`, `t_max`) and the fit's `t_grid`. `t_grid` is a `Fit` field, not a
+`DPChains` field, so `save_chain` takes it as a keyword-only argument.
+
+The 0-d unicode `meta` member is a JSON object with `schema_version`, the
+provenance `label` and `chain_index` (both nullable when a chain is stored
+without fit context), the seven `DPPrior` scalars and the eight `DPSettings`
+knobs (including `seed`, which may be `null`). It is written with sorted keys
+so the same chain produces the same blob.
+
+`load_chain` checks the member names exactly (a missing or extra key is an
+`ArtifactIntegrityError`), then every dtype and shape against the declared
+schema, then the metadata fields against their types and bounds, and only
+then builds `SurvData` and `DPChains`. The shape checks use the archive
+header, so a corrupt file cannot make the loader allocate a huge array, and
+`allow_pickle=False` is explicit. A container invariant violation (for
+example `phi < prior.b_phi`) is reported as an artifact error naming the
+path, never as a bare `ValueError` from the middle of construction.
 
 ---
 
