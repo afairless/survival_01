@@ -4,12 +4,14 @@
 
 `src/dp_weibull.py` is short (432 lines) but it implements an infinite-
 dimensional object, so the mapping from symbol to function is worth writing
-down once. This guide is a companion to two other notes:
+down once. This guide is a companion to three other notes:
 
 - `docs/research/dirichlet_process_concepts.md` — the mathematics: what a DP
   is, why a draw is discrete, what $\nu$ does, and why $J$ is not $n^*$.
 - `docs/dp_weibull_explanation.md` — the model, the base measure $G_0$, and the
   Section 5.1 hyperparameter choices, in the paper's notation.
+- `docs/research/dp_gibbs_code_guide.md` — the Gibbs sampler and functional
+  layer that consume this module's draws.
 
 This note answers the practical questions instead: which function produces
 which object, what each argument means, what the demo is doing, and where the
@@ -38,15 +40,18 @@ It provides:
 
 It does **not** provide:
 
-- the Gibbs sampler over $(\alpha_i, \lambda_i)$ — that is the paper's §7, and
-  `sample_dp_posterior` expects its output as the `theta` argument;
+- the Gibbs sampler over $(\alpha_i, \lambda_i)$ — that is the paper's §7 and
+  lives in `src/dp_gibbs.py`; `sample_dp_posterior` expects the sampler's
+  output as its `theta` argument;
 - a fit or a point estimate for the population survival function — that comes
-  from averaging over many posterior draws;
+  from averaging over many posterior draws, in `src/dp_functionals.py`;
 - any notion of a cluster count $n^*$ — see §5.
 
-`src/kottas_2002_5_1.py` is separate scaffolding: it generates the two-lognormal
-data from §5.1 and explores the $\nu$ prior. It is not imported by
-`dp_weibull.py`.
+The two downstream modules are documented in
+`docs/research/dp_gibbs_code_guide.md`. `src/kottas_2002_5_1.py` is now a thin
+wrapper over `src/paper_examples.py::example_5_1`; the §5.1 generator and the
+prior constants live in `src/paper_data.py`. Nothing in this module imports
+any of them.
 
 ---
 
@@ -450,8 +455,8 @@ not with a cluster count.
 A single prior draw:
 
 ```python
-from dp_weibull import sample_dp_prior, weibull_from_median_iqr, \
-                       b_gamma_b_phi_from_weibull
+from src.dp_weibull import sample_dp_prior, weibull_from_median_iqr, \
+                           b_gamma_b_phi_from_weibull
 
 at, lt = weibull_from_median_iqr(median=1.1727, iqr=1.3679)
 b_gamma, b_phi = b_gamma_b_phi_from_weibull(at, lt)
@@ -466,7 +471,7 @@ A posterior draw, given latents from your sampler:
 
 ```python
 import numpy as np
-from dp_weibull import sample_dp_posterior
+from src.dp_weibull import sample_dp_posterior
 
 theta = np.asarray(theta, dtype=float)          # shape (n, 2) from the Gibbs sampler
 G_post = sample_dp_posterior(
@@ -509,7 +514,8 @@ S_lo, S_hi = np.percentile(S_draws, [2.5, 97.5], axis=0)
 - **`hazard` is a ratio of two sums**, so it inherits their numerical error at
   extreme $t$.
 - **`_demo` is one draw per prior**, not an average, and it calls `plt.show()`.
-- **No Gibbs sampler here.** `sample_dp_posterior` is downstream of one.
+- **No Gibbs sampler here.** `sample_dp_posterior` is downstream of one; the
+  sampler is `src/dp_gibbs.py` (see `docs/research/dp_gibbs_code_guide.md`).
 
 ---
 
@@ -524,5 +530,9 @@ S_lo, S_hi = np.percentile(S_draws, [2.5, 97.5], axis=0)
   hyperparameters.
 - `docs/research/weibull_lambda_definitions.md` — the two Weibull scale
   parameterisations.
-- `src/kottas_2002_5_1.py` — data generation for the §5.1 example
-  (`TwoLognormalMix`).
+- `docs/research/dp_gibbs_code_guide.md` — the Gibbs sampler and the
+  functional layer that consume this module's draws.
+- `docs/research/dp_gibbs_results.md` — the §5.1 and §5.2 reproduction numbers.
+- `src/paper_data.py` — the §5.1 lognormal mixture (`TwoLognormalMix`), the
+  §5.2 leukemia data and the prior-guess constants.
+- `src/kottas_2002_5_1.py` — a thin wrapper over the §5.1 driver.
