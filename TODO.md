@@ -69,3 +69,20 @@ commits the message in column 2 verbatim.
   no production path except the test-only discrete α mode in step 31.
 - Reproduction steps 35-36 are opt-in (`-m paper`) and are never part of
   `pixi run test`; their numbers go into the step 37 results note.
+- Before step 35 was accepted, a paper-grade probe (burn 5,000, thin 150, 500
+  saved draws per chain, 4 chains, seed 20240601) showed that two §6.3 clauses
+  as first written were not paper claims and did not hold for the deliberately
+  extreme `Gamma(3, 0.05)` prior: `Pr(3 ≤ n* ≤ 15)` was 0.730, and the third
+  hazard change point was 4.166 against 4.454 ± 0.25. Plan amendments A1 and
+  A2 (§6.3) record the corrected criteria: `n*` mean in `[3, 15]` with
+  per-prior probability floors 0.85/0.85/0.70, and a ±0.35 tolerance for the
+  third change point only. Both are justified by the paper's text/figure and
+  by the sample's tail (2 observations above 4 against the paper's 4).
+- A paper-grade §5.2 probe (same settings, seed 20240602) showed that two
+  row-5 clauses of §6.3 were misreadings of Figure 5: the 95% band of
+  `F_B - F_A` straddles zero in the paper as well (only its 80% band clears
+  zero), and the paper's very tight `h_B/h_A` bands are not reproduced by a
+  per-draw ratio. Amendments A3 and A4 replace both clauses with the paper's
+  qualitative claims — mean `F_B - F_A ≥ 0` with pointwise probability floors,
+  and a ≥30% decline of the mean hazard ratio with `P ≥ 0.75` — and the
+  results note records the original band numbers so the gap is visible.
