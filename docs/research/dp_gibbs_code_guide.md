@@ -25,7 +25,7 @@ It has two companions:
 | --- | --- | --- |
 | `src/dp_gibbs.py` | ingestion validation and the time transform, state and bookkeeping, the $\alpha$ quadrature grid, the three full conditionals, one sweep, chain storage, initialisation, the collapsed log-posterior, diagnostics | plotting, data generation, functionals |
 | `src/dp_functionals.py` | the paper's §3 steps (i)–(iii) for posterior *and* prior, survival/CDF/density/hazard/quantile functionals on the original scale, two-population comparisons | drawing $\theta$ |
-| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz` writes and the self-contained chain round-trip; later units add the functional, fit, event-log and manifest round-trips | fitting, plotting, recomputing summaries |
+| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz`/JSON writes and the self-contained chain, functional, fit and section round-trips; later units add the event log and the manifest | fitting, plotting, recomputing summaries |
 
 Two rules hold everywhere and are enforced by tests, not by convention:
 
@@ -401,9 +401,9 @@ This module owns serialisation and nothing else: it imports NumPy, the
 standard library and the container types it reconstructs on load (`DPChains`
 and friends from `dp_gibbs`, `Functionals` from `dp_functionals`), never
 `matplotlib` or any plotting code, and it never runs the sampler or evaluates
-a functional. The primitives, chain and functional units are introduced
-first; the fit, event-log and manifest units of plan §6.1 layer on top of
-them.
+a functional. The primitives, chain, functional, fit and section units are
+introduced first; the event-log and manifest units of plan §6.1 layer on top
+of them.
 
 | name | role |
 | --- | --- |
@@ -417,6 +417,10 @@ them.
 | `load_chain(path)` | validate the archive against the schema, then reconstruct `SurvData`/`DPPrior`/`DPSettings`/`DPChains` explicitly (no pickle) |
 | `save_functionals(path, func)` | write one `Functionals` as `functionals.npz` (or `prior-band.npz`): grid, four arrays, verbatim `meta` |
 | `load_functionals(path)` | validate the archive against the schema, then build `Functionals` explicitly with the stored `meta` |
+| `save_fit(directory, fit, *, meta=None)` | write a per-fit directory: every `chain-<b>.npz`, `functionals.npz`, an optional `prior-band.npz`, then `fit-meta.json` last |
+| `load_fit(directory)` | validate `fit-meta.json`, then every archive against its record and its own schema, and rebuild a `Fit` with the band re-attached |
+| `save_demo_result(directory, result)` | write a section directory: one fit directory per fit under `draws/`, plus `meta.json` last; never a figure |
+| `load_demo_result(directory)` | load every named fit and rebuild `DemoResult` with `prior_indices` as a tuple and `figures=()` |
 
 ### 6.1 Why the write helper is not `np.savez(tmp_name)`
 
@@ -437,9 +441,15 @@ a path not ending in `.npz` is an `ArtifactError`. Arrays are written one at a
 time from the objects that already own them, so a 96 MB trace is not copied up
 front.
 
-The `compressed=True` default is R8's starting point; the `savez` versus
-`savez_compressed` size/CPU measurement on one representative fit decides
-whether it stays, and the numbers are recorded as R8's outcome in the plan.
+The `compressed=True` default is R8's decision, taken from a measurement on
+one representative fit (a `quick` §5.1 fit: 2 chains × 1 000 draws × 200
+observations plus the `(2 000, 300)` functionals). Writing every archive both
+ways gave 25 697 642 bytes in 0.04 s with `np.savez` and 18 615 305 bytes in
+0.61 s with `np.savez_compressed` — 27.6 % fewer bytes for 0.57 s of extra CPU,
+about 25 ms per MiB. The 5 % threshold of R8 is met, so compressed archives
+stay the default; at paper scale (~0.5 GiB per §5.1 fit) that is roughly 12 s
+of extra write time per fit against a one-hour fit. The numbers are recorded
+as R8's outcome in `docs/research/dp_gibbs_replication_artifacts_plan.md` §2.
 
 ### 6.2 The chain file (`chain-<b>.npz`)
 
@@ -492,6 +502,59 @@ reject.
 `h` may hold `inf` (the correct limit where `S` underflows to zero while
 `f > 0`), and an infinite value survives `savez_compressed` and
 `np.array_equal` bit-exactly; only `S`, `F` and `f` are required finite.
+
+### 6.4 The fit directory (`fit-meta.json`)
+
+`save_fit` owns one directory and writes it in a fixed order: the chains, then
+`functionals.npz`, then an optional `prior-band.npz`, then `fit-meta.json`.
+Because the metadata file is last and atomic, a crashed save leaves archives
+without a readable fit and `load_fit` rejects the directory instead of
+reconstructing half a fit. A re-save into a longer fit's directory also removes
+stale `chain-*.npz` files and a stale `prior-band.npz`, so the directory never
+holds an array the manifest would hash but no loader would read.
+
+`fit-meta.json` is the only place the **un-slugged** `label` survives: the
+directory name is `A-nu_Gamma_2_0.9` (plan §5), and `load_demo_result` keys
+`DemoResult.fits` from `arm` plus `label`, which is exactly what the paper
+tests index. The file records:
+
+| field | content |
+| --- | --- |
+| `schema_version` | the supported version; a mismatch is an error |
+| `label`, `arm` | readable prior label and the §5.2 arm (`null` in §5.1) |
+| `prior`, `settings` | the seven `DPPrior` scalars and eight `DPSettings` knobs |
+| `data_seed`, `shared_t_max` | the dataset seed (`null` for §5.2) and the common time scale |
+| `n_chains`, `n_draws` | `n_chains` and `n_chains * n_save` |
+| `t_grid` | `{size, first, last}` — the full grid is rebuilt from the archives |
+| `chains` | one `{path, dtype, shape}` per `chain-<b>.npz` (`theta` shape) |
+| `functionals`, `prior_band` | `{path, dtype, shape}` records (`null` band when absent) |
+| `functionals_meta`, `prior_band_meta` | both provenance dicts **verbatim** |
+| `extra` | caller provenance (timings, chain seeds) verbatim |
+
+`load_fit` validates every field before it reads an archive: `n_draws` must be
+`n_chains * n_save`, the recorded shapes must agree with `settings`, and the
+`t_grid` summary must be consistent. Then each chain must agree with the fit's
+prior, settings and dataset, all chains must share one grid, and the functional
+and band arrays must have one column per grid point with a meta dict equal to
+the recorded one. That is what turns a transposed `S`, a wrong draw count or a
+stale metadata file into an `ArtifactIntegrityError` naming the path, rather
+than a fit that merely looks different.
+
+### 6.5 The section file (`meta.json`)
+
+`save_demo_result` writes `draws/<arm>-<slug(label)>/` per fit and the section
+`meta.json` last. The section file holds the label, the fit keys **in the
+driver's order** (a JSON object of fits would lose it) and `DemoResult.meta`
+verbatim; no figures are written, because plan R7 makes the report stage the
+only figure writer.
+
+JSON cannot express the types the paper preconditions compare, so
+`load_demo_result` restores them: `prior_indices` becomes a tuple of ints
+(`test_cli` asserts `== (0, 2)`, the paper preconditions
+`== tuple(range(3))`), `seed`/`data_seed` stay int or `None` (so a default seed
+is not turned into `0`), and `t_max`/`t_max_a`/`t_max_b` become floats. A fit
+directory the section file does not name is an error, so `result.fits` is the
+whole tree and a manifest can hash exactly what a reviewer sees.
 
 ---
 

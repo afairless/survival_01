@@ -29,7 +29,16 @@ functional, fit and run writers are built on, plus the chain round-trip:
 * :func:`save_functionals` / :func:`load_functionals` -- one ``Functionals``
   (plan §5.1): ``t_grid`` and the four ``(B, M)`` arrays plus the provenance
   dict verbatim, so a prior band and a posterior functional of the same shape
-  are stored by one rule.
+  are stored by one rule;
+* :func:`save_fit` / :func:`load_fit` -- one per-fit directory (plan §5.1):
+  ``chain-<b>.npz`` for every chain, ``functionals.npz``, an optional
+  ``prior-band.npz`` and a ``fit-meta.json`` holding the **un-slugged**
+  ``label``, the ``arm``, both meta dicts verbatim and the recorded array
+  shapes/dtypes;
+* :func:`save_demo_result` / :func:`load_demo_result` -- a whole section
+  (plan §5): the section ``meta.json`` plus one fit directory per fit under
+  ``draws/``, reconstructing ``DemoResult.meta`` with its original types
+  (``prior_indices`` stays a tuple).
 
 Why the write helper exists
 ---------------------------
@@ -47,8 +56,12 @@ This module imports NumPy, the standard library and the container types it
 reconstructs on load (``DPChains`` and friends from ``dp_gibbs``, and
 ``Functionals`` from ``dp_functionals``).  It must never import ``matplotlib``
 or any plotting code (plan §6.1), and it never runs the sampler or evaluates a
-functional -- it only owns the containers.  The fit, run-writer and manifest
-units of plan §6.1 are layered on top of the primitives here.
+functional -- it only owns the containers.  ``Fit`` and ``DemoResult`` live in
+``src.paper_examples``; importing that module is cheap (its ``matplotlib``
+import is lazy), but the import is done **inside** the fit/run functions rather
+than at module scope, so the driver can import this module in either order
+without a cycle.  The event-log and manifest units of plan §6.1 are layered on
+top of the primitives here.
 """
 
 from __future__ import annotations
@@ -58,13 +71,17 @@ import os
 import re
 import zipfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
 import numpy as np
 
 from src.dp_functionals import Functionals
 from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at run time
+    from src.paper_examples import DemoResult, Fit
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -72,8 +89,12 @@ __all__ = [
     "ArtifactIntegrityError",
     "atomic_savez",
     "load_chain",
+    "load_demo_result",
+    "load_fit",
     "load_functionals",
     "save_chain",
+    "save_demo_result",
+    "save_fit",
     "save_functionals",
     "slug",
 ]
@@ -676,6 +697,20 @@ def load_chain(path: str | os.PathLike[str]) -> DPChains:
         shapes, metadata fields, schema version) or the stored arrays violate
         the ``DPChains`` invariants.
     """
+    chain, _ = _load_chain_with_grid(path)
+    return chain
+
+
+def _load_chain_with_grid(
+    path: str | os.PathLike[str],
+) -> tuple[DPChains, np.ndarray]:
+    """Load a chain file and return the fit grid stored alongside it.
+
+    ``t_grid`` is a ``Fit`` field, not a ``DPChains`` field, so the fit loader
+    needs both halves of the archive.  Keeping one implementation means the
+    stand-alone :func:`load_chain` and :func:`load_fit` cannot drift apart in
+    what they accept.
+    """
     target = Path(path)
     with _open_npz(target) as archive:
         _require_exact_keys(archive, _CHAIN_KEYS, target, kind="chain")
@@ -753,7 +788,7 @@ def load_chain(path: str | os.PathLike[str]) -> DPChains:
             raise ArtifactIntegrityError(
                 f"{target}: stored chain violates the DPChains contract: {exc}"
             ) from exc
-    return chain
+    return chain, np.array(grid, dtype=np.float64, copy=True)
 
 
 # ---------------------------------------------------------------------------
@@ -774,7 +809,9 @@ _FUNCTIONALS_META_KEYS = frozenset({"schema_version", "meta"})
 _FUNCTIONAL_ARRAY_FIELDS = ("S", "F", "f", "h")
 
 
-def _require_jsonable_meta(meta: object, target: Path) -> dict[str, Any]:
+def _require_jsonable_meta(
+    meta: object, target: Path, *, name: str = "functionals meta"
+) -> dict[str, Any]:
     """Convert a container's ``meta`` dict to the JSON object that is stored.
 
     The dict is stored verbatim (plan §5.1): its keys are not enumerated,
@@ -784,6 +821,10 @@ def _require_jsonable_meta(meta: object, target: Path) -> dict[str, Any]:
     a tuple becomes a JSON list; a value with no JSON form is rejected instead
     of being stringified.
 
+    ``name`` labels the field in the error message, because the same helper
+    validates ``Functionals.meta``, the two ``fit-meta.json`` meta records and
+    the caller-supplied ``extra`` provenance.
+
     Raises
     ------
     ArtifactIntegrityError
@@ -791,19 +832,17 @@ def _require_jsonable_meta(meta: object, target: Path) -> dict[str, Any]:
     """
     if not isinstance(meta, Mapping):
         raise ArtifactIntegrityError(
-            f"{target}: functionals meta must be a JSON object, "
-            f"got {type(meta).__name__}"
+            f"{target}: {name} must be a JSON object, got {type(meta).__name__}"
         )
     try:
         converted = _jsonable(dict(meta))
     except ArtifactError as exc:
         raise ArtifactIntegrityError(
-            f"{target}: functionals meta is not JSON-serialisable: {exc}"
+            f"{target}: {name} is not JSON-serialisable: {exc}"
         ) from exc
     if not isinstance(converted, dict):
         raise ArtifactIntegrityError(
-            f"{target}: functionals meta must be a JSON object, "
-            f"got {type(converted).__name__}"
+            f"{target}: {name} must be a JSON object, got {type(converted).__name__}"
         )
     return converted
 
@@ -997,3 +1036,1064 @@ def load_functionals(path: str | os.PathLike[str]) -> Functionals:
             raise ArtifactIntegrityError(
                 f"{target}: stored functionals violate the Functionals contract: {exc}"
             ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Fit serialisation (plan §5.1, §6.1)
+# ---------------------------------------------------------------------------
+
+#: File names of one per-fit artifact directory (plan §5).
+_FIT_META_NAME = "fit-meta.json"
+_FUNCTIONALS_NAME = "functionals.npz"
+_PRIOR_BAND_NAME = "prior-band.npz"
+_CHAIN_NAME = "chain-{index}.npz"
+
+#: Section-level file names (plan §5): the section ``meta.json`` and the
+#: directory holding one fit directory per fit.
+_DEMO_META_NAME = "meta.json"
+_DRAWS_DIR = "draws"
+
+#: Keys of one ``fit-meta.json``.  The shape/dtype records and the two meta
+#: dicts are the plan §5.1 field list; ``extra`` holds caller provenance
+#: (timings, chain seeds) verbatim, so a new provenance key never forces a
+#: schema bump.
+_FIT_META_KEYS = frozenset(
+    {
+        "schema_version",
+        "label",
+        "arm",
+        "prior",
+        "settings",
+        "data_seed",
+        "shared_t_max",
+        "n_chains",
+        "n_draws",
+        "t_grid",
+        "chains",
+        "functionals",
+        "prior_band",
+        "functionals_meta",
+        "prior_band_meta",
+        "extra",
+    }
+)
+
+#: One archive record inside ``fit-meta.json``: a file name, the array dtype
+#: and the shape.  The dtype is recorded rather than inferred so a loader can
+#: report a disagreement between an archive and its metadata in the schema's
+#: own terms.
+_FIT_ARRAY_KEYS = frozenset({"path", "dtype", "shape"})
+
+#: ``t_grid`` record: point count and both endpoints.  The full grid is
+#: rebuilt from the archives and checked against these three numbers, so
+#: ``fit-meta.json`` stays readable instead of holding 300 floats.
+_FIT_GRID_KEYS = frozenset({"size", "first", "last"})
+
+#: ``save_fit`` metadata keys that are lifted into the fixed part of
+#: ``fit-meta.json``; every other key is stored under ``extra``.
+_FIT_META_RESERVED = frozenset({"arm", "data_seed", "shared_t_max"})
+
+#: Keys of the section ``meta.json``.  ``fit_keys`` records the driver's fit
+#: order, which a JSON object of fits would lose.
+_DEMO_META_KEYS = frozenset({"schema_version", "label", "fit_keys", "meta"})
+
+#: ``"A: nu ~ Gamma(2, 0.9)"`` -> arm ``"A"``, label ``"nu ~ Gamma(2, 0.9)"``.
+_ARM_KEY = re.compile(r"^([A-Za-z][A-Za-z0-9]*): (.+)$")
+
+
+@dataclass(frozen=True)
+class _FitMetadata:
+    """Validated contents of one ``fit-meta.json`` (internal)."""
+
+    directory: Path
+    path: Path
+    label: str
+    arm: str | None
+    prior: DPPrior
+    settings: DPSettings
+    data_seed: int | None
+    shared_t_max: float | None
+    n_chains: int
+    n_draws: int
+    n_grid: int
+    grid_first: float
+    grid_last: float
+    chains: tuple[tuple[str, tuple[int, ...]], ...]
+    functionals: tuple[str, tuple[int, ...]]
+    prior_band: tuple[str, tuple[int, ...]] | None
+    functionals_meta: dict[str, Any]
+    prior_band_meta: dict[str, Any] | None
+    extra: dict[str, Any]
+
+
+def _write_json(path: str | os.PathLike[str], payload: Any) -> Path:
+    """Write one JSON artifact atomically.
+
+    Same contract as :func:`atomic_savez`: write ``<path>.tmp``, flush,
+    ``fsync``, close, then :func:`os.replace`.  A crash leaves either the old
+    file or the new one, never a half-written ``fit-meta.json`` that a loader
+    would have to interpret.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        text = json.dumps(payload, sort_keys=True, indent=2) + "\n"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _read_json_object(path: str | os.PathLike[str], *, kind: str) -> Any:
+    """Read a JSON file, naming it in every failure mode."""
+    target = Path(path)
+    if not target.exists():
+        raise ArtifactError(f"artifact does not exist: {target}")
+    if not target.is_file():
+        raise ArtifactError(f"artifact is not a file: {target}")
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ArtifactIntegrityError(f"{target}: cannot read {kind}: {exc}") from exc
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ArtifactIntegrityError(
+            f"{target}: {kind} is not valid JSON: {exc}"
+        ) from exc
+
+
+def _as_optional_int(
+    value: Any, name: str, target: Path, *, minimum: int = 0
+) -> int | None:
+    """Validate an integer metadata value that may be ``null``."""
+    if value is None:
+        return None
+    return _as_meta_int(value, name, target, minimum=minimum)
+
+
+def _as_optional_float(value: Any, name: str, target: Path) -> float | None:
+    """Validate a finite numeric metadata value that may be ``null``."""
+    if value is None:
+        return None
+    return float(_as_meta_number(value, name, target))
+
+
+def _as_label(value: Any, name: str, target: Path) -> str:
+    """Validate the un-slugged label (the key ``DemoResult.fits`` uses)."""
+    if not isinstance(value, str) or not value:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} must be a non-empty string, got {value!r}"
+        )
+    return value
+
+
+def _as_arm(value: Any, name: str, target: Path) -> str | None:
+    """Validate the optional arm prefix (``"A"``/``"B"`` in §5.2)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} must be a non-empty string or null, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _member_path(directory: Path, name: Any, *, field: str, target: Path) -> Path:
+    """Resolve a recorded file name inside ``directory``.
+
+    Only a plain file name is accepted: an absolute path, a parent reference or
+    a nested path would let a tampered ``fit-meta.json`` point a loader outside
+    the fit directory it belongs to.
+    """
+    if not isinstance(name, str) or not name:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {field!r} must record a non-empty file name, "
+            f"got {name!r}"
+        )
+    candidate = Path(name)
+    if candidate.name != name or name in {".", ".."}:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {field!r} must name a file inside the fit "
+            f"directory, got {name!r}"
+        )
+    return directory / name
+
+
+def _array_record(
+    value: Any, name: str, target: Path, *, ndim: int
+) -> tuple[str, tuple[int, ...]]:
+    """Validate one ``{"path", "dtype", "shape"}`` archive record."""
+    record = _require_record(value, _FIT_ARRAY_KEYS, name, target)
+    path = _member_path(Path("."), record["path"], field=f"{name}.path", target=target)
+    dtype = record["dtype"]
+    if dtype != "float64":
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} records dtype {dtype!r}, expected 'float64'"
+        )
+    shape = record["shape"]
+    if not isinstance(shape, list) or len(shape) != ndim:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field {name!r} shape must be a list of {ndim} "
+            f"integers, got {shape!r}"
+        )
+    dims: list[int] = []
+    for dim in shape:
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+            raise ArtifactIntegrityError(
+                f"{target}: meta field {name!r} shape must hold positive "
+                f"integers, got {shape!r}"
+            )
+        dims.append(int(dim))
+    return path.name, tuple(dims)
+
+
+def _grid_record(value: Any, target: Path) -> tuple[int, float, float]:
+    """Validate the readable ``t_grid`` summary stored in ``fit-meta.json``."""
+    record = _require_record(value, _FIT_GRID_KEYS, "t_grid", target)
+    size = _as_meta_int(record["size"], "t_grid.size", target, minimum=1)
+    first = float(_as_meta_number(record["first"], "t_grid.first", target))
+    last = float(_as_meta_number(record["last"], "t_grid.last", target))
+    if first <= 0.0 or last <= 0.0:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field 't_grid' endpoints must be strictly positive, "
+            f"got {first!r} and {last!r}"
+        )
+    return size, first, last
+
+
+def _chain_records(
+    value: Any, *, n_chains: int, n_save: int, target: Path
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Validate the per-chain archive records of one fit."""
+    if not isinstance(value, list):
+        raise ArtifactIntegrityError(
+            f"{target}: meta field 'chains' must be a list, got {type(value).__name__}"
+        )
+    if len(value) != n_chains:
+        raise ArtifactIntegrityError(
+            f"{target}: meta field 'chains' lists {len(value)} files, "
+            f"expected {n_chains}"
+        )
+    records: list[tuple[str, tuple[int, ...]]] = []
+    for index, item in enumerate(value):
+        name, shape = _array_record(item, f"chains[{index}]", target, ndim=3)
+        if shape[0] != n_save or shape[2] != 2:
+            raise ArtifactIntegrityError(
+                f"{target}: meta field 'chains[{index}]' shape {shape} "
+                f"disagrees with (n_save, n, 2) = ({n_save}, n, 2)"
+            )
+        if records and shape[1] != records[0][1][1]:
+            raise ArtifactIntegrityError(
+                f"{target}: meta field 'chains[{index}]' shape {shape} has a "
+                f"different observation count than chains[0] "
+                f"({records[0][1][0]} rows)"
+            )
+        records.append((name, shape))
+    return tuple(records)
+
+
+def _meta_digest(value: Any) -> str:
+    """Canonical comparison form of a metadata dict.
+
+    JSON turns a tuple into a list, so comparing the reconstructed dict with
+    the recorded one must compare their JSON forms; the sorted dump also makes
+    a non-finite float (``NaN != NaN``) compare equal to itself, which keeps
+    the verbatim round-trip check honest instead of accidentally strict.
+    """
+    try:
+        return json.dumps(_jsonable(value), sort_keys=True)
+    except ArtifactError:  # pragma: no cover - validated before comparison
+        return repr(value)
+
+
+def _same_dataset(left: SurvData, right: SurvData) -> bool:
+    """True when two chains were fitted to the same stored dataset."""
+    return (
+        float(left.t_max) == float(right.t_max)
+        and np.array_equal(left.time, right.time)
+        and np.array_equal(left.event, right.event)
+    )
+
+
+def _split_fit_key(key: str) -> tuple[str | None, str]:
+    """Split a ``DemoResult.fits`` key into ``(arm, label)``.
+
+    ``"nu ~ Gamma(2, 0.9)"`` has no arm (§5.1); ``"A: nu ~ Gamma(2, 0.9)"``
+    does (§5.2).  The label half must equal ``Fit.label``, which is what keeps
+    the un-slugged label recoverable from ``fit-meta.json``.
+    """
+    match = _ARM_KEY.match(key)
+    if match is None:
+        return None, key
+    return match.group(1), match.group(2)
+
+
+def _fit_directory_name(arm: str | None, label: str) -> str:
+    """The plan §5 fit directory name: ``A-<slug>`` or just ``<slug>``."""
+    return f"{arm}-{slug(label)}" if arm else slug(label)
+
+
+def _fit_provenance(
+    meta: Mapping[str, Any] | None, target: Path
+) -> tuple[str | None, int | None, float | None, dict[str, Any]]:
+    """Split ``save_fit``'s metadata into its typed keys and ``extra``."""
+    if meta is None:
+        meta = {}
+    if not isinstance(meta, Mapping):
+        raise ArtifactError(f"fit meta must be a mapping, got {type(meta).__name__}")
+    arm = meta.get("arm")
+    if arm is not None and (not isinstance(arm, str) or not arm):
+        raise ArtifactError(
+            f"fit meta 'arm' must be a non-empty string or None, got {arm!r}"
+        )
+    raw_seed = meta.get("data_seed")
+    data_seed: int | None = None
+    if raw_seed is not None:
+        if (
+            isinstance(raw_seed, bool)
+            or not isinstance(raw_seed, (int, np.integer))
+            or int(raw_seed) < 0
+        ):
+            raise ArtifactError(
+                f"fit meta 'data_seed' must be a non-negative integer or None, "
+                f"got {raw_seed!r}"
+            )
+        data_seed = int(raw_seed)
+    shared_t_max = meta.get("shared_t_max")
+    resolved_shared: float | None = None
+    if shared_t_max is not None:
+        try:
+            shared_value = float(shared_t_max)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactError(
+                f"fit meta 'shared_t_max' must be a number or None, "
+                f"got {shared_t_max!r}"
+            ) from exc
+        if not np.isfinite(shared_value) or shared_value <= 0.0:
+            raise ArtifactError(
+                f"fit meta 'shared_t_max' must be finite and positive, "
+                f"got {shared_t_max!r}"
+            )
+        resolved_shared = shared_value
+    extra = {key: value for key, value in meta.items() if key not in _FIT_META_RESERVED}
+    try:
+        converted = _jsonable(extra)
+    except ArtifactError as exc:
+        raise ArtifactError(f"fit meta is not JSON-serialisable: {exc}") from exc
+    if not isinstance(converted, dict):  # pragma: no cover - extra is a dict
+        raise ArtifactError("fit meta 'extra' must be a JSON object")
+    return arm, data_seed, resolved_shared, converted
+
+
+def save_fit(
+    directory: str | os.PathLike[str],
+    fit: Fit,
+    *,
+    meta: Mapping[str, Any] | None = None,
+) -> Path:
+    """Write one :class:`Fit` into a self-contained per-fit directory.
+
+    Layout (plan §5)::
+
+        <directory>/
+          chain-0.npz ... chain-<B-1>.npz
+          functionals.npz
+          prior-band.npz        # only when fit.prior_band is set
+          fit-meta.json         # written last
+
+    ``fit-meta.json`` records the **un-slugged** ``fit.label`` (the directory
+    name is only a slug), the ``arm``, the seven prior scalars, the eight
+    settings knobs, the dataset seed and shared ``t_max``, the readable
+    ``t_grid`` summary, the archive dtype/shape records, and the posterior and
+    prior-band meta dicts **verbatim**.  ``meta`` supplies the provenance the
+    fit itself does not hold (``arm``, ``data_seed``, ``shared_t_max``) and any
+    other JSON values (timings, chain seeds), which are stored under
+    ``extra``.
+
+    The metadata file is written last and atomically: a crashed save leaves
+    chain/functional archives without a ``fit-meta.json``, so :func:`load_fit`
+    rejects the directory instead of reconstructing a half-written fit.  A
+    re-save removes a stale ``prior-band.npz`` and stale ``chain-*.npz`` files
+    from an earlier, longer fit so the directory never holds unlisted arrays.
+
+    Parameters
+    ----------
+    directory:
+        Destination fit directory.  Missing parents are created.
+    fit:
+        The fit to store.  It is not mutated.
+    meta:
+        Provenance mapping.  ``arm`` is a non-empty string or ``None``,
+        ``data_seed`` a non-negative integer or ``None``, ``shared_t_max`` a
+        positive finite number or ``None`` (defaults to ``fit.data.t_max``).
+
+    Returns
+    -------
+    pathlib.Path
+        The directory actually written.
+
+    Raises
+    ------
+    ArtifactError
+        If ``fit`` is not a :class:`Fit`, its chains, dataset, prior, settings,
+        grid or meta dicts disagree with each other, a chain's ``theta`` is not
+        ``float64``, or ``meta`` holds a value with no JSON form.
+    """
+    from src.paper_examples import Fit as FitType
+
+    if not isinstance(fit, FitType):
+        raise ArtifactError(f"save_fit expects a Fit, got {type(fit).__name__}")
+    target = Path(directory)
+    arm, data_seed, shared_t_max, extra = _fit_provenance(meta, target)
+    if not isinstance(fit.label, str) or not fit.label:
+        raise ArtifactError(f"fit label must be a non-empty string, got {fit.label!r}")
+    label = fit.label
+    grid = _validated_t_grid(fit.t_grid)
+    if not isinstance(fit.prior, DPPrior):
+        raise ArtifactError(
+            f"fit.prior must be a DPPrior, got {type(fit.prior).__name__}"
+        )
+    if not isinstance(fit.data, SurvData):
+        raise ArtifactError(
+            f"fit.data must be a SurvData, got {type(fit.data).__name__}"
+        )
+    if not fit.chains:
+        raise ArtifactError("a fit must hold at least one chain")
+    first = fit.chains[0]
+    if not isinstance(first, DPChains):
+        raise ArtifactError(f"fit chains must be DPChains, got {type(first).__name__}")
+    settings = first.settings
+    if settings.n_chains != len(fit.chains):
+        raise ArtifactError(
+            f"fit holds {len(fit.chains)} chains but its settings declare "
+            f"{settings.n_chains}"
+        )
+    for index, chain in enumerate(fit.chains):
+        if not isinstance(chain, DPChains):
+            raise ArtifactError(
+                f"fit chains must be DPChains, got {type(chain).__name__}"
+            )
+        if chain.prior != fit.prior:
+            raise ArtifactError(f"chain {index} prior disagrees with fit.prior")
+        if chain.settings != settings:
+            raise ArtifactError(
+                f"chain {index} settings disagree with chain 0's settings"
+            )
+        if not _same_dataset(chain.data, fit.data):
+            raise ArtifactError(f"chain {index} dataset disagrees with fit.data")
+        if chain.theta.dtype != np.dtype(np.float64):
+            raise ArtifactError(
+                f"chain {index} theta has dtype {chain.theta.dtype}, expected float64"
+            )
+    n_draws = int(settings.n_save) * len(fit.chains)
+
+    functionals = fit.functionals
+    if not isinstance(functionals, Functionals):
+        raise ArtifactError(
+            f"fit.functionals must be a Functionals, got {type(functionals).__name__}"
+        )
+    if not np.array_equal(functionals.t_grid, grid):
+        raise ArtifactError("fit.functionals.t_grid disagrees with fit.t_grid")
+    if functionals.n_draws != n_draws:
+        raise ArtifactError(
+            f"fit.functionals holds {functionals.n_draws} draws, expected "
+            f"{n_draws} (n_chains * n_save)"
+        )
+    try:
+        _check_functional_arrays(
+            {name: getattr(functionals, name) for name in _FUNCTIONAL_ARRAY_FIELDS},
+            grid,
+            target,
+        )
+        functionals_meta = _require_jsonable_meta(functionals.meta, target)
+    except ArtifactIntegrityError as exc:
+        raise ArtifactError(
+            f"functionals are outside the artifact schema: {exc}"
+        ) from exc
+
+    band = fit.prior_band
+    band_record: dict[str, Any] | None = None
+    band_meta: dict[str, Any] | None = None
+    if band is not None:
+        if not isinstance(band, Functionals):
+            raise ArtifactError(
+                f"fit.prior_band must be a Functionals or None, "
+                f"got {type(band).__name__}"
+            )
+        if not np.array_equal(band.t_grid, grid):
+            raise ArtifactError("fit.prior_band.t_grid disagrees with fit.t_grid")
+        try:
+            _check_functional_arrays(
+                {name: getattr(band, name) for name in _FUNCTIONAL_ARRAY_FIELDS},
+                grid,
+                target,
+            )
+            band_meta = _require_jsonable_meta(band.meta, target)
+        except ArtifactIntegrityError as exc:
+            raise ArtifactError(
+                f"prior band is outside the artifact schema: {exc}"
+            ) from exc
+
+    if shared_t_max is None:
+        shared_t_max = float(fit.data.t_max)
+
+    target.mkdir(parents=True, exist_ok=True)
+    # A re-save into a longer fit's directory must not leave unlisted arrays
+    # behind: the manifest hashes every file it finds, so a stale chain or band
+    # would look like part of the fit.
+    for stale in target.glob("chain-*.npz"):
+        match = re.fullmatch(r"chain-(\d+)\.npz", stale.name)
+        if match is None or int(match.group(1)) >= len(fit.chains):
+            stale.unlink()
+    if band is None:
+        (target / _PRIOR_BAND_NAME).unlink(missing_ok=True)
+
+    chain_records: list[dict[str, Any]] = []
+    for index, chain in enumerate(fit.chains):
+        name = _CHAIN_NAME.format(index=index)
+        save_chain(
+            target / name,
+            chain,
+            t_grid=grid,
+            label=label,
+            chain_index=index,
+        )
+        chain_records.append(
+            {
+                "path": name,
+                "dtype": "float64",
+                "shape": [int(dim) for dim in chain.theta.shape],
+            }
+        )
+
+    save_functionals(target / _FUNCTIONALS_NAME, functionals)
+    if band is not None:
+        save_functionals(target / _PRIOR_BAND_NAME, band)
+        band_record = {
+            "path": _PRIOR_BAND_NAME,
+            "dtype": "float64",
+            "shape": [int(dim) for dim in band.S.shape],
+        }
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "label": label,
+        "arm": arm,
+        "prior": {name: _jsonable(getattr(fit.prior, name)) for name in _PRIOR_FIELDS},
+        "settings": {
+            name: _jsonable(getattr(settings, name)) for name in _SETTINGS_FIELDS
+        },
+        "data_seed": data_seed,
+        "shared_t_max": shared_t_max,
+        "n_chains": len(fit.chains),
+        "n_draws": n_draws,
+        "t_grid": {
+            "size": int(grid.size),
+            "first": float(grid[0]),
+            "last": float(grid[-1]),
+        },
+        "chains": chain_records,
+        "functionals": {
+            "path": _FUNCTIONALS_NAME,
+            "dtype": "float64",
+            "shape": [n_draws, int(grid.size)],
+        },
+        "prior_band": band_record,
+        "functionals_meta": functionals_meta,
+        "prior_band_meta": band_meta,
+        "extra": extra,
+    }
+    _write_json(target / _FIT_META_NAME, payload)
+    return target
+
+
+def _read_fit_meta(directory: str | os.PathLike[str]) -> _FitMetadata:
+    """Read and validate ``fit-meta.json`` without loading any array."""
+    target = Path(directory)
+    if not target.exists():
+        raise ArtifactError(f"artifact does not exist: {target}")
+    if not target.is_dir():
+        raise ArtifactError(f"artifact is not a directory: {target}")
+    path = target / _FIT_META_NAME
+    record = _read_json_object(path, kind="fit metadata")
+    record = _require_record(record, _FIT_META_KEYS, "fit metadata", path)
+
+    version = _as_meta_int(record["schema_version"], "schema_version", path, minimum=1)
+    if version != SCHEMA_VERSION:
+        raise ArtifactIntegrityError(
+            f"{path}: schema version {version} is not the supported "
+            f"version {SCHEMA_VERSION} (no migration path)"
+        )
+    label = _as_label(record["label"], "label", path)
+    arm = _as_arm(record["arm"], "arm", path)
+    prior = _prior_from_record(record["prior"], path)
+    settings = _settings_from_record(record["settings"], path)
+    data_seed = _as_optional_int(record["data_seed"], "data_seed", path)
+    shared_t_max = _as_optional_float(record["shared_t_max"], "shared_t_max", path)
+    if shared_t_max is not None and shared_t_max <= 0.0:
+        raise ArtifactIntegrityError(
+            f"{path}: meta field 'shared_t_max' must be strictly positive, "
+            f"got {shared_t_max!r}"
+        )
+    n_chains = _as_meta_int(record["n_chains"], "n_chains", path, minimum=1)
+    n_draws = _as_meta_int(record["n_draws"], "n_draws", path, minimum=1)
+    if n_chains != settings.n_chains:
+        raise ArtifactIntegrityError(
+            f"{path}: meta field 'n_chains' ({n_chains}) disagrees with "
+            f"settings.n_chains ({settings.n_chains})"
+        )
+    expected_draws = int(settings.n_chains) * int(settings.n_save)
+    if n_draws != expected_draws:
+        raise ArtifactIntegrityError(
+            f"{path}: meta field 'n_draws' ({n_draws}) is not "
+            f"n_chains * n_save ({expected_draws})"
+        )
+    n_grid, grid_first, grid_last = _grid_record(record["t_grid"], path)
+    chains = _chain_records(
+        record["chains"],
+        n_chains=n_chains,
+        n_save=int(settings.n_save),
+        target=path,
+    )
+    func_name, func_shape = _array_record(
+        record["functionals"], "functionals", path, ndim=2
+    )
+    if func_shape != (n_draws, n_grid):
+        raise ArtifactIntegrityError(
+            f"{path}: meta field 'functionals' shape {func_shape} disagrees "
+            f"with (n_draws, n_grid) = {(n_draws, n_grid)}"
+        )
+
+    raw_band = record["prior_band"]
+    raw_band_meta = record["prior_band_meta"]
+    if raw_band is None:
+        if raw_band_meta is not None:
+            raise ArtifactIntegrityError(
+                f"{path}: meta field 'prior_band_meta' is set but 'prior_band' is null"
+            )
+        band: tuple[str, tuple[int, ...]] | None = None
+        band_meta: dict[str, Any] | None = None
+    else:
+        if raw_band_meta is None:
+            raise ArtifactIntegrityError(
+                f"{path}: meta field 'prior_band' is set but 'prior_band_meta' is null"
+            )
+        band_name, band_shape = _array_record(raw_band, "prior_band", path, ndim=2)
+        if band_shape[1] != n_grid:
+            raise ArtifactIntegrityError(
+                f"{path}: meta field 'prior_band' shape {band_shape} disagrees "
+                f"with the fit's {n_grid}-point t_grid"
+            )
+        band = (band_name, band_shape)
+        band_meta = _require_jsonable_meta(
+            raw_band_meta, path, name="fit metadata 'prior_band_meta'"
+        )
+
+    return _FitMetadata(
+        directory=target,
+        path=path,
+        label=label,
+        arm=arm,
+        prior=prior,
+        settings=settings,
+        data_seed=data_seed,
+        shared_t_max=shared_t_max,
+        n_chains=n_chains,
+        n_draws=n_draws,
+        n_grid=n_grid,
+        grid_first=grid_first,
+        grid_last=grid_last,
+        chains=chains,
+        functionals=(func_name, func_shape),
+        prior_band=band,
+        functionals_meta=_require_jsonable_meta(
+            record["functionals_meta"], path, name="fit metadata 'functionals_meta'"
+        ),
+        prior_band_meta=band_meta,
+        extra=_require_jsonable_meta(
+            record["extra"], path, name="fit metadata 'extra'"
+        ),
+    )
+
+
+def _load_fit_from_meta(meta: _FitMetadata) -> Fit:
+    """Load the archives of an already-validated fit directory."""
+    from src.paper_examples import Fit as FitType
+
+    target = meta.directory
+    chains: list[DPChains] = []
+    grid: np.ndarray | None = None
+    data: SurvData | None = None
+    for index, (name, shape) in enumerate(meta.chains):
+        path = _member_path(target, name, field=f"chains[{index}]", target=meta.path)
+        chain, chain_grid = _load_chain_with_grid(path)
+        if list(chain.theta.shape) != list(shape):
+            raise ArtifactIntegrityError(
+                f"{path}: theta shape {chain.theta.shape} disagrees with the "
+                f"fit metadata shape {shape}"
+            )
+        if chain.prior != meta.prior:
+            raise ArtifactIntegrityError(
+                f"{path}: stored prior disagrees with fit-meta.json"
+            )
+        if chain.settings != meta.settings:
+            raise ArtifactIntegrityError(
+                f"{path}: stored settings disagree with fit-meta.json"
+            )
+        if grid is None:
+            grid = chain_grid
+            data = chain.data
+        else:
+            if not np.array_equal(chain_grid, grid):
+                raise ArtifactIntegrityError(f"{path}: t_grid disagrees with chains[0]")
+            if not _same_dataset(chain.data, data):  # type: ignore[arg-type]
+                raise ArtifactIntegrityError(
+                    f"{path}: dataset disagrees with chains[0]"
+                )
+        chains.append(chain)
+    if grid is None or data is None:  # pragma: no cover - n_chains >= 1
+        raise ArtifactIntegrityError(f"{meta.path}: fit records no chains")
+    if (
+        int(grid.size) != meta.n_grid
+        or float(grid[0]) != meta.grid_first
+        or float(grid[-1]) != meta.grid_last
+    ):
+        raise ArtifactIntegrityError(
+            f"{target}: stored t_grid ({grid.size} points, "
+            f"[{float(grid[0])!r}, {float(grid[-1])!r}]) disagrees with "
+            f"fit-meta.json ({meta.n_grid} points, "
+            f"[{meta.grid_first!r}, {meta.grid_last!r}])"
+        )
+
+    func_path = _member_path(
+        target, meta.functionals[0], field="functionals", target=meta.path
+    )
+    functionals = load_functionals(func_path)
+    if functionals.S.shape != meta.functionals[1]:
+        raise ArtifactIntegrityError(
+            f"{func_path}: shape {functionals.S.shape} disagrees with the fit "
+            f"metadata shape {meta.functionals[1]}"
+        )
+    if not np.array_equal(functionals.t_grid, grid):
+        raise ArtifactIntegrityError(
+            f"{func_path}: t_grid disagrees with the chains' t_grid"
+        )
+    if _meta_digest(functionals.meta) != _meta_digest(meta.functionals_meta):
+        raise ArtifactIntegrityError(
+            f"{func_path}: metadata disagrees with fit-meta.json 'functionals_meta'"
+        )
+
+    band: Functionals | None = None
+    if meta.prior_band is not None:
+        band_path = _member_path(
+            target, meta.prior_band[0], field="prior_band", target=meta.path
+        )
+        band = load_functionals(band_path)
+        if band.S.shape != meta.prior_band[1]:
+            raise ArtifactIntegrityError(
+                f"{band_path}: shape {band.S.shape} disagrees with the fit "
+                f"metadata shape {meta.prior_band[1]}"
+            )
+        if not np.array_equal(band.t_grid, grid):
+            raise ArtifactIntegrityError(
+                f"{band_path}: t_grid disagrees with the chains' t_grid"
+            )
+        if _meta_digest(band.meta) != _meta_digest(meta.prior_band_meta):
+            raise ArtifactIntegrityError(
+                f"{band_path}: metadata disagrees with fit-meta.json 'prior_band_meta'"
+            )
+    else:
+        stray = target / _PRIOR_BAND_NAME
+        if stray.exists():
+            raise ArtifactIntegrityError(
+                f"{stray}: unlisted prior band (fit-meta.json records none)"
+            )
+
+    return FitType(
+        label=meta.label,
+        data=data,
+        prior=meta.prior,
+        t_grid=functionals.t_grid,
+        chains=chains,
+        functionals=functionals,
+        prior_band=band,
+    )
+
+
+def load_fit(directory: str | os.PathLike[str]) -> Fit:
+    """Load a fit directory written by :func:`save_fit`.
+
+    ``fit-meta.json`` is validated first -- schema version, every metadata
+    field, the recorded array shapes/dtypes against the settings, and the
+    recorded ``t_grid`` summary.  Then each archive is checked against its
+    record **and** its schema: chains must agree with the fit's prior, settings
+    and dataset, every chain must share one ``t_grid``, and the functional and
+    band arrays must hold one column per grid point.  A discrepancy between an
+    archive and its metadata is an :class:`ArtifactIntegrityError` naming the
+    file, never a silently reconstructed fit.
+
+    The prior band is attached only when ``fit-meta.json`` records one and the
+    band file is present; a recorded-but-missing band and an unlisted band file
+    are both errors.
+
+    Raises
+    ------
+    ArtifactError
+        If ``directory`` is missing, is not a directory, or has no
+        ``fit-meta.json``.
+    ArtifactIntegrityError
+        If the metadata or any archive disagrees with the declared schema.
+    """
+    return _load_fit_from_meta(_read_fit_meta(directory))
+
+
+# ---------------------------------------------------------------------------
+# Demo-result serialisation (plan §5, §6.1)
+# ---------------------------------------------------------------------------
+
+
+def _restore_demo_meta(meta: dict[str, Any], target: Path) -> dict[str, Any]:
+    """Rebuild ``DemoResult.meta`` with the types the driver produced.
+
+    JSON has no tuples and stores every number as a float or int, so the
+    fields the paper preconditions compare are restored explicitly:
+    ``prior_indices`` becomes a tuple of ints and the ``t_max`` values become
+    floats.  ``seed``/``data_seed`` stay int-or-``None`` so a run started from
+    the default seed is not turned into ``0``.
+    """
+    restored = dict(meta)
+    if "prior_indices" in restored:
+        value = restored["prior_indices"]
+        if not isinstance(value, list):
+            raise ArtifactIntegrityError(
+                f"{target}: meta field 'prior_indices' must be a list, got {value!r}"
+            )
+        indices: list[int] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise ArtifactIntegrityError(
+                    f"{target}: meta field 'prior_indices' must hold "
+                    f"non-negative integers, got {value!r}"
+                )
+            indices.append(int(item))
+        restored["prior_indices"] = tuple(indices)
+    for name in ("t_max", "t_max_a", "t_max_b"):
+        if name in restored and restored[name] is not None:
+            restored[name] = float(
+                _as_meta_number(restored[name], f"meta.{name}", target)
+            )
+    for name in ("seed", "data_seed"):
+        if name in restored:
+            restored[name] = _as_optional_int(restored[name], f"meta.{name}", target)
+    return restored
+
+
+def save_demo_result(directory: str | os.PathLike[str], result: DemoResult) -> Path:
+    """Write one :class:`DemoResult` as a section directory (plan §5).
+
+    ``<directory>/meta.json`` holds the section label, the fit keys in the
+    driver's order and ``result.meta`` verbatim; ``<directory>/draws/`` holds
+    one :func:`save_fit` directory per fit, named ``<arm>-<slug(label)>``.  No
+    figures are written: plan R7 makes the report stage the only figure writer.
+
+    The section ``meta.json`` is written **after** every fit, so a crashed
+    save never produces a section that claims fits it does not hold.  A fit
+    key of the form ``"A: <label>"`` becomes the ``A-`` prefix and records
+    ``arm="A"``; a bare key is the §5.1 form and records ``arm=None``.
+
+    Raises
+    ------
+    ArtifactError
+        If ``result`` is not a :class:`DemoResult`, a key disagrees with its
+        fit's label, two keys map to the same directory, or its meta dict has
+        no JSON form.
+    """
+    from src.paper_examples import DemoResult as DemoResultType
+
+    if not isinstance(result, DemoResultType):
+        raise ArtifactError(
+            f"save_demo_result expects a DemoResult, got {type(result).__name__}"
+        )
+    target = Path(directory)
+    if not isinstance(result.label, str) or not result.label:
+        raise ArtifactError(
+            f"demo label must be a non-empty string, got {result.label!r}"
+        )
+    label = result.label
+    if not isinstance(result.meta, Mapping):
+        raise ArtifactError(
+            f"demo meta must be a mapping, got {type(result.meta).__name__}"
+        )
+    try:
+        section_meta = _jsonable(dict(result.meta))
+    except ArtifactError as exc:
+        raise ArtifactError(f"demo meta is not JSON-serialisable: {exc}") from exc
+    if not isinstance(section_meta, dict):  # pragma: no cover - dict in, dict out
+        raise ArtifactError("demo meta must be a JSON object")
+    data_seed = section_meta.get("data_seed")
+    if data_seed is not None and (
+        isinstance(data_seed, bool) or not isinstance(data_seed, int)
+    ):
+        raise ArtifactError(
+            f"demo meta 'data_seed' must be an integer or None, got {data_seed!r}"
+        )
+
+    # Validate the whole key set before writing anything, so a duplicate slug
+    # cannot leave a half-written section behind.
+    plan: list[tuple[str, str | None, str]] = []
+    directories: dict[str, str] = {}
+    for key, fit in result.fits.items():
+        if not isinstance(key, str) or not key:
+            raise ArtifactError(f"demo fit keys must be non-empty strings, got {key!r}")
+        arm, fit_label = _split_fit_key(key)
+        fit_label_attr = getattr(fit, "label", None)
+        if fit_label != fit_label_attr:
+            raise ArtifactError(
+                f"demo fit key {key!r} does not match the fit's label "
+                f"{fit_label_attr!r}"
+            )
+        name = _fit_directory_name(arm, fit_label)
+        if name in directories:
+            raise ArtifactError(
+                f"demo fit keys {directories[name]!r} and {key!r} both map to "
+                f"the directory {name!r}"
+            )
+        directories[name] = key
+        plan.append((key, arm, name))
+
+    fit_keys: list[str] = []
+    for key, arm, name in plan:
+        fit = result.fits[key]
+        save_fit(
+            target / _DRAWS_DIR / name,
+            fit,
+            meta={
+                "arm": arm,
+                "data_seed": data_seed,
+                "shared_t_max": float(fit.data.t_max),
+            },
+        )
+        fit_keys.append(key)
+
+    _write_json(
+        target / _DEMO_META_NAME,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "label": label,
+            "fit_keys": fit_keys,
+            "meta": section_meta,
+        },
+    )
+    return target
+
+
+def load_demo_result(directory: str | os.PathLike[str]) -> DemoResult:
+    """Load a section directory written by :func:`save_demo_result`.
+
+    The section ``meta.json`` names the fits and their order; every named
+    directory is loaded with :func:`load_fit` and its recorded ``label``/``arm``
+    must match the key it is filed under.  A fit directory that the section
+    metadata does not name is an error, so a reviewer can trust that
+    ``result.fits`` is the whole tree.
+
+    ``DemoResult.meta`` is reconstructed with its original types --
+    ``prior_indices`` as a tuple, ``seed``/``data_seed`` as int or ``None``,
+    ``t_max`` as floats -- and ``figures`` is empty, because plan R7 moves
+    figures to the report stage.
+
+    Raises
+    ------
+    ArtifactError
+        If ``directory`` is missing, is not a directory, or has no
+        ``meta.json``.
+    ArtifactIntegrityError
+        If a fit disagrees with the section metadata or its own schema.
+    """
+    from src.paper_examples import DemoResult as DemoResultType
+
+    target = Path(directory)
+    if not target.exists():
+        raise ArtifactError(f"artifact does not exist: {target}")
+    if not target.is_dir():
+        raise ArtifactError(f"artifact is not a directory: {target}")
+    meta_path = target / _DEMO_META_NAME
+    record = _read_json_object(meta_path, kind="section metadata")
+    record = _require_record(record, _DEMO_META_KEYS, "section metadata", meta_path)
+
+    version = _as_meta_int(
+        record["schema_version"], "schema_version", meta_path, minimum=1
+    )
+    if version != SCHEMA_VERSION:
+        raise ArtifactIntegrityError(
+            f"{meta_path}: schema version {version} is not the supported "
+            f"version {SCHEMA_VERSION} (no migration path)"
+        )
+    label = _as_label(record["label"], "label", meta_path)
+    raw_keys = record["fit_keys"]
+    if not isinstance(raw_keys, list):
+        raise ArtifactIntegrityError(
+            f"{meta_path}: meta field 'fit_keys' must be a list, "
+            f"got {type(raw_keys).__name__}"
+        )
+    fit_keys: list[str] = []
+    for key in raw_keys:
+        if not isinstance(key, str) or not key:
+            raise ArtifactIntegrityError(
+                f"{meta_path}: meta field 'fit_keys' must hold non-empty "
+                f"strings, got {key!r}"
+            )
+        if key in fit_keys:
+            raise ArtifactIntegrityError(
+                f"{meta_path}: meta field 'fit_keys' lists {key!r} twice"
+            )
+        fit_keys.append(key)
+    section_meta = _require_jsonable_meta(
+        record["meta"], meta_path, name="section meta"
+    )
+
+    fits: dict[str, Fit] = {}
+    expected: dict[str, str] = {}
+    for key in fit_keys:
+        arm, fit_label = _split_fit_key(key)
+        name = _fit_directory_name(arm, fit_label)
+        if name in expected:
+            raise ArtifactIntegrityError(
+                f"{meta_path}: fit keys {expected[name]!r} and {key!r} both map "
+                f"to the directory {name!r}"
+            )
+        expected[name] = key
+        fit_meta = _read_fit_meta(target / _DRAWS_DIR / name)
+        if fit_meta.label != fit_label or fit_meta.arm != arm:
+            raise ArtifactIntegrityError(
+                f"{fit_meta.path}: label/arm ({fit_meta.label!r}, "
+                f"{fit_meta.arm!r}) disagree with the section key {key!r}"
+            )
+        fits[key] = _load_fit_from_meta(fit_meta)
+
+    draws = target / _DRAWS_DIR
+    if draws.exists():
+        # An empty run legitimately has no ``draws/``; if the directory exists,
+        # every entry must be a fit the section metadata names -- including the
+        # case of a section that names no fits at all.
+        if not draws.is_dir():
+            raise ArtifactError(f"artifact is not a directory: {draws}")
+        for child in sorted(draws.iterdir()):
+            if child.name not in expected:
+                raise ArtifactIntegrityError(
+                    f"{child}: unlisted fit directory (not named by {meta_path})"
+                )
+
+    return DemoResultType(
+        label=label,
+        fits=fits,
+        figures=(),
+        meta=_restore_demo_meta(section_meta, meta_path),
+    )

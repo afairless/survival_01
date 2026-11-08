@@ -1,4 +1,4 @@
-"""Plan §6.1: the artifact primitives and the chain round-trip.
+"""Plan §6.1: the artifact primitives and the chain/functional/fit/run round-trips.
 
 Step 1 of the replication-artifact plan introduces the pieces every later
 writer and loader share, so this module pins them in isolation:
@@ -57,6 +57,33 @@ field *before* ``DPChains`` is built.  The one-draw/one-grid-point and
 all-censored cases are covered here because this is the container that
 introduces them.
 
+Step 4 adds the two container round-trips the long runs are written with.
+``save_fit`` owns one directory whose ``fit-meta.json`` is the only place the
+**un-slugged** ``label`` and the ``arm`` survive -- the directory name is a
+slug -- and the tests pin both, together with the two ``meta`` dicts stored
+verbatim and the prior band that is re-attached only when its file is listed.
+Every loader check is exercised by tampering with a saved artifact: a
+transposed ``S``, a wrong draw count, a shape or dtype that drifted from
+``fit-meta.json``, a grid summary that disagrees with the stored grid, a
+recorded-but-missing band, an unlisted band, and a metadata path escaping the
+fit directory.  The writer's own contract is pinned too: a crash before
+``fit-meta.json`` leaves no readable fit, and a re-save removes a stale band or
+stale chain files instead of leaving arrays no loader would read.
+
+``save_demo_result``/``load_demo_result`` are the section-level pair.  The
+section ``meta.json`` keeps the fit keys in the driver's order and
+``DemoResult.meta`` verbatim; the loader restores the types JSON loses
+(``prior_indices`` back to a tuple, ``seed`` back to ``None``) because the
+paper preconditions compare ``run.meta`` against the in-memory dict.  A fit
+directory the section file does not name is rejected, so ``result.fits`` is the
+whole tree a manifest can hash.  The None/One ends are covered here too: no
+fits at all, one chain with one draw on a one-point grid, and an all-censored
+dataset.
+
+One integration test closes the loop the plan asks for: a ``quick``-preset
+§5.2 arm-A fit is saved, loaded back, and must still feed ``r_hat()``/``ess()``
+with bit-identical values while ``run.meta == result.meta``.
+
 The property-based tests use seeded NumPy generators; the repository has no
 Hypothesis dependency.  The inputs are random, the invariants are
 deterministic.
@@ -65,16 +92,19 @@ deterministic.
 import json
 import os
 import re
+import subprocess
+import sys
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 from src import paper_artifacts
-from src.dp_functionals import Functionals
-from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData
+from src.dp_functionals import Functionals, FunctionalSettings
+from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData, ess, r_hat
 from src.paper_artifacts import (
     SCHEMA_VERSION,
     ArtifactError,
@@ -82,10 +112,25 @@ from src.paper_artifacts import (
     _jsonable,
     atomic_savez,
     load_chain,
+    load_demo_result,
+    load_fit,
     load_functionals,
     save_chain,
+    save_demo_result,
+    save_fit,
     save_functionals,
     slug,
+)
+from src.paper_examples import (
+    SEED_5_2,
+    DemoResult,
+    Fit,
+    Preset,
+    data_5_2,
+    fit_dataset,
+    make_prior,
+    prior_band,
+    time_grid,
 )
 
 ALLOWED_SLUG = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -109,6 +154,36 @@ def test_integrity_error_is_an_artifact_error() -> None:
     """Callers may catch the base class; the integrity type refines it."""
     assert issubclass(ArtifactIntegrityError, ArtifactError)
     assert not issubclass(ArtifactError, ArtifactIntegrityError)
+
+
+def test_artifact_module_does_not_pull_in_matplotlib() -> None:
+    """Plan §6.1: the artifact I/O module is pure NumPy and the standard library.
+
+    ``Fit``/``DemoResult`` live in ``paper_examples``; the import is done inside
+    the fit/run functions, so importing this module must stay clear of
+    ``matplotlib`` (whose import in ``paper_examples`` is lazy anyway) and of an
+    import cycle with the driver.
+    """
+    code = "\n".join(
+        [
+            "import sys",
+            "import src.paper_artifacts",
+            "assert 'matplotlib' not in sys.modules, 'matplotlib was imported'",
+            "assert 'src.paper_examples' not in sys.modules, "
+            "       'paper_artifacts imported the driver at module scope'",
+            "print('ok')",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -1608,3 +1683,750 @@ def test_functionals_meta_property_round_trips_random_dicts(
         assert loaded.meta == {"provenance": expected}
         assert loaded.meta == _jsonable(meta)
         assert_functionals_equal(loaded, func)
+
+
+# ---------------------------------------------------------------------------
+# Fit round-trip (plan §5.1, §6.1)
+# ---------------------------------------------------------------------------
+
+#: The readable label the §5.1 driver records; the directory only holds its slug.
+FIT_LABEL = "nu ~ Gamma(2, 0.9)"
+
+
+def make_fit(
+    *,
+    n_chains: int = 2,
+    n_draws: int = 4,
+    n_grid: int = 5,
+    n: int = 6,
+    seed: int = 20240601,
+    event: np.ndarray | None = None,
+    label: str = FIT_LABEL,
+    with_band: bool = False,
+    band_draws: int = 3,
+    functionals_meta: dict[str, object] | None = None,
+    band_meta: dict[str, object] | None = None,
+) -> Fit:
+    """A small but internally consistent ``Fit`` (chains + functionals).
+
+    Every chain shares one prior, one settings record and one dataset, and the
+    functionals hold exactly ``n_chains * n_draws`` rows on the fit's grid --
+    the invariants ``save_fit`` checks before it writes anything.
+    """
+    chains = [
+        make_chain(
+            n_draws=n_draws,
+            n=n,
+            seed=seed + index,
+            event=event,
+            n_chains=n_chains,
+            settings_seed=seed,
+        )
+        for index in range(n_chains)
+    ]
+    grid = chain_grid(n_grid)
+    functionals = make_functionals(
+        n_draws=n_chains * n_draws,
+        n_grid=n_grid,
+        meta=functionals_meta,
+    )
+    functionals.t_grid = grid
+    band = None
+    if with_band:
+        band = make_functionals(
+            n_draws=band_draws,
+            n_grid=n_grid,
+            seed=20261118,
+            meta=band_meta if band_meta is not None else PRIOR_BAND_META,
+        )
+        band.t_grid = grid
+    return Fit(
+        label=label,
+        data=chains[0].data,
+        prior=chains[0].prior,
+        t_grid=grid,
+        chains=chains,
+        functionals=functionals,
+        prior_band=band,
+    )
+
+
+def saved_fit(
+    tmp_path: Path, *, name: str = "A-nu_Gamma_2_0.9", **kwargs: object
+) -> tuple[Fit, Path]:
+    """Save :func:`make_fit` into a plan-shaped per-fit directory."""
+    fit = make_fit(**kwargs)  # type: ignore[arg-type]
+    directory = tmp_path / "5.1" / "draws" / name
+    save_fit(directory, fit, meta={"arm": "A", "data_seed": 721383})
+    return fit, directory
+
+
+def fit_meta(directory: Path) -> dict[str, Any]:
+    """Read the raw ``fit-meta.json`` object."""
+    return json.loads((directory / "fit-meta.json").read_text(encoding="utf-8"))
+
+
+def rewrite_fit_meta(directory: Path, mutate: Any) -> None:
+    """Apply ``mutate`` to ``fit-meta.json`` and write it back."""
+    payload = fit_meta(directory)
+    mutate(payload)  # type: ignore[operator]
+    (directory / "fit-meta.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def demo_meta(directory: Path) -> dict[str, Any]:
+    """Read the raw section ``meta.json`` object."""
+    return json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+
+
+def assert_fits_equal(loaded: Fit, expected: Fit) -> None:
+    """Every chain, functional array, grid and label survives bit-exactly."""
+    assert loaded.label == expected.label
+    assert loaded.prior == expected.prior
+    np.testing.assert_array_equal(loaded.t_grid, expected.t_grid)
+    assert len(loaded.chains) == len(expected.chains)
+    for actual, wanted in zip(loaded.chains, expected.chains, strict=True):
+        assert_chains_equal(actual, wanted)
+    assert_functionals_equal(loaded.functionals, expected.functionals)
+    assert loaded.functionals.meta == _jsonable(expected.functionals.meta)
+    if expected.prior_band is None:
+        assert loaded.prior_band is None
+    else:
+        assert loaded.prior_band is not None
+        assert_functionals_equal(loaded.prior_band, expected.prior_band)
+        assert loaded.prior_band.meta == _jsonable(expected.prior_band.meta)
+
+
+# --- round-trip ------------------------------------------------------------
+
+
+def test_save_fit_writes_the_plan_layout(tmp_path: Path) -> None:
+    """A fit directory holds every chain, one functional file and its meta."""
+    _, directory = saved_fit(tmp_path)
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "chain-0.npz",
+        "chain-1.npz",
+        "fit-meta.json",
+        "functionals.npz",
+    ]
+    payload = fit_meta(directory)
+    assert set(payload) == {
+        "schema_version",
+        "label",
+        "arm",
+        "prior",
+        "settings",
+        "data_seed",
+        "shared_t_max",
+        "n_chains",
+        "n_draws",
+        "t_grid",
+        "chains",
+        "functionals",
+        "prior_band",
+        "functionals_meta",
+        "prior_band_meta",
+        "extra",
+    }
+    assert payload["schema_version"] == SCHEMA_VERSION
+    assert payload["n_chains"] == 2
+    assert payload["n_draws"] == 8
+
+
+def test_fit_round_trips_every_chain_and_functional_array(tmp_path: Path) -> None:
+    """Chains, functionals, grid and label are bit-exact after a round trip."""
+    fit, directory = saved_fit(tmp_path)
+    loaded = load_fit(directory)
+    assert_fits_equal(loaded, fit)
+    assert loaded.n_chains == 2
+    np.testing.assert_array_equal(loaded.data.time, fit.data.time)
+    np.testing.assert_array_equal(loaded.data.event, fit.data.event)
+    assert loaded.data.t_max == fit.data.t_max
+
+
+def test_fit_meta_keeps_the_un_slugged_label_and_arm(tmp_path: Path) -> None:
+    """The directory is a slug; ``fit-meta.json`` carries the readable label."""
+    _, directory = saved_fit(tmp_path)
+    payload = fit_meta(directory)
+    assert directory.name == "A-nu_Gamma_2_0.9"
+    assert payload["label"] == FIT_LABEL
+    assert payload["arm"] == "A"
+    assert payload["data_seed"] == 721383
+    assert payload["t_grid"] == {
+        "size": 5,
+        "first": float(chain_grid()[0]),
+        "last": float(chain_grid()[-1]),
+    }
+    assert payload["chains"] == [
+        {"path": "chain-0.npz", "dtype": "float64", "shape": [4, 6, 2]},
+        {"path": "chain-1.npz", "dtype": "float64", "shape": [4, 6, 2]},
+    ]
+    assert payload["functionals"] == {
+        "path": "functionals.npz",
+        "dtype": "float64",
+        "shape": [8, 5],
+    }
+    assert load_fit(directory).label == FIT_LABEL
+
+
+def test_fit_meta_records_both_meta_dicts_verbatim(tmp_path: Path) -> None:
+    """The posterior and prior-band provenance dicts are stored, not enumerated."""
+    _, directory = saved_fit(tmp_path, with_band=True)
+    payload = fit_meta(directory)
+    assert payload["functionals_meta"] == _jsonable(FUNCTIONALS_META)
+    assert payload["prior_band_meta"] == _jsonable(PRIOR_BAND_META)
+
+
+def test_fit_round_trips_the_prior_band(tmp_path: Path) -> None:
+    """A band is one more ``Functionals`` file and re-attaches on load."""
+    fit, directory = saved_fit(tmp_path, with_band=True)
+    assert (directory / "prior-band.npz").exists()
+    loaded = load_fit(directory)
+    assert loaded.prior_band is not None
+    assert loaded.prior_band.meta == _jsonable(PRIOR_BAND_META)
+    assert_fits_equal(loaded, fit)
+
+
+def test_fit_round_trips_without_a_prior_band(tmp_path: Path) -> None:
+    """No band file, no ``prior_band``: the loader does not invent one."""
+    _, directory = saved_fit(tmp_path)
+    assert not (directory / "prior-band.npz").exists()
+    assert fit_meta(directory)["prior_band"] is None
+    assert fit_meta(directory)["prior_band_meta"] is None
+    assert load_fit(directory).prior_band is None
+
+
+def test_save_fit_records_extra_metadata_verbatim(tmp_path: Path) -> None:
+    """Timings and chain seeds go under ``extra`` so they never need a bump."""
+    fit = make_fit()
+    directory = tmp_path / "fit"
+    save_fit(
+        directory,
+        fit,
+        meta={
+            "arm": None,
+            "data_seed": None,
+            "chain_seeds": (20240601, 20240602),
+            "timing_seconds": 1.5,
+        },
+    )
+    payload = fit_meta(directory)
+    assert payload["arm"] is None
+    assert payload["shared_t_max"] == float(fit.data.t_max)
+    assert payload["extra"] == {
+        "chain_seeds": [20240601, 20240602],
+        "timing_seconds": 1.5,
+    }
+
+
+def test_fit_round_trip_with_one_draw_one_chain_one_grid_point(
+    tmp_path: Path,
+) -> None:
+    """The None/One end of the contract: one chain, one draw, one grid point."""
+    fit, directory = saved_fit(
+        tmp_path,
+        n_chains=1,
+        n_draws=1,
+        n_grid=1,
+        with_band=True,
+        band_draws=1,
+    )
+    loaded = load_fit(directory)
+    assert_fits_equal(loaded, fit)
+    assert loaded.t_grid.size == 1
+    assert len(loaded.chains) == 1
+    assert loaded.chains[0].nu.size == 1
+    assert loaded.functionals.n_grid == 1
+
+
+def test_fit_round_trip_all_censored_dataset(tmp_path: Path) -> None:
+    """An all-censored dataset is a legal fit and survives the round trip."""
+    event = np.zeros(6, dtype=bool)
+    fit, directory = saved_fit(tmp_path, event=event)
+    loaded = load_fit(directory)
+    assert not loaded.data.event.any()
+    assert_fits_equal(loaded, fit)
+
+
+def test_save_fit_clears_a_stale_prior_band(tmp_path: Path) -> None:
+    """Re-saving without a band must not leave the old file looking listed."""
+    fit, directory = saved_fit(tmp_path, with_band=True)
+    assert (directory / "prior-band.npz").exists()
+    fit.prior_band = None
+    save_fit(directory, fit, meta={"arm": "A", "data_seed": 721383})
+    assert not (directory / "prior-band.npz").exists()
+    assert load_fit(directory).prior_band is None
+
+
+def test_failed_functionals_write_leaves_no_fit_meta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``fit-meta.json`` is written last, so a crash leaves no readable fit."""
+    fit = make_fit()
+    directory = tmp_path / "fit"
+    real_savez = paper_artifacts._savez
+
+    def failing_savez(handle: object, arrays: object, *, compressed: bool) -> None:
+        if isinstance(arrays, dict) and "S" in arrays:
+            raise RuntimeError("disk full")
+        real_savez(handle, arrays, compressed=compressed)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(paper_artifacts, "_savez", failing_savez)
+    with pytest.raises(RuntimeError, match="disk full"):
+        save_fit(directory, fit, meta={"arm": "A"})
+    assert not (directory / "fit-meta.json").exists()
+    assert not list(directory.glob("*.tmp"))
+    with pytest.raises(ArtifactError, match="does not exist"):
+        load_fit(directory)
+
+
+# --- loader validation -----------------------------------------------------
+
+
+def test_load_fit_rejects_a_missing_directory(tmp_path: Path) -> None:
+    """A missing fit directory is an artifact error naming the path."""
+    missing = tmp_path / "nowhere"
+    with pytest.raises(ArtifactError, match="does not exist") as excinfo:
+        load_fit(missing)
+    assert str(missing) in str(excinfo.value)
+
+
+def test_load_fit_rejects_a_file(tmp_path: Path) -> None:
+    """A file where a fit directory belongs is not silently opened."""
+    path = tmp_path / "fit"
+    path.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(ArtifactError, match="is not a directory"):
+        load_fit(path)
+
+
+def test_load_fit_rejects_a_missing_fit_meta(tmp_path: Path) -> None:
+    """Chain files without ``fit-meta.json`` are not a fit."""
+    directory = tmp_path / "fit"
+    directory.mkdir()
+    (directory / "chain-0.npz").write_bytes(b"")
+    with pytest.raises(ArtifactError, match="does not exist") as excinfo:
+        load_fit(directory)
+    assert "fit-meta.json" in str(excinfo.value)
+
+
+def test_load_fit_rejects_schema_version_mismatch(tmp_path: Path) -> None:
+    """The schema has no migration path; an unknown version is an error."""
+    _, directory = saved_fit(tmp_path)
+    rewrite_fit_meta(
+        directory,
+        lambda payload: payload.__setitem__("schema_version", SCHEMA_VERSION + 1),
+    )
+    with pytest.raises(ArtifactIntegrityError, match="schema version"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_transposed_functionals_array(tmp_path: Path) -> None:
+    """A transposed ``S`` is caught by the functional loader, not by plotting."""
+    _, directory = saved_fit(tmp_path)
+    path = directory / "functionals.npz"
+    arrays = archive_members(path)
+    rewrite_archive(path, S=np.ascontiguousarray(arrays["S"].T))
+    with pytest.raises(ArtifactIntegrityError, match="shape|columns"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_wrong_draw_count(tmp_path: Path) -> None:
+    """``n_draws`` must equal ``n_chains * n_save``; a stale count is an error."""
+    _, directory = saved_fit(tmp_path)
+    rewrite_fit_meta(directory, lambda payload: payload.__setitem__("n_draws", 7))
+    with pytest.raises(ArtifactIntegrityError, match="n_draws"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_shape_disagreeing_with_fit_meta(tmp_path: Path) -> None:
+    """A functional shape that drifted from ``fit-meta.json`` is caught."""
+    _, directory = saved_fit(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        record = payload["functionals"]
+        assert isinstance(record, dict)
+        record["shape"] = [8, 6]
+
+    rewrite_fit_meta(directory, mutate)
+    with pytest.raises(ArtifactIntegrityError, match="shape"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_dtype_disagreeing_with_fit_meta(tmp_path: Path) -> None:
+    """The recorded dtype is part of the schema, not a comment."""
+    _, directory = saved_fit(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        record = payload["functionals"]
+        assert isinstance(record, dict)
+        record["dtype"] = "float32"
+
+    rewrite_fit_meta(directory, mutate)
+    with pytest.raises(ArtifactIntegrityError, match="dtype"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_chain_shape_disagreeing_with_fit_meta(
+    tmp_path: Path,
+) -> None:
+    """A chain record that disagrees with the archive is an integrity error."""
+    _, directory = saved_fit(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        records = payload["chains"]
+        assert isinstance(records, list)
+        records[0]["shape"] = [4, 7, 2]
+
+    rewrite_fit_meta(directory, mutate)
+    with pytest.raises(ArtifactIntegrityError, match="shape"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_grid_summary_disagreement(tmp_path: Path) -> None:
+    """The readable grid summary is checked against the stored grid."""
+    _, directory = saved_fit(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        record = payload["t_grid"]
+        assert isinstance(record, dict)
+        record["last"] = float(record["last"]) + 1.0
+
+    rewrite_fit_meta(directory, mutate)
+    with pytest.raises(ArtifactIntegrityError, match="t_grid"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_functionals_meta_disagreement(tmp_path: Path) -> None:
+    """The stored meta dict must match the one recorded in ``fit-meta.json``."""
+    _, directory = saved_fit(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        record = payload["functionals_meta"]
+        assert isinstance(record, dict)
+        record["method"] = "mc"
+
+    rewrite_fit_meta(directory, mutate)
+    with pytest.raises(ArtifactIntegrityError, match="functionals_meta"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_recorded_band_without_a_file(tmp_path: Path) -> None:
+    """A recorded prior band is part of the fit; a missing file is an error."""
+    _, directory = saved_fit(tmp_path, with_band=True)
+    (directory / "prior-band.npz").unlink()
+    with pytest.raises(ArtifactError, match="does not exist"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_an_unlisted_band_file(tmp_path: Path) -> None:
+    """An unrecorded band file would be hashed but never loaded; reject it."""
+    fit, directory = saved_fit(tmp_path)
+    band = make_functionals(n_grid=5, seed=20261119)
+    band.t_grid = fit.t_grid
+    save_functionals(directory / "prior-band.npz", band)
+    with pytest.raises(ArtifactIntegrityError, match="unlisted prior band"):
+        load_fit(directory)
+
+
+def test_load_fit_rejects_a_meta_path_outside_the_directory(tmp_path: Path) -> None:
+    """A recorded path may not escape the fit directory."""
+    _, directory = saved_fit(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        records = payload["chains"]
+        assert isinstance(records, list)
+        records[0]["path"] = "../chain-0.npz"
+
+    rewrite_fit_meta(directory, mutate)
+    with pytest.raises(ArtifactIntegrityError, match="inside the fit directory"):
+        load_fit(directory)
+
+
+# --- writer validation -----------------------------------------------------
+
+
+def test_save_fit_rejects_a_non_fit(tmp_path: Path) -> None:
+    """A dict with the right attributes is not a ``Fit``."""
+    with pytest.raises(ArtifactError, match="Fit"):
+        save_fit(tmp_path / "fit", object())  # type: ignore[arg-type]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"arm": 7},
+        {"arm": ""},
+        {"data_seed": -1},
+        {"data_seed": 1.5},
+        {"shared_t_max": 0.0},
+        {"shared_t_max": "soon"},
+        {"timing": object()},
+        [("arm", "A")],
+    ],
+)
+def test_save_fit_rejects_invalid_provenance(tmp_path: Path, meta: object) -> None:
+    """Provenance the loader could not read back must not be written."""
+    fit = make_fit()
+    with pytest.raises(ArtifactError):
+        save_fit(tmp_path / "fit", fit, meta=meta)  # type: ignore[arg-type]
+    assert not (tmp_path / "fit" / "fit-meta.json").exists()
+
+
+def test_save_fit_rejects_a_chain_outside_the_fit(tmp_path: Path) -> None:
+    """Every chain must share the fit's prior, settings and dataset."""
+    fit = make_fit()
+    fit.chains[1] = make_chain(seed=1, settings_seed=1)
+    with pytest.raises(ArtifactError, match="settings"):
+        save_fit(tmp_path / "fit", fit, meta={"arm": "A"})
+    assert not (tmp_path / "fit" / "fit-meta.json").exists()
+
+
+def test_save_fit_rejects_a_functionals_grid_disagreement(tmp_path: Path) -> None:
+    """The functional grid and the fit grid are one grid, not two."""
+    fit = make_fit()
+    fit.functionals.t_grid = np.linspace(0.5, 9.0, 5)
+    with pytest.raises(ArtifactError, match="t_grid"):
+        save_fit(tmp_path / "fit", fit, meta={"arm": "A"})
+
+
+def test_save_fit_rejects_a_draw_count_mismatch(tmp_path: Path) -> None:
+    """``functionals`` must hold ``n_chains * n_save`` rows."""
+    fit = make_fit()
+    fit.functionals = make_functionals(n_draws=3, n_grid=5)
+    fit.functionals.t_grid = fit.t_grid
+    with pytest.raises(ArtifactError, match="n_chains \\* n_save"):
+        save_fit(tmp_path / "fit", fit, meta={"arm": "A"})
+
+
+# --- demo-result round-trip ------------------------------------------------
+
+
+def demo_result(*, with_band: bool = True, seed: int | None = 20240602) -> DemoResult:
+    """A two-arm result shaped like §5.2, with the §5.1 meta keys as well."""
+    fit_a = make_fit(with_band=with_band)
+    fit_b = make_fit(seed=20240603)
+    return DemoResult(
+        label="5.2",
+        fits={
+            f"A: {FIT_LABEL}": fit_a,
+            f"B: {FIT_LABEL}": fit_b,
+        },
+        meta={
+            "preset": "quick",
+            "seed": seed,
+            "data_seed": 721383,
+            "prior_indices": (0, 2),
+            "n_chains": 2,
+            "burn_in": 5,
+            "n_save": 4,
+            "thin": 1,
+            "t_max": 4.5518,
+        },
+    )
+
+
+def test_demo_result_round_trips_fits_keys_and_meta(tmp_path: Path) -> None:
+    """Every fit and the whole meta dict come back, in the driver's order."""
+    result = demo_result()
+    directory = save_demo_result(tmp_path / "5.2", result)
+    run = load_demo_result(directory)
+    assert run.label == "5.2"
+    assert list(run.fits) == list(result.fits)
+    assert run.meta == result.meta
+    assert run.figures == ()
+    for key, fit in result.fits.items():
+        assert_fits_equal(run.fits[key], fit)
+    assert fit_meta(directory / "draws" / "A-nu_Gamma_2_0.9")["arm"] == "A"
+    assert fit_meta(directory / "draws" / "B-nu_Gamma_2_0.9")["arm"] == "B"
+    assert (directory / "draws" / "A-nu_Gamma_2_0.9" / "prior-band.npz").exists()
+
+
+def test_demo_result_meta_restores_prior_indices_as_a_tuple(tmp_path: Path) -> None:
+    """JSON has no tuples; the paper preconditions compare ``prior_indices``."""
+    result = demo_result(with_band=False, seed=None)
+    directory = save_demo_result(tmp_path / "5.2", result)
+    stored = demo_meta(directory)["meta"]
+    assert stored["prior_indices"] == [0, 2]
+    loaded = load_demo_result(directory)
+    assert loaded.meta["prior_indices"] == (0, 2)
+    assert isinstance(loaded.meta["prior_indices"], tuple)
+    assert loaded.meta["seed"] is None
+    assert loaded.meta["t_max"] == 4.5518
+    assert loaded.meta == result.meta
+
+
+def test_demo_result_round_trips_an_empty_run(tmp_path: Path) -> None:
+    """The None end of the contract: no fits still round-trips its meta."""
+    result = DemoResult(label="5.1", fits={}, meta={"preset": "quick"})
+    directory = save_demo_result(tmp_path / "5.1", result)
+    run = load_demo_result(directory)
+    assert run.fits == {}
+    assert run.meta == {"preset": "quick"}
+    assert demo_meta(directory)["fit_keys"] == []
+
+
+def test_load_demo_result_rejects_a_missing_directory(tmp_path: Path) -> None:
+    """A missing section directory is named in the error."""
+    missing = tmp_path / "nowhere"
+    with pytest.raises(ArtifactError, match="does not exist") as excinfo:
+        load_demo_result(missing)
+    assert str(missing) in str(excinfo.value)
+
+
+def test_load_demo_result_rejects_a_missing_meta(tmp_path: Path) -> None:
+    """Fits without a section ``meta.json`` are not a run."""
+    directory = tmp_path / "5.2"
+    directory.mkdir()
+    with pytest.raises(ArtifactError, match="does not exist") as excinfo:
+        load_demo_result(directory)
+    assert "meta.json" in str(excinfo.value)
+
+
+def test_load_demo_result_rejects_schema_version_mismatch(tmp_path: Path) -> None:
+    """The section schema is versioned like every other artifact."""
+    directory = save_demo_result(tmp_path / "5.2", demo_result())
+    payload = demo_meta(directory)
+    payload["schema_version"] = SCHEMA_VERSION + 1
+    (directory / "meta.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ArtifactIntegrityError, match="schema version"):
+        load_demo_result(directory)
+
+
+def test_load_demo_result_rejects_an_unlisted_fit_directory(tmp_path: Path) -> None:
+    """A fit directory the section metadata does not name is an error."""
+    directory = save_demo_result(tmp_path / "5.2", demo_result())
+    stray = directory / "draws" / "C-nu_Gamma_2_0.9"
+    save_fit(stray, make_fit(), meta={"arm": "C"})
+    with pytest.raises(ArtifactIntegrityError, match="unlisted fit directory"):
+        load_demo_result(directory)
+
+
+def test_load_demo_result_rejects_fits_in_a_section_that_names_none(
+    tmp_path: Path,
+) -> None:
+    """An empty run has no ``draws/``; a stray fit there is still unlisted."""
+    directory = save_demo_result(
+        tmp_path / "5.1", DemoResult(label="5.1", fits={}, meta={})
+    )
+    save_fit(directory / "draws" / "nu_Gamma_2_0.9", make_fit(), meta={"arm": None})
+    with pytest.raises(ArtifactIntegrityError, match="unlisted fit directory"):
+        load_demo_result(directory)
+
+
+def test_load_demo_result_rejects_a_key_mismatch(tmp_path: Path) -> None:
+    """The fit directory must hold the fit the section key names."""
+    directory = save_demo_result(tmp_path / "5.2", demo_result())
+    rewrite_fit_meta(
+        directory / "draws" / "A-nu_Gamma_2_0.9",
+        lambda payload: payload.__setitem__("label", "nu ~ Gamma(3, 0.05)"),
+    )
+    with pytest.raises(ArtifactIntegrityError, match="disagree with the section key"):
+        load_demo_result(directory)
+
+
+def test_save_demo_result_rejects_duplicate_directory_names(tmp_path: Path) -> None:
+    """Two labels that slug to the same name cannot both own a directory."""
+    first = make_fit(label="nu ~ Gamma(2, 0.9)")
+    second = make_fit(label="nu  ~ Gamma(2, 0.9)")
+    result = DemoResult(
+        label="5.1", fits={first.label: first, second.label: second}, meta={}
+    )
+    with pytest.raises(ArtifactError, match="both map to the directory"):
+        save_demo_result(tmp_path / "5.1", result)
+    assert not (tmp_path / "5.1" / "meta.json").exists()
+
+
+def test_save_demo_result_rejects_a_key_label_mismatch(tmp_path: Path) -> None:
+    """A key that is not the fit's (arm-prefixed) label is a caller bug."""
+    fit = make_fit()
+    result = DemoResult(label="5.2", fits={"A: something else": fit}, meta={})
+    with pytest.raises(ArtifactError, match="does not match the fit's label"):
+        save_demo_result(tmp_path / "5.2", result)
+
+
+def test_save_demo_result_rejects_a_non_result(tmp_path: Path) -> None:
+    """A duck-typed object is not a ``DemoResult``."""
+    with pytest.raises(ArtifactError, match="DemoResult"):
+        save_demo_result(tmp_path / "5.2", object())  # type: ignore[arg-type]
+
+
+# --- integration -----------------------------------------------------------
+
+#: A quick-preset fit of the §5.2 arm A is the cheapest *real* sampler run:
+#: 2 chains x 1 000 stored draws over 20 observations (about 30 s).
+QUICK_PRESET = Preset(
+    name="quick",
+    sampler=DPSettings(
+        burn_in=1_000,
+        n_save=1_000,
+        thin=10,
+        n_alpha=256,
+        epsilon=1e-4,
+        n_chains=2,
+        seed=None,
+        preset="quick",
+    ),
+    functionals=FunctionalSettings(method="exact", L=200, atom_tol=1e-6, n_t_grid=300),
+    n_prior_draws=200,
+)
+
+
+def test_quick_preset_round_trip_feeds_r_hat_and_ess(tmp_path: Path) -> None:
+    """A quick-preset result survives save/load and still feeds the diagnostics.
+
+    This is the §6.1 acceptance check for the fit/run unit: the loaded chains
+    must reproduce ``r_hat()``/``ess()`` exactly, the functionals (and the
+    quick preset's prior band) must be bit-exact, and ``DemoResult.meta`` must
+    compare equal to the in-memory dict that the paper preconditions use.
+    """
+    from src.paper_data import leukemia_5_2
+
+    raw = leukemia_5_2()
+    shared_t_max = max(float(np.max(raw[arm][0])) for arm in ("A", "B"))
+    data = data_5_2("A", t_max=shared_t_max)
+    grid = time_grid(shared_t_max, 300)
+    fit = fit_dataset(
+        data,
+        make_prior(0),
+        preset=QUICK_PRESET,
+        seed=SEED_5_2,
+        t_grid=grid,
+        max_workers=2,
+    )
+    fit.prior_band = prior_band(fit, preset=QUICK_PRESET, seed=SEED_5_2)
+    key = f"A: {fit.label}"
+    result = DemoResult(
+        label="5.2",
+        fits={key: fit},
+        meta={
+            "preset": "quick",
+            "seed": SEED_5_2,
+            "prior_indices": (0,),
+            "n_chains": 2,
+            "burn_in": 1_000,
+            "n_save": 1_000,
+            "thin": 10,
+            "t_max": shared_t_max,
+            "t_max_a": data.t_max,
+            "t_max_b": data.t_max,
+        },
+    )
+
+    directory = save_demo_result(tmp_path / "5.2", result)
+    run = load_demo_result(directory)
+    assert run.meta == result.meta
+    loaded = run.fits[key]
+    assert_fits_equal(loaded, fit)
+
+    for name in ("nu", "n_star"):
+        assert r_hat(loaded.chains, name) == r_hat(fit.chains, name)
+        assert ess(loaded.chains, name) == ess(fit.chains, name)
+    assert r_hat(loaded.chains, "S").keys() == r_hat(fit.chains, "S").keys()
+    for label in r_hat(loaded.chains, "S"):
+        np.testing.assert_array_equal(
+            r_hat(loaded.chains, "S")[label], r_hat(fit.chains, "S")[label]
+        )
+    for label in ess(loaded.chains, "S"):
+        np.testing.assert_array_equal(
+            ess(loaded.chains, "S")[label], ess(fit.chains, "S")[label]
+        )
