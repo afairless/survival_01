@@ -25,7 +25,7 @@ It has two companions:
 | --- | --- | --- |
 | `src/dp_gibbs.py` | ingestion validation and the time transform, state and bookkeeping, the $\alpha$ quadrature grid, the three full conditionals, one sweep, chain storage, initialisation, the collapsed log-posterior, diagnostics | plotting, data generation, functionals |
 | `src/dp_functionals.py` | the paper's §3 steps (i)–(iii) for posterior *and* prior, survival/CDF/density/hazard/quantile functionals on the original scale, two-population comparisons | drawing $\theta$ |
-| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz`/JSON writes, the self-contained chain, functional, fit and section round-trips, the incremental `ArtifactWriter` and its append-only event log; a later unit adds the run manifest | fitting, plotting, recomputing summaries |
+| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz`/JSON writes, the self-contained chain, functional, fit and section round-trips, the incremental `ArtifactWriter` and its append-only event log, `finalize_run`/`verify_manifest` for the run-level manifest | fitting, plotting, recomputing summaries |
 
 Two rules hold everywhere and are enforced by tests, not by convention:
 
@@ -422,6 +422,9 @@ which is layered on it) then drives the long runs.
 | `save_demo_result(directory, result)` | write a section directory: one fit directory per fit under `draws/`, plus `meta.json` last; never a figure |
 | `load_demo_result(directory)` | load every named fit and rebuild `DemoResult` with `prior_indices` as a tuple and `figures=()` |
 | `ArtifactWriter(root, *, section, meta=None, label=None)` | incremental writer: `fit_done(fit, timing=None, *, arm=None, **extra)`, `band_done(band, timing=None, *, fit=None, fit_label=None, arm=None, **extra)`, `event(kind, **fields)`, `write_meta(*, meta=None)`; never writes `MANIFEST.json` or figures |
+| `finalize_run(root, *, meta=None)` | hash the whole run tree and write the single run-level `MANIFEST.json`: schema version, stamp, git/package provenance, section `meta.json` payloads, and `{sha256, size}` per artifact; never lists itself |
+| `verify_manifest(root, *, allow_extra=False)` | re-hash every listed artifact, reject a flipped byte, a truncation, a missing file, an unlisted extra and a schema-version mismatch; returns a `ManifestReport` |
+| `ManifestReport` | what a passing verification checked: schema version, stamp, code SHA/dirty flag, file count/bytes, verified paths and any allowed extras |
 
 ### 6.1 Why the write helper is not `np.savez(tmp_name)`
 
@@ -593,6 +596,41 @@ one instance per section, writing under one run root.
 
 The writer never writes `MANIFEST.json` (plan R7 gives that to
 `finalize_run`) and never writes figures (also R7).
+
+### 6.7 The run manifest (`MANIFEST.json`)
+
+`finalize_run(root)` is called once after the report stage, over the whole run
+root, so the §5.2 and §5.1 trees, their `summary/`, `report/`, `figures/` and
+`logs/` are covered by one file. It walks the tree (skipping only its own
+`MANIFEST.json`, because a file cannot carry its own hash), records a SHA-256
+and a size for every regular file, and adds:
+
+- `schema_version` and an ISO 8601 UTC `created_at` stamp;
+- `code_sha`, `code_dirty`, `pixi_lock_sha256` and the installed package
+  versions -- the git calls run from the run root and every field degrades to
+  `null` outside a repository, so a manifest is still possible;
+- `sections`: the section `meta.json` payloads verbatim (preset, seeds,
+  timings), so the run-level record does not depend on files a cleanup could
+  remove;
+- `meta`: optional caller provenance (run stamp, harness notes);
+- `file_count`, `total_bytes` and `files`, an object keyed by POSIX relative
+  path with `{sha256, size}` per entry.
+
+Re-finalising rewrites the manifest atomically and picks up later files, which
+is how the §5.1 run joins the §5.2 root (R6). Because the manifest never lists
+itself, the report cites `sha256(MANIFEST.json)` from outside the file -- plan
+§8 item 1.
+
+`verify_manifest(root)` is the integrity layer of plan §9. It validates the
+manifest schema (exact key set, canonical relative paths, no self-listing,
+`file_count`/`total_bytes` agreeing with `files`), then checks every listed
+artifact for existence, size and digest. Unlisted files under the root are an
+error unless `allow_extra=True`; they are then reported in
+`ManifestReport.extra` while every listed artifact is still verified. Failures
+are collected into one `ArtifactIntegrityError` naming each offending path, so
+a broken tree is diagnosed in one pass. A returned `ManifestReport` is a pass:
+its `paths`, `file_count`, `total_bytes`, `code_sha` and `code_dirty` are what
+the report's provenance table quotes.
 
 ---
 

@@ -97,11 +97,27 @@ resolution, and the refusal to write a section meta that names a fit directory
 the writer can no longer see.  The stream is the only run-level file this unit
 writes: ``MANIFEST.json`` belongs to the manifest unit.
 
+Step 6 adds the run manifest.  ``finalize_run`` walks the completed run tree,
+records one SHA-256 and size per file and writes the single run-level
+``MANIFEST.json``; the manifest never lists itself, because the report cites
+its hash from outside.  The tests pin that every file is covered -- draws,
+summaries, reports, figures and logs, including files added after an earlier
+finalisation -- and that the section ``meta.json`` payloads, the caller's
+provenance and the code/environment record (git SHA, dirty flag, ``pixi.lock``
+digest, package versions) land in the manifest, each degrading to ``null``
+rather than failing outside a repository.  ``verify_manifest`` is the reviewer
+entry point, so the tamper matrix is explicit: a flipped byte, a truncated
+file, a missing file, an unlisted extra, a schema-version mismatch, a
+self-listed manifest, a path escaping the root, and a manifest whose own
+counts or digests disagree with its file list.  ``allow_extra=True`` is the one
+legitimate exception, and it still verifies every listed file.
+
 The property-based tests use seeded NumPy generators; the repository has no
 Hypothesis dependency.  The inputs are random, the invariants are
 deterministic.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -124,17 +140,21 @@ from src.paper_artifacts import (
     ArtifactError,
     ArtifactIntegrityError,
     ArtifactWriter,
+    ManifestReport,
     _jsonable,
     atomic_savez,
+    finalize_run,
     load_chain,
     load_demo_result,
     load_fit,
     load_functionals,
+    manifest_path,
     save_chain,
     save_demo_result,
     save_fit,
     save_functionals,
     slug,
+    verify_manifest,
 )
 from src.paper_examples import (
     SEED_5_2,
@@ -2948,3 +2968,622 @@ def test_writer_is_closed_after_the_context_manager(tmp_path: Path) -> None:
         writer.band_done(make_functionals())
     with pytest.raises(ArtifactError, match="closed"):
         writer.write_meta()
+
+
+# ---------------------------------------------------------------------------
+# Run manifest (plan §6.1)
+# ---------------------------------------------------------------------------
+
+#: The layout of plan §5, as tiny byte payloads: draws, functionals, summaries,
+#: report tables, figures and logs under one run root.  The manifest hashes
+#: bytes, so the contents need not be real archives.
+MANIFEST_TREE: dict[str, bytes] = {
+    "logs/env.txt": b"git sha deadbeef, 16 cores\n",
+    "logs/events-5.2.jsonl": b'{"kind": "run_start", "t_monotonic": 0.0}\n',
+    "5.2/draws/A-nu_Gamma_2_0.9/chain-0.npz": b"PK\x03\x04chain-0",
+    "5.2/draws/A-nu_Gamma_2_0.9/functionals.npz": b"PK\x03\x04functionals",
+    "5.2/summary/stats.json": b'{"nu_mean": 0.5}\n',
+    "5.2/summary/acceptance.json": b'{"pass": true}\n',
+    "5.2/report/tables.md": b"| quantity | value |\n| --- | --- |\n",
+    "5.2/figures/figure_4.png": b"\x89PNG\r\n\x1a\nfigure-bytes",
+    "report/provenance.md": b"# replication report\n",
+}
+
+
+def section_meta_bytes(section: str = "5.2", *, preset: str = "quick") -> bytes:
+    """One section ``meta.json`` payload, as ``ArtifactWriter`` writes it."""
+    return json.dumps(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "label": section,
+            "fit_keys": ["nu ~ Gamma(2, 0.9)"],
+            "meta": {"preset": preset, "seed": 20240602, "n_chains": 4},
+        },
+        sort_keys=True,
+    ).encode()
+
+
+def write_manifest_tree(
+    root: Path, *, sections: tuple[str, ...] = ("5.2",)
+) -> dict[str, bytes]:
+    """Write the plan §5 tree under ``root`` and return its byte payloads."""
+    files = dict(MANIFEST_TREE)
+    for section in sections:
+        files[f"{section}/meta.json"] = section_meta_bytes(section)
+    for relative, data in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return files
+
+
+def read_manifest(root: Path) -> dict[str, Any]:
+    """Read the run-level manifest as JSON."""
+    return json.loads((root / "MANIFEST.json").read_text(encoding="utf-8"))
+
+
+def write_manifest(root: Path, payload: dict[str, Any]) -> None:
+    """Overwrite the manifest with a (usually tampered) payload."""
+    (root / "MANIFEST.json").write_text(
+        json.dumps(payload, sort_keys=True), encoding="utf-8"
+    )
+
+
+# --- finalize_run ----------------------------------------------------------
+
+
+def test_finalize_run_hashes_every_file_and_never_itself(tmp_path: Path) -> None:
+    """One run-level manifest covers draws, summaries, reports, figures, logs."""
+    root = tmp_path / "run"
+    files = write_manifest_tree(root)
+
+    manifest = finalize_run(root)
+
+    assert manifest == root / "MANIFEST.json"
+    assert manifest == manifest_path(root)
+    payload = read_manifest(root)
+    assert payload["schema_version"] == SCHEMA_VERSION
+    assert payload["files"].keys() == set(files)
+    assert "MANIFEST.json" not in payload["files"]
+    assert payload["file_count"] == len(files)
+    assert payload["total_bytes"] == sum(len(data) for data in files.values())
+    for relative, data in files.items():
+        record = payload["files"][relative]
+        assert record["size"] == len(data), relative
+        assert record["sha256"] == hashlib.sha256(data).hexdigest(), relative
+
+
+def test_finalize_run_rewrites_a_stable_manifest(tmp_path: Path) -> None:
+    """Re-finalising keeps the same file map; only the stamp may move."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    first = finalize_run(root)
+    first_files = read_manifest(root)["files"]
+    first_text = first.read_text(encoding="utf-8")
+
+    second = finalize_run(root)
+
+    assert second == first
+    assert read_manifest(root)["files"] == first_files
+    assert "MANIFEST.json" not in read_manifest(root)["files"]
+    assert first_text.endswith("\n")
+
+
+def test_finalize_run_covers_files_added_after_an_earlier_finalisation(
+    tmp_path: Path,
+) -> None:
+    """R6: the §5.1 run joins the §5.2 tree and the manifest is rewritten."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    late = root / "5.1" / "summary" / "rhat_ess.csv"
+    late.parent.mkdir(parents=True)
+    late.write_text("fit,r_hat\n", encoding="utf-8")
+
+    finalize_run(root)
+
+    payload = read_manifest(root)
+    assert "5.1/summary/rhat_ess.csv" in payload["files"]
+    assert payload["files"]["5.1/summary/rhat_ess.csv"]["size"] == len("fit,r_hat\n")
+
+
+def test_finalize_run_records_section_metadata_verbatim(tmp_path: Path) -> None:
+    """The run-level manifest carries both section ``meta.json`` payloads."""
+    root = tmp_path / "run"
+    write_manifest_tree(root, sections=("5.1", "5.2"))
+
+    finalize_run(root)
+
+    sections = read_manifest(root)["sections"]
+    assert set(sections) == {"5.1", "5.2"}
+    assert sections["5.1"]["label"] == "5.1"
+    assert sections["5.2"]["meta"]["seed"] == 20240602
+    assert sections["5.2"]["schema_version"] == SCHEMA_VERSION
+
+
+def test_finalize_run_records_caller_meta_with_numpy_values(tmp_path: Path) -> None:
+    """Caller provenance goes through ``_jsonable`` like every other meta dict."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+
+    finalize_run(
+        root,
+        meta={"stamp": "replication-2026-11-08", "seed": np.int64(20240602)},
+    )
+
+    assert read_manifest(root)["meta"] == {
+        "stamp": "replication-2026-11-08",
+        "seed": 20240602,
+    }
+
+
+def test_finalize_run_records_code_and_environment_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git SHA, dirty flag, lock digest and package versions are recorded."""
+
+    def fake_git(root: Path, *arguments: str) -> str | None:
+        if arguments == ("rev-parse", "HEAD"):
+            return "deadbeef\n"
+        if arguments == ("status", "--porcelain"):
+            return " M src/paper_artifacts.py\n"
+        if arguments == ("rev-parse", "--show-toplevel"):
+            return f"{tmp_path}\n"
+        return None
+
+    monkeypatch.setattr(paper_artifacts, "_git_output", fake_git)
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    lock = tmp_path / "pixi.lock"
+    lock.write_bytes(b"name: survival_01\n")
+
+    finalize_run(root)
+
+    payload = read_manifest(root)
+    assert payload["code_sha"] == "deadbeef"
+    assert payload["code_dirty"] is True
+    assert payload["pixi_lock_sha256"] == hashlib.sha256(lock.read_bytes()).hexdigest()
+    assert payload["packages"]["numpy"] == np.__version__
+
+
+def test_finalize_run_records_a_clean_tree_as_not_dirty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ``git status --porcelain`` is the replayable case."""
+
+    def fake_git(root: Path, *arguments: str) -> str | None:
+        if arguments == ("rev-parse", "HEAD"):
+            return "feedface\n"
+        if arguments == ("status", "--porcelain"):
+            return ""
+        if arguments == ("rev-parse", "--show-toplevel"):
+            return f"{tmp_path}\n"
+        return None
+
+    monkeypatch.setattr(paper_artifacts, "_git_output", fake_git)
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+
+    finalize_run(root)
+
+    assert read_manifest(root)["code_dirty"] is False
+
+
+def test_finalize_run_leaves_provenance_null_outside_a_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run outside git is still hashable; only the provenance is weaker."""
+    monkeypatch.setattr(paper_artifacts, "_git_output", lambda *_: None)
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+
+    finalize_run(root)
+
+    payload = read_manifest(root)
+    assert payload["code_sha"] is None
+    assert payload["code_dirty"] is None
+    assert payload["pixi_lock_sha256"] is None
+    assert isinstance(payload["packages"], dict)
+    assert payload["packages"]
+
+
+def test_finalize_run_accepts_an_empty_run_root(tmp_path: Path) -> None:
+    """No artifacts is a valid (vacuous) manifest, not a crash."""
+    root = tmp_path / "run"
+    root.mkdir()
+
+    finalize_run(root)
+
+    payload = read_manifest(root)
+    assert payload["files"] == {}
+    assert payload["file_count"] == 0
+    assert payload["total_bytes"] == 0
+    assert verify_manifest(root).file_count == 0
+
+
+def test_finalize_run_rejects_a_missing_root(tmp_path: Path) -> None:
+    """Finalising a mistyped path must not create a manifest for nothing."""
+    with pytest.raises(ArtifactError, match="does not exist"):
+        finalize_run(tmp_path / "missing")
+
+
+def test_finalize_run_rejects_a_file_root(tmp_path: Path) -> None:
+    """A file is not a run root, however it is named."""
+    target = tmp_path / "run"
+    target.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(ArtifactError, match="not a directory"):
+        finalize_run(target)
+
+
+def test_finalize_run_rejects_a_section_meta_schema_version(
+    tmp_path: Path,
+) -> None:
+    """A section file the loaders would reject cannot enter the manifest."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    meta = root / "5.2" / "meta.json"
+    meta.write_text(
+        json.dumps({"schema_version": SCHEMA_VERSION + 1}), encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="schema_version"):
+        finalize_run(root)
+
+
+def test_finalize_run_rejects_a_malformed_section_meta(tmp_path: Path) -> None:
+    """A corrupt section file names itself in the integrity error."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    meta = root / "5.2" / "meta.json"
+    meta.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError, match="not valid JSON"):
+        finalize_run(root)
+
+
+@pytest.mark.parametrize("meta", [object(), [1, 2], {"bad": object()}])
+def test_finalize_run_rejects_unusable_meta(tmp_path: Path, meta: object) -> None:
+    """The caller meta is stored verbatim, so it must have a JSON form."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    with pytest.raises(ArtifactError, match="run manifest meta"):
+        finalize_run(root, meta=meta)  # type: ignore[arg-type]
+
+
+# --- verify_manifest -------------------------------------------------------
+
+
+def test_verify_manifest_accepts_an_untouched_tree(tmp_path: Path) -> None:
+    """A freshly finalised tree verifies and reports what it checked."""
+    root = tmp_path / "run"
+    files = write_manifest_tree(root)
+    finalize_run(root, meta={"stamp": "run-1"})
+
+    report = verify_manifest(root)
+
+    assert isinstance(report, ManifestReport)
+    assert report.root == root
+    assert report.manifest == root / "MANIFEST.json"
+    assert report.schema_version == SCHEMA_VERSION
+    assert report.file_count == len(files)
+    assert report.total_bytes == sum(len(data) for data in files.values())
+    assert report.paths == tuple(sorted(files))
+    assert report.extra == ()
+    assert report.code_sha is None
+
+
+def test_verify_manifest_detects_a_flipped_byte(tmp_path: Path) -> None:
+    """A same-length edit changes the digest; the path is named."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    target = root / "5.2" / "summary" / "stats.json"
+    data = bytearray(target.read_bytes())
+    data[2] ^= 0xFF
+    target.write_bytes(bytes(data))
+
+    with pytest.raises(ArtifactIntegrityError, match="sha256 mismatch") as excinfo:
+        verify_manifest(root)
+    assert "5.2/summary/stats.json" in str(excinfo.value)
+
+
+def test_verify_manifest_detects_a_truncated_file(tmp_path: Path) -> None:
+    """A short file is caught by size before any hash is computed."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    target = root / "5.2" / "figures" / "figure_4.png"
+    target.write_bytes(target.read_bytes()[:5])
+
+    with pytest.raises(ArtifactIntegrityError, match="size mismatch") as excinfo:
+        verify_manifest(root)
+    assert "figure_4.png" in str(excinfo.value)
+
+
+def test_verify_manifest_detects_a_missing_file(tmp_path: Path) -> None:
+    """A deleted artifact is reported by path, not skipped."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    (root / "5.2" / "draws" / "A-nu_Gamma_2_0.9" / "chain-0.npz").unlink()
+
+    with pytest.raises(ArtifactIntegrityError, match="is missing") as excinfo:
+        verify_manifest(root)
+    assert "chain-0.npz" in str(excinfo.value)
+
+
+def test_verify_manifest_detects_an_unlisted_extra(tmp_path: Path) -> None:
+    """A file added after finalisation means the manifest no longer covers it."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    rogue = root / "5.2" / "figures" / "rogue.png"
+    rogue.write_bytes(b"\x89PNG\r\n\x1a\nrogue")
+
+    with pytest.raises(ArtifactIntegrityError, match="unlisted artifact") as excinfo:
+        verify_manifest(root)
+    assert "5.2/figures/rogue.png" in str(excinfo.value)
+
+
+def test_verify_manifest_allows_extras_on_request(tmp_path: Path) -> None:
+    """The verifier may add scratch files; listed artifacts stay verified."""
+    root = tmp_path / "run"
+    files = write_manifest_tree(root)
+    finalize_run(root)
+    (root / "report" / "scratch.md").write_bytes(b"scratch")
+
+    report = verify_manifest(root, allow_extra=True)
+
+    assert report.extra == ("report/scratch.md",)
+    assert report.file_count == len(files)
+
+
+def test_verify_manifest_rejects_an_unlisted_change_even_with_extras(
+    tmp_path: Path,
+) -> None:
+    """``allow_extra`` only relaxes the extra check; listed files still match."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    (root / "report" / "scratch.md").write_bytes(b"scratch")
+    target = root / "5.2" / "report" / "tables.md"
+    target.write_bytes(b"x" * len(target.read_bytes()))
+
+    with pytest.raises(ArtifactIntegrityError, match="sha256 mismatch"):
+        verify_manifest(root, allow_extra=True)
+
+
+def test_verify_manifest_rejects_a_missing_manifest(tmp_path: Path) -> None:
+    """There is nothing to verify without the manifest itself."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    with pytest.raises(ArtifactError, match="does not exist"):
+        verify_manifest(root)
+
+
+@pytest.mark.parametrize("version", [SCHEMA_VERSION + 1, 0, "1"])
+def test_verify_manifest_rejects_a_schema_version_mismatch(
+    tmp_path: Path, version: object
+) -> None:
+    """No migration path: another schema version is an error, not a guess."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    payload = read_manifest(root)
+    payload["schema_version"] = version
+    write_manifest(root, payload)
+
+    with pytest.raises(ArtifactIntegrityError, match="schema_version"):
+        verify_manifest(root)
+
+
+def test_verify_manifest_rejects_a_file_count_disagreement(tmp_path: Path) -> None:
+    """The summary counts are part of the schema, not decoration."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    payload = read_manifest(root)
+    payload["file_count"] += 1
+    write_manifest(root, payload)
+
+    with pytest.raises(ArtifactIntegrityError, match="file_count"):
+        verify_manifest(root)
+
+
+def test_verify_manifest_rejects_a_total_bytes_disagreement(tmp_path: Path) -> None:
+    """A tampered size summary is caught before any artifact is read."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    payload = read_manifest(root)
+    payload["total_bytes"] += 1
+    write_manifest(root, payload)
+
+    with pytest.raises(ArtifactIntegrityError, match="total_bytes"):
+        verify_manifest(root)
+
+
+def test_verify_manifest_rejects_a_self_listed_manifest(tmp_path: Path) -> None:
+    """A manifest cannot hash itself; that cycle is a schema error."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    payload = read_manifest(root)
+    payload["files"]["MANIFEST.json"] = {
+        "sha256": "0" * 64,
+        "size": 1,
+    }
+    payload["file_count"] = len(payload["files"])
+    write_manifest(root, payload)
+
+    with pytest.raises(ArtifactIntegrityError, match="may not list itself"):
+        verify_manifest(root)
+
+
+@pytest.mark.parametrize(
+    "path", ["../escape.txt", "/abs.txt", "5.2//stats.json", "", ".", "a/../b.txt"]
+)
+def test_verify_manifest_rejects_an_unsafe_listed_path(
+    tmp_path: Path, path: str
+) -> None:
+    """Listed paths are joined to the root, so traversal is refused."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    payload = read_manifest(root)
+    payload["files"][path] = {"sha256": "0" * 64, "size": 1}
+    payload["file_count"] = len(payload["files"])
+    write_manifest(root, payload)
+
+    with pytest.raises(ArtifactIntegrityError, match="manifest file path"):
+        verify_manifest(root)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"sha256": "not-a-digest", "size": 1},
+        {"sha256": "0" * 63, "size": 1},
+        {"sha256": "0" * 64},
+        {"sha256": "0" * 64, "size": -1},
+        {"sha256": "0" * 64, "size": True},
+        {"size": 1},
+        "raw-bytes",
+    ],
+)
+def test_verify_manifest_rejects_a_malformed_file_record(
+    tmp_path: Path, record: object
+) -> None:
+    """One malformed record is a schema error naming the manifest."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    payload = read_manifest(root)
+    payload["files"]["5.2/summary/stats.json"] = record
+    write_manifest(root, payload)
+
+    with pytest.raises(ArtifactIntegrityError):
+        verify_manifest(root)
+
+
+def test_verify_manifest_detects_a_tampered_recorded_digest(tmp_path: Path) -> None:
+    """Editing the manifest's digest is caught against the real file."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    payload = read_manifest(root)
+    payload["files"]["5.2/summary/stats.json"]["sha256"] = "0" * 64
+    write_manifest(root, payload)
+
+    with pytest.raises(ArtifactIntegrityError, match="sha256 mismatch"):
+        verify_manifest(root)
+
+
+def test_verify_manifest_rejects_a_non_canonical_manifest_payload(
+    tmp_path: Path,
+) -> None:
+    """A non-JSON manifest is an integrity error, not an empty pass."""
+    root = tmp_path / "run"
+    write_manifest_tree(root)
+    finalize_run(root)
+    (root / "MANIFEST.json").write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError, match="not valid JSON"):
+        verify_manifest(root)
+
+
+# --- property-based manifest checks ---------------------------------------
+
+
+def random_manifest_tree(rng: np.random.Generator, root: Path) -> dict[str, bytes]:
+    """Write a random file tree under ``root`` and return its payloads."""
+    directories = [
+        "",
+        "logs",
+        "5.2/draws/A-nu_Gamma_2_0.9",
+        "5.2/summary",
+        "5.2/report",
+        "5.2/figures",
+        "5.1/draws/nu_Gamma_2_0.9",
+        "report",
+    ]
+    files: dict[str, bytes] = {}
+    for index in range(int(rng.integers(1, 10))):
+        directory = directories[int(rng.integers(0, len(directories)))]
+        name = f"file-{index}.bin"
+        relative = f"{directory}/{name}" if directory else name
+        size = int(rng.integers(1, 48))
+        data = rng.integers(0, 256, size=size, dtype=np.uint8).tobytes()
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        files[relative] = data
+    return files
+
+
+def test_manifest_property_random_tree_round_trips(tmp_path: Path) -> None:
+    """Any random tree verifies, with digests and sizes recorded exactly."""
+    rng = np.random.default_rng(20261120)
+    for trial in range(20):
+        root = tmp_path / f"run-{trial}"
+        root.mkdir()
+        files = random_manifest_tree(rng, root)
+        finalize_run(root)
+
+        report = verify_manifest(root)
+        payload = read_manifest(root)
+
+        assert report.file_count == len(files)
+        assert report.paths == tuple(sorted(files))
+        assert report.total_bytes == sum(len(data) for data in files.values())
+        assert payload["files"].keys() == set(files)
+        for relative, data in files.items():
+            assert payload["files"][relative] == {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+            }
+        assert "MANIFEST.json" not in payload["files"]
+
+
+def test_manifest_property_any_single_byte_change_is_detected(
+    tmp_path: Path,
+) -> None:
+    """A one-bit edit of a random artifact always fails verification."""
+    rng = np.random.default_rng(20261121)
+    for trial in range(12):
+        root = tmp_path / f"run-{trial}"
+        root.mkdir()
+        files = random_manifest_tree(rng, root)
+        finalize_run(root)
+        relative = sorted(files)[int(rng.integers(0, len(files)))]
+        original = files[relative]
+        position = int(rng.integers(0, len(original)))
+        mutated = bytearray(original)
+        mutated[position] ^= 1 << int(rng.integers(0, 8))
+        assert mutated != original
+        target = root / relative
+        target.write_bytes(bytes(mutated))
+
+        with pytest.raises(ArtifactIntegrityError, match="sha256 mismatch"):
+            verify_manifest(root)
+
+        target.write_bytes(original)
+        assert verify_manifest(root).file_count == len(files)
+
+
+def test_manifest_property_any_truncation_is_detected(tmp_path: Path) -> None:
+    """A randomly truncated artifact always fails the size check."""
+    rng = np.random.default_rng(20261122)
+    for trial in range(12):
+        root = tmp_path / f"run-{trial}"
+        root.mkdir()
+        files = random_manifest_tree(rng, root)
+        finalize_run(root)
+        relative = sorted(files)[int(rng.integers(0, len(files)))]
+        original = files[relative]
+        keep = int(rng.integers(0, len(original)))
+        target = root / relative
+        target.write_bytes(original[:keep])
+
+        with pytest.raises(ArtifactIntegrityError, match="size mismatch"):
+            verify_manifest(root)

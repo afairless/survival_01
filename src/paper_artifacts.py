@@ -45,7 +45,15 @@ functional, fit and run writers are built on, plus the chain round-trip:
   so a crashed run never claims artifacts it does not hold.  It owns the
   append-only ``logs/events-<section>.jsonl`` stream (``ts``/
   ``t_monotonic``/``kind``) and never writes ``MANIFEST.json`` -- the manifest
-  unit is layered on top.
+  unit is layered on top;
+* :func:`finalize_run` -- the single run-level ``MANIFEST.json`` of plan §6.1:
+  one SHA-256 and size per file in the whole tree (draws, summaries, reports,
+  figures, logs), plus the code/environment provenance and the section
+  ``meta.json`` payloads.  The manifest never lists itself, because a file
+  cannot carry its own hash; the report records that hash externally;
+* :func:`verify_manifest` -- the reviewer entry point: re-hash every listed
+  file, fail on a flipped byte, a truncated or missing file and an unlisted
+  extra, and return a :class:`ManifestReport` naming what was checked.
 
 Why the write helper exists
 ---------------------------
@@ -73,14 +81,18 @@ primitives here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import subprocess
 import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _package_version
+from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import IO, TYPE_CHECKING, Any
 
@@ -97,16 +109,20 @@ __all__ = [
     "ArtifactError",
     "ArtifactIntegrityError",
     "ArtifactWriter",
+    "ManifestReport",
     "atomic_savez",
+    "finalize_run",
     "load_chain",
     "load_demo_result",
     "load_fit",
     "load_functionals",
+    "manifest_path",
     "save_chain",
     "save_demo_result",
     "save_fit",
     "save_functionals",
     "slug",
+    "verify_manifest",
 ]
 
 #: Version of the on-disk artifact schema (plan §5.1).  Bumped only when a
@@ -2740,3 +2756,564 @@ class ArtifactWriter:
     def _relative(self, path: Path) -> str:
         """Return ``path`` relative to the run root, as a POSIX-style string."""
         return Path(os.path.relpath(path, self._root)).as_posix()
+
+
+# ---------------------------------------------------------------------------
+# Run manifest (plan §6.1)
+# ---------------------------------------------------------------------------
+
+#: The one run-level manifest.  It is written at the root of a replication run
+#: and never lists itself: a file cannot carry its own hash, so the report
+#: records ``sha256(MANIFEST.json)`` externally (plan §8 item 1).
+_MANIFEST_NAME = "MANIFEST.json"
+
+#: Shape of a stored SHA-256 digest (lowercase hexadecimal).
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+#: Read size used while hashing.  One MiB keeps a 96 MB trace at ~100 reads and
+#: the peak memory of a verification at one chunk per file.
+_HASH_CHUNK = 1024 * 1024
+
+#: Package versions recorded as run provenance.  ``importlib.metadata`` reads
+#: the installed distributions; nothing is imported, so the artifact module
+#: still keeps ``matplotlib`` out of ``sys.modules`` (plan §6.1).
+_PROVENANCE_PACKAGES = (
+    "numpy",
+    "scipy",
+    "pandas",
+    "polars",
+    "pyarrow",
+    "matplotlib",
+)
+
+#: Keys of the run-level manifest.  The set is exact so a typo cannot hide
+#: behind an ignored field.
+_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "created_at",
+        "code_sha",
+        "code_dirty",
+        "pixi_lock_sha256",
+        "packages",
+        "sections",
+        "meta",
+        "file_count",
+        "total_bytes",
+        "files",
+    }
+)
+
+#: Keys of one ``files`` entry: the digest and the byte size of one artifact.
+_FILE_RECORD_KEYS = frozenset({"sha256", "size"})
+
+
+@dataclass(frozen=True)
+class ManifestReport:
+    """What :func:`verify_manifest` checked and found.
+
+    A report is returned only when every listed artifact matches its recorded
+    size and digest, listed paths are safe, and no unlisted artifact exists
+    (unless the caller allowed extras).  Anything else raises
+    :class:`ArtifactIntegrityError`, so a returned report is a pass.
+
+    Attributes
+    ----------
+    root:
+        The run root that was verified.
+    manifest:
+        ``<root>/MANIFEST.json``.
+    schema_version:
+        The version the manifest claims; it equals :data:`SCHEMA_VERSION`.
+    created_at:
+        The manifest's ISO 8601 UTC stamp, as written by :func:`finalize_run`.
+    code_sha / code_dirty:
+        The git revision and dirty flag recorded at finalisation, or ``None``
+        when the run was finalised outside a repository.
+    file_count / total_bytes:
+        Number of artifacts listed and their summed size (the manifest's own
+        file is never part of either).
+    paths:
+        The verified artifact paths, relative to ``root``, in sorted order.
+    extra:
+        Unlisted artifacts found under ``root``.  Empty unless the caller
+        passed ``allow_extra=True``.
+    """
+
+    root: Path
+    manifest: Path
+    schema_version: int
+    created_at: str
+    code_sha: str | None
+    code_dirty: bool | None
+    file_count: int
+    total_bytes: int
+    paths: tuple[str, ...]
+    extra: tuple[str, ...] = ()
+
+
+def manifest_path(root: str | os.PathLike[str]) -> Path:
+    """Return the run-level manifest path of ``root`` without touching disk.
+
+    ``root`` need not exist yet; this is the path :func:`finalize_run` writes
+    and :func:`verify_manifest` reads.
+
+    Raises
+    ------
+    ArtifactError
+        If ``root`` is not a non-empty path.
+    """
+    return _validated_root(root) / _MANIFEST_NAME
+
+
+def _existing_run_root(root: object) -> Path:
+    """Validate a run root that must already exist as a directory."""
+    target = _validated_root(root)
+    if not target.exists():
+        raise ArtifactError(f"artifact run root does not exist: {target}")
+    if not target.is_dir():
+        raise ArtifactError(f"artifact run root is not a directory: {target}")
+    return target
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the lowercase SHA-256 digest of one file, read in chunks."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            while chunk := handle.read(_HASH_CHUNK):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ArtifactIntegrityError(f"{path}: cannot hash artifact: {exc}") from exc
+    return digest.hexdigest()
+
+
+def _run_tree_files(root: Path, manifest: Path) -> list[Path]:
+    """List every file under ``root`` except the manifest itself.
+
+    The walk is deterministic (sorted directories and names) and does not
+    follow directory symlinks, so two finalisations of the same tree list the
+    same paths.  Directories are not artifacts: an empty directory is not
+    part of the checksum record.
+    """
+    paths: list[Path] = []
+    for directory, subdirectories, filenames in os.walk(root):
+        subdirectories.sort()
+        for name in sorted(filenames):
+            path = Path(directory, name)
+            if path == manifest:
+                continue
+            paths.append(path)
+    return paths
+
+
+def _git_output(root: Path, *arguments: str) -> str | None:
+    """Run one read-only git command, returning ``None`` when it cannot work.
+
+    Finalising a run outside a repository, or on a machine without git, must
+    still produce a manifest; the provenance field then stays ``null``.  No
+    command here writes to the repository.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except OSError, subprocess.SubprocessError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
+def _installed_versions() -> dict[str, str]:
+    """Return the installed versions of the packages the run depends on."""
+    versions: dict[str, str] = {}
+    for name in _PROVENANCE_PACKAGES:
+        try:
+            versions[name] = _package_version(name)
+        except _PackageNotFoundError:
+            continue
+    return versions
+
+
+def _run_provenance(root: Path) -> dict[str, Any]:
+    """Collect the code and environment provenance of a run root.
+
+    The run root normally lives inside the repository (``output/`` is
+    git-ignored), so the git calls work from there.  ``code_dirty`` counts
+    every path ``git status --porcelain`` reports, which never includes the
+    ignored ``output/`` tree itself; ``pixi_lock_sha256`` is the digest of the
+    repository's ``pixi.lock``.  Each field degrades to ``None`` instead of
+    failing the finalisation.
+    """
+    revision = _git_output(root, "rev-parse", "HEAD")
+    status = _git_output(root, "status", "--porcelain")
+    toplevel = _git_output(root, "rev-parse", "--show-toplevel")
+
+    lock_sha: str | None = None
+    if toplevel is not None and toplevel.strip():
+        lock = Path(toplevel.strip()) / "pixi.lock"
+        if lock.is_file():
+            lock_sha = _sha256_file(lock)
+
+    return {
+        "code_sha": (revision.strip() or None) if revision is not None else None,
+        "code_dirty": bool(status.strip()) if status is not None else None,
+        "pixi_lock_sha256": lock_sha,
+        "packages": _installed_versions(),
+    }
+
+
+def _section_metas(root: Path) -> dict[str, Any]:
+    """Return the section ``meta.json`` payloads found under ``root``.
+
+    One replication root holds one directory per section (``5.1/``,
+    ``5.2/``); each is named by its ``meta.json``.  The manifests keeps those
+    payloads verbatim so the run-level record carries the preset, seeds and
+    timings without depending on section files that a later cleanup could
+    remove.  A section file at another schema version is an integrity error,
+    exactly as it is for the loaders.
+    """
+    sections: dict[str, Any] = {}
+    for entry in sorted(root.iterdir()):
+        meta_file = entry / _DEMO_META_NAME
+        if not entry.is_dir() or not meta_file.is_file():
+            continue
+        payload = _read_json_object(meta_file, kind="section metadata")
+        if not isinstance(payload, Mapping):
+            raise ArtifactIntegrityError(
+                f"{meta_file}: section metadata must be a JSON object, "
+                f"got {type(payload).__name__}"
+            )
+        version = payload.get("schema_version")
+        if version != SCHEMA_VERSION:
+            raise ArtifactIntegrityError(
+                f"{meta_file}: unsupported schema_version {version!r}; "
+                f"expected {SCHEMA_VERSION}"
+            )
+        sections[entry.name] = dict(payload)
+    return sections
+
+
+def finalize_run(
+    root: str | os.PathLike[str], *, meta: Mapping[str, Any] | None = None
+) -> Path:
+    """Hash a completed run tree and write its single ``MANIFEST.json``.
+
+    Plan §6.1: called once after the report stage, over the whole run root, so
+    ``summary/``, ``report/`` and ``figures/`` are covered together with every
+    chain and functional.  A later stage (the §5.1 run joining the §5.2 tree,
+    R6) simply calls this again: the manifest is rewritten atomically and now
+    covers both sections.
+
+    The manifest is one JSON object::
+
+        schema_version, created_at,
+        code_sha, code_dirty, pixi_lock_sha256, packages,
+        sections:  {"5.1": <section meta.json>, "5.2": ...},
+        meta:      <caller provenance, verbatim>,
+        file_count, total_bytes,
+        files:     {"<posix relative path>": {"sha256": ..., "size": ...}}
+
+    ``MANIFEST.json`` never lists itself (a file cannot carry its own hash);
+    every other regular file under ``root`` is listed, including log files
+    and the report.  The file counts and sizes are consistent with the
+    ``files`` object by construction and are re-checked by
+    :func:`verify_manifest`.
+
+    Parameters
+    ----------
+    root:
+        The existing run root.  It is never created: finalising a mistyped
+        path would produce a manifest for an empty run.
+    meta:
+        Optional JSON-serialisable provenance (run stamp, harness notes)
+        stored under ``meta``.  Section payloads and code provenance are
+        collected automatically.
+
+    Returns
+    -------
+    pathlib.Path
+        The written ``MANIFEST.json``.
+
+    Raises
+    ------
+    ArtifactError
+        If ``root`` is unusable or ``meta`` has no JSON form.
+    ArtifactIntegrityError
+        If a file disappears or cannot be read while hashing, or a section
+        ``meta.json`` is malformed or at another schema version.
+    """
+    target = _existing_run_root(root)
+    manifest = target / _MANIFEST_NAME
+    caller_meta = _writer_meta(meta, name="run manifest meta")
+
+    files: dict[str, dict[str, Any]] = {}
+    total_bytes = 0
+    for path in _run_tree_files(target, manifest):
+        relative = path.relative_to(target).as_posix()
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise ArtifactIntegrityError(
+                f"{path}: cannot stat artifact: {exc}"
+            ) from exc
+        files[relative] = {"sha256": _sha256_file(path), "size": size}
+        total_bytes += size
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": _utc_timestamp(),
+        **_run_provenance(target),
+        "sections": _section_metas(target),
+        "meta": caller_meta,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "files": files,
+    }
+    return _write_json(manifest, payload)
+
+
+def _manifest_mapping(value: Any, name: str, target: Path) -> Mapping[str, Any]:
+    """Validate one JSON object field of a manifest."""
+    if not isinstance(value, Mapping):
+        raise ArtifactIntegrityError(
+            f"{target}: manifest field {name!r} must be a JSON object, "
+            f"got {type(value).__name__}"
+        )
+    return value
+
+
+def _manifest_string_map(value: Any, name: str, target: Path) -> dict[str, str]:
+    """Validate a manifest object whose values are all strings."""
+    mapping = _manifest_mapping(value, name, target)
+    converted: dict[str, str] = {}
+    for key, item in mapping.items():
+        if not isinstance(item, str):
+            raise ArtifactIntegrityError(
+                f"{target}: manifest field {name}[{key!r}] must be a string, "
+                f"got {type(item).__name__}"
+            )
+        converted[key] = item
+    return converted
+
+
+def _manifest_text(value: Any, name: str, target: Path) -> str:
+    """Validate a required non-empty string field of a manifest."""
+    if not isinstance(value, str) or not value:
+        raise ArtifactIntegrityError(
+            f"{target}: manifest field {name!r} must be a non-empty string, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _manifest_optional_string(value: Any, name: str, target: Path) -> str | None:
+    """Validate an optional non-empty string field of a manifest."""
+    if value is None:
+        return None
+    return _manifest_text(value, name, target)
+
+
+def _manifest_optional_bool(value: Any, name: str, target: Path) -> bool | None:
+    """Validate an optional boolean field of a manifest."""
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ArtifactIntegrityError(
+            f"{target}: manifest field {name!r} must be a boolean or null, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _manifest_relative_path(value: Any, target: Path) -> str:
+    """Validate a listed artifact path as a canonical relative POSIX path.
+
+    The path is later joined to the run root, so an absolute path, a ``..``
+    component, an empty/dot path or a non-canonical spelling (``a//b``) is
+    rejected rather than normalised: two spellings of one file would let a
+    manifest name one artifact twice.  A manifest naming itself is rejected
+    too -- that is the hash cycle the design forbids.
+    """
+    if not isinstance(value, str) or not value:
+        raise ArtifactIntegrityError(
+            f"{target}: manifest file path must be a non-empty string, got {value!r}"
+        )
+    relative = PurePosixPath(value)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+        or relative.as_posix() != value
+    ):
+        raise ArtifactIntegrityError(
+            f"{target}: manifest file path {value!r} is not a canonical path "
+            "relative to the run root"
+        )
+    if value == _MANIFEST_NAME:
+        raise ArtifactIntegrityError(f"{target}: the run manifest may not list itself")
+    return value
+
+
+def _manifest_file_record(value: Any, name: str, target: Path) -> tuple[str, int]:
+    """Validate one ``files`` entry and return ``(sha256, size)``."""
+    record = _require_record(value, _FILE_RECORD_KEYS, f"files[{name!r}]", target)
+    digest = record["sha256"]
+    if not isinstance(digest, str) or not _SHA256_HEX.match(digest):
+        raise ArtifactIntegrityError(
+            f"{target}: files[{name!r}].sha256 must be a 64-character "
+            f"lowercase hexadecimal digest, got {digest!r}"
+        )
+    size = _as_meta_int(record["size"], f"files[{name!r}].size", target, minimum=0)
+    return digest, size
+
+
+def verify_manifest(
+    root: str | os.PathLike[str], *, allow_extra: bool = False
+) -> ManifestReport:
+    """Re-hash a run tree against its ``MANIFEST.json``.
+
+    The reviewer entry point of plan §9 layer 1.  It reads the manifest,
+    validates its schema (including :data:`SCHEMA_VERSION`), then checks every
+    listed artifact:
+
+    * a missing file or a listed path that is not a regular file;
+    * a size mismatch (a truncated file);
+    * a SHA-256 mismatch (a flipped byte, or any edit of the same length).
+
+    It also walks the tree in the other direction: a file under the root that
+    the manifest does not list is an integrity failure unless the caller
+    passed ``allow_extra=True`` (the verifier re-renders figures into a
+    scratch directory and may legitimately add files there).
+
+    Every failure is collected and reported in one :class:`ArtifactIntegrityError`
+    naming the manifest and each offending path, so a broken tree is fixed in
+    one pass instead of one exception per run.
+
+    Parameters
+    ----------
+    root:
+        The run root holding ``MANIFEST.json``.
+    allow_extra:
+        Accept unlisted files under ``root``.  They are listed in
+        :attr:`ManifestReport.extra`; listed files are still fully verified.
+
+    Returns
+    -------
+    ManifestReport
+        The verified manifest's provenance and artifact inventory.
+
+    Raises
+    ------
+    ArtifactError
+        If the root or the manifest is missing or unreadable.
+    ArtifactIntegrityError
+        If the manifest schema is invalid, a listed artifact fails its size or
+        digest check, or an unlisted artifact exists while ``allow_extra`` is
+        false.
+    """
+    target = _existing_run_root(root)
+    manifest = target / _MANIFEST_NAME
+    payload = _read_json_object(manifest, kind="run manifest")
+    record = _require_record(payload, _MANIFEST_KEYS, "run manifest", manifest)
+
+    schema_version = _as_meta_int(
+        record["schema_version"], "schema_version", manifest, minimum=1
+    )
+    if schema_version != SCHEMA_VERSION:
+        raise ArtifactIntegrityError(
+            f"{manifest}: unsupported schema_version {schema_version}; "
+            f"expected {SCHEMA_VERSION}"
+        )
+    created_at = _manifest_text(record["created_at"], "created_at", manifest)
+    code_sha = _manifest_optional_string(record["code_sha"], "code_sha", manifest)
+    code_dirty = _manifest_optional_bool(record["code_dirty"], "code_dirty", manifest)
+    _manifest_optional_string(record["pixi_lock_sha256"], "pixi_lock_sha256", manifest)
+    _manifest_string_map(record["packages"], "packages", manifest)
+    _manifest_mapping(record["sections"], "sections", manifest)
+    _manifest_mapping(record["meta"], "meta", manifest)
+
+    expected_count = _as_meta_int(
+        record["file_count"], "file_count", manifest, minimum=0
+    )
+    expected_bytes = _as_meta_int(
+        record["total_bytes"], "total_bytes", manifest, minimum=0
+    )
+    files = _manifest_mapping(record["files"], "files", manifest)
+    if expected_count != len(files):
+        raise ArtifactIntegrityError(
+            f"{manifest}: file_count is {expected_count} but the manifest "
+            f"lists {len(files)} files"
+        )
+
+    listed: dict[str, tuple[str, int]] = {}
+    for name, value in files.items():
+        relative = _manifest_relative_path(name, manifest)
+        listed[relative] = _manifest_file_record(value, relative, manifest)
+    total_bytes = sum(size for _, size in listed.values())
+    if expected_bytes != total_bytes:
+        raise ArtifactIntegrityError(
+            f"{manifest}: total_bytes is {expected_bytes} but the listed "
+            f"files total {total_bytes}"
+        )
+
+    failures: list[str] = []
+    for relative, (digest, size) in listed.items():
+        path = target / relative
+        if not path.is_file():
+            state = "is not a file" if path.exists() else "is missing"
+            failures.append(f"{path}: listed artifact {state}")
+            continue
+        try:
+            actual_size = path.stat().st_size
+        except OSError as exc:
+            failures.append(f"{path}: cannot stat artifact: {exc}")
+            continue
+        if actual_size != size:
+            failures.append(
+                f"{path}: size mismatch; manifest says {size}, found {actual_size}"
+            )
+            continue
+        actual_digest = _sha256_file(path)
+        if actual_digest != digest:
+            failures.append(
+                f"{path}: sha256 mismatch; manifest says {digest}, "
+                f"found {actual_digest}"
+            )
+    if failures:
+        raise ArtifactIntegrityError(
+            f"{manifest}: integrity check failed for {len(failures)} "
+            f"artifact(s):\n" + "\n".join(failures)
+        )
+
+    extra = tuple(
+        sorted(
+            path.relative_to(target).as_posix()
+            for path in _run_tree_files(target, manifest)
+            if path.relative_to(target).as_posix() not in listed
+        )
+    )
+    if extra and not allow_extra:
+        raise ArtifactIntegrityError(
+            f"{manifest}: {len(extra)} unlisted artifact(s) under {target}: "
+            f"{list(extra)}"
+        )
+
+    return ManifestReport(
+        root=target,
+        manifest=manifest,
+        schema_version=schema_version,
+        created_at=created_at,
+        code_sha=code_sha,
+        code_dirty=code_dirty,
+        file_count=len(listed),
+        total_bytes=total_bytes,
+        paths=tuple(sorted(listed)),
+        extra=extra,
+    )
