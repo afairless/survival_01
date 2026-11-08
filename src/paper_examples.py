@@ -568,10 +568,21 @@ def _pyplot() -> Any:
     return plt
 
 
+#: Fixed PNG metadata for every figure (plan R7).
+#:
+#: matplotlib writes its own version string into the ``Software`` slot by
+#: default and Pillow would add a creation time unless told otherwise, so the
+#: same stored draws would produce different bytes on the next render.  The
+#: report stage re-renders the figures from the artifacts and compares bytes,
+#: so the metadata is pinned to one constant and the ``dpi``/format are fixed
+#: too (``paper_report`` relies on both).
+PNG_METADATA: dict[str, str] = {"Software": "survival_01 replication"}
+
+
 def _save(fig: Any, path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=150, format="png", metadata=PNG_METADATA)
     _pyplot().close(fig)
     return path
 

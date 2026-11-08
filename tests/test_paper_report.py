@@ -1,7 +1,8 @@
-"""Unit tests for the artifact report payloads (plan §6.3, row 8).
+"""Tests for the artifact report payloads and renderer (plan §6.3).
 
 The report module turns a loaded ``DemoResult`` into the numbers the committed
-report quotes.  These tests pin four contracts:
+report quotes and then into the generated tables, CSVs and figures.  These
+tests pin six contracts:
 
 * the two summaries expose every Figure 1-5 quantity, with one row per fitted
   prior and JSON-safe values (``tests/test_paper_report.py`` is the drift guard
@@ -12,15 +13,25 @@ report quotes.  These tests pin four contracts:
 * the diagnostics on the slice reproduce ``r_hat``/``ess`` computed directly
   from the sliced chains, and leave the inputs untouched;
 * the baseline delta names the rows that cannot match by construction and uses
-  the expected sign for every comparable row.
+  the expected sign for every comparable row;
+* every acceptance clause is evaluated from the summary alone, with unique
+  names and the same thresholds the acceptance tests use;
+* the writer lays out ``summary/``, ``report/`` and ``figures/`` exactly as
+  plan §5 specifies, and re-rendering the same functionals yields
+  **byte-identical** PNGs (the figures carry fixed metadata, so a second render
+  cannot pick up a creation time or a matplotlib version string).
 
 The fixtures are deliberately synthetic: a report payload is a pure function
 of chains and functionals, so a tiny deterministic ``DemoResult`` exercises it
-without a second of MCMC.
+without a second of MCMC.  The integration tests save a small artifact tree
+with ``save_demo_result`` and read it back with ``load_demo_result`` first, so
+the writer is exercised on a loaded ``DemoResult`` exactly like the CLI.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import subprocess
 import sys
@@ -30,7 +41,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src import paper_report
+from src import paper_artifacts, paper_report
 from src.dp_functionals import Functionals
 from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData, ess, r_hat
 from src.paper_examples import REPO_ROOT, DemoResult, Fit, prior_label
@@ -693,3 +704,556 @@ def test_delta_vs_baseline_returns_none_for_a_shape_change(
     summary["figure_1"]["nu_prior_mean"] = [2.22, 20.0]
     delta = paper_report.delta_vs_baseline(summary)
     assert delta["rows"]["figure_1.nu_prior_mean"]["delta"] is None
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers: a synthetic result the artifact loader can round-trip
+# ---------------------------------------------------------------------------
+def _artifact_ready(result: DemoResult) -> DemoResult:
+    """Give every chain of a fit the same settings, as a real fit does.
+
+    ``save_fit`` refuses a fit whose chains record different settings; the
+    synthetic chains above each carry their own seed, which is harmless for a
+    summary but not for serialisation.
+    """
+    fits: dict[str, Fit] = {}
+    for key, fit in result.fits.items():
+        settings = fit.chains[0].settings
+        fits[key] = replace(
+            fit,
+            chains=[replace(chain, settings=settings) for chain in fit.chains],
+        )
+    return replace(result, fits=fits)
+
+
+def _artifact_result_5_2() -> DemoResult:
+    """A saveable Section 5.2 result with bare fit labels and real keys."""
+    t_grid = np.linspace(0.1, 50.0, 80)
+    fits: dict[str, Fit] = {}
+    for index in range(len(PRIOR_TABLE)):
+        label = prior_label(index)
+        fits[f"A: {label}"] = _fit(
+            label,
+            t_grid=t_grid,
+            seed=200 * (index + 1),
+            prior=_prior(index),
+            low=0.1,
+            high=0.2,
+        )
+    label_b = prior_label(0)
+    fits[f"B: {label_b}"] = _fit(
+        label_b,
+        t_grid=t_grid,
+        seed=900,
+        prior=_prior(0),
+        low=0.12,
+        high=0.22,
+        bump=True,
+    )
+    return _artifact_ready(
+        DemoResult(
+            label="5.2",
+            fits=fits,
+            meta={
+                "preset": "quick",
+                "seed": 20240602,
+                "prior_indices": (0, 1, 2),
+                "n_chains": 2,
+                "n_save": 8,
+                "t_max": float(t_grid[-1]),
+            },
+        )
+    )
+
+
+def _save_section(tmp_path: Path, result: DemoResult) -> tuple[Path, DemoResult]:
+    """Write a synthetic section, then load it back as the CLI would."""
+    section = tmp_path / "replication-test" / result.label
+    paper_artifacts.save_demo_result(section, _artifact_ready(result))
+    return section, paper_artifacts.load_demo_result(section)
+
+
+# ---------------------------------------------------------------------------
+# Acceptance clauses
+# ---------------------------------------------------------------------------
+def test_evaluate_acceptance_5_1_has_unique_json_rows(
+    result_5_1: DemoResult,
+) -> None:
+    """Every Figure 1-3 clause is one row with a name, target and verdict."""
+    payload = paper_report.evaluate_acceptance(paper_report.summarize_5_1(result_5_1))
+
+    assert payload["label"] == "5.1"
+    assert payload["n_clauses"] == len(payload["clauses"]) > 0
+    assert payload["n_passed"] == sum(
+        1 for clause in payload["clauses"] if clause["pass"]
+    )
+    assert payload["passed"] is (payload["n_passed"] == payload["n_clauses"])
+
+    names = [clause["clause"] for clause in payload["clauses"]]
+    assert len(set(names)) == len(names)
+    for clause in payload["clauses"]:
+        assert set(clause) == {
+            "clause",
+            "description",
+            "target",
+            "observed",
+            "pass",
+        }
+        assert isinstance(clause["pass"], bool)
+        assert clause["description"]
+    json.dumps(payload)
+
+
+def test_evaluate_acceptance_5_2_has_unique_json_rows() -> None:
+    result = _artifact_result_5_2()
+    payload = paper_report.evaluate_acceptance(paper_report.summarize_5_2(result))
+
+    assert payload["label"] == "5.2"
+    assert payload["n_clauses"] >= len(paper_report.ACCEPTANCE_TARGETS["5.2"]) - 2
+    names = [clause["clause"] for clause in payload["clauses"]]
+    assert len(set(names)) == len(names)
+    assert any(
+        clause["clause"] == "figure_5.prob_eta_a_gt_eta_b"
+        for clause in payload["clauses"]
+    )
+    json.dumps(payload)
+
+
+def test_evaluate_acceptance_uses_the_mirrored_thresholds(
+    result_5_1: DemoResult,
+) -> None:
+    """A clause that names a target constant carries that exact threshold."""
+    payload = paper_report.evaluate_acceptance(paper_report.summarize_5_1(result_5_1))
+    clauses = {clause["clause"]: clause for clause in payload["clauses"]}
+    targets = paper_report.ACCEPTANCE_TARGETS["5.1"]
+
+    probability = clauses["figure_1.n_star_probability[0]"]
+    assert probability["target"] == targets["N_STAR_MIN_PROBABILITIES"][0]
+    ratio = clauses["figure_3.band_ratio[0]"]
+    assert ratio["target"] == targets["HAZARD_BAND_RATIO"]
+    points = clauses["figure_3.change_points[0]"]
+    assert points["target"]["points"] == list(targets["HAZARD_CHANGE_POINTS"])
+    assert points["target"]["tolerances"] == list(targets["HAZARD_CHANGE_TOLERANCES"])
+
+
+def test_evaluate_acceptance_rejects_an_unknown_section() -> None:
+    with pytest.raises(ValueError, match="9.9"):
+        paper_report.evaluate_acceptance({"label": "9.9"})
+
+
+# ---------------------------------------------------------------------------
+# Payload assembly
+# ---------------------------------------------------------------------------
+def test_build_payload_carries_both_draw_sets(result_5_1: DemoResult) -> None:
+    payload = paper_report.build_payload(result_5_1)
+
+    assert payload["schema_version"] == paper_report.REPORT_SCHEMA_VERSION
+    assert payload["label"] == "5.1"
+    assert payload["full"]["label"] == "5.1"
+    assert payload["first_500"]["label"] == "5.1"
+    assert payload["acceptance"]["label"] == "5.1"
+    assert payload["delta"]["label"] == "5.1"
+    assert payload["diagnostics"]["slice_draws"] == paper_report.SLICE_DRAWS
+    assert payload["settings"]["n_fits"] == len(PRIOR_TABLE)
+    assert payload["settings"]["slice_draws"] == paper_report.SLICE_DRAWS
+    assert payload["manifest"] is None
+    # The first-500 summary is the run itself here: the fixture holds 8 draws.
+    assert payload["first_500"]["figure_1"] == payload["full"]["figure_1"]
+    json.dumps(payload)
+
+
+def test_build_payload_reads_the_manifest_when_it_exists(
+    tmp_path: Path, result_5_1: DemoResult
+) -> None:
+    section, loaded = _save_section(tmp_path, result_5_1)
+    manifest = {
+        "schema_version": 1,
+        "created_at": "2026-11-08T00:00:00Z",
+        "code_sha": "0" * 40,
+        "code_dirty": False,
+        "pixi_lock_sha256": "1" * 64,
+        "packages": {"numpy": "2.0.0"},
+        "sections": {"5.1": {}, "5.2": {}},
+        "file_count": 12,
+        "total_bytes": 3456,
+    }
+    (section.parent / "MANIFEST.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    payload = paper_report.build_payload(loaded, save_dir=section)
+
+    assert payload["manifest"] is not None
+    assert payload["manifest"]["sections"] == ["5.1", "5.2"]
+    assert payload["manifest"]["file_count"] == 12
+    assert payload["manifest"]["total_bytes"] == 3456
+    assert "root" not in payload["manifest"]
+
+
+def test_build_payload_rejects_an_unknown_label() -> None:
+    with pytest.raises(ValueError, match="9.9"):
+        paper_report.build_payload(DemoResult(label="9.9", fits={}))
+
+
+# ---------------------------------------------------------------------------
+# Manifest summary
+# ---------------------------------------------------------------------------
+def test_manifest_summary_is_none_before_finalisation(tmp_path: Path) -> None:
+    section = tmp_path / "5.1"
+    section.mkdir()
+    assert paper_report.manifest_summary(section) is None
+
+
+def test_manifest_summary_rejects_a_corrupt_manifest(tmp_path: Path) -> None:
+    section = tmp_path / "run" / "5.1"
+    section.mkdir(parents=True)
+    (section.parent / "MANIFEST.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="MANIFEST.json"):
+        paper_report.manifest_summary(section)
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+def test_render_markdown_5_1_has_every_table(result_5_1: DemoResult) -> None:
+    payload = paper_report.build_payload(result_5_1)
+    text = paper_report.render_markdown(payload)
+
+    for header in (
+        "## Settings",
+        "## Figure 1",
+        "## Figure 2",
+        "## Figure 3",
+        "## Diagnostics",
+        "## Acceptance",
+        "## Delta vs baseline",
+        "## Manifest",
+    ):
+        assert header in text, header
+    assert "## Figure 4" not in text
+    assert "## Figure 5" not in text
+    # Deterministic: a second render is the same text, no timestamp involved.
+    assert text == paper_report.render_markdown(payload)
+    assert text.endswith("\n")
+
+
+def test_render_markdown_5_2_has_every_table() -> None:
+    result = _artifact_result_5_2()
+    payload = paper_report.build_payload(result)
+    text = paper_report.render_markdown(payload)
+
+    for header in (
+        "## Figure 4: prior agreement",
+        "## Figure 4: prior agreement matrix",
+        "## Figure 5",
+        "## Acceptance",
+        "## Delta vs baseline",
+        "## Manifest",
+    ):
+        assert header in text, header
+    assert "## Figure 1" not in text
+    assert "## Figure 3" not in text
+
+
+def test_render_markdown_escapes_pipes_in_cells() -> None:
+    result = _artifact_result_5_2()
+    text = paper_report.render_markdown(paper_report.build_payload(result))
+
+    assert "Pr(eta_A > eta_B \\| D)" in text
+    for line in text.splitlines():
+        if line.startswith("| Pr("):
+            # Three column separators plus one escaped pipe inside the cell.
+            assert line.count("|") - line.count("\\|") == 3, line
+
+
+def test_render_markdown_rejects_a_missing_key(result_5_1: DemoResult) -> None:
+    payload = paper_report.build_payload(result_5_1)
+    payload.pop("delta")
+    with pytest.raises(ValueError, match="delta"):
+        paper_report.render_markdown(payload)
+
+
+# ---------------------------------------------------------------------------
+# CSV payloads
+# ---------------------------------------------------------------------------
+def _parse_csv(text: str) -> list[dict[str, str]]:
+    return list(csv.DictReader(io.StringIO(text)))
+
+
+def test_rhat_ess_rows_cover_both_draw_sets(result_5_1: DemoResult) -> None:
+    payload = paper_report.build_payload(result_5_1)
+    rows = paper_report.rhat_ess_rows(payload)
+
+    assert {row[1] for row in rows} == {"full", "first_500"}
+    assert {row[3] for row in rows} == {"nu", "n_star", "S"}
+    for fit in payload["diagnostics"]["fits"]:
+        block = payload["diagnostics"]["fits"][fit]
+        for draw_set in ("full", "first_500"):
+            times = [
+                row[4]
+                for row in rows
+                if row[0] == fit and row[1] == draw_set and row[3] == "S"
+            ]
+            assert len(times) == len(block[draw_set]["S"]["t"]) == 5
+
+
+def test_rhat_ess_csv_is_a_header_and_long_rows(
+    tmp_path: Path, result_5_1: DemoResult
+) -> None:
+    section, loaded = _save_section(tmp_path, result_5_1)
+    payload = paper_report.build_payload(loaded, save_dir=section)
+    paper_report.write_report_artifacts(section, payload, loaded)
+
+    text = (section / "summary" / "rhat_ess.csv").read_text(encoding="utf-8")
+    assert text.splitlines()[0] == (
+        "fit,draw_set,draws_per_chain,variable,time,r_hat,ess"
+    )
+    rows = _parse_csv(text)
+    assert len(rows) == len(paper_report.rhat_ess_rows(payload))
+    assert all(row["fit"] for row in rows)
+    assert text.endswith("\n")
+
+
+def test_quantiles_rows_add_eta_for_5_2(tmp_path: Path) -> None:
+    result = _artifact_result_5_2()
+    section = tmp_path / "run" / "5.2"
+    paper_artifacts.save_demo_result(section, result)
+    loaded = paper_artifacts.load_demo_result(section)
+    payload = paper_report.build_payload(loaded, save_dir=section)
+    paper_report.write_report_artifacts(section, payload, loaded)
+
+    text = (section / "summary" / "quantiles.csv").read_text(encoding="utf-8")
+    rows = _parse_csv(text)
+    assert {row["quantity"] for row in rows} == {"nu", "n_star", "eta_median"}
+    eta_rows = [row for row in rows if row["quantity"] == "eta_median"]
+    assert {row["arm"] for row in eta_rows} == {"A", "B"}
+    assert all(int(row["n_censored"]) >= 0 for row in rows)
+    # No §5.1 fit has an eta row: the paired comparison belongs to §5.2 only.
+    assert all(
+        row["quantity"] != "eta_median"
+        for row in _parse_csv(
+            paper_report._csv_text(
+                [
+                    "fit",
+                    "arm",
+                    "quantity",
+                    "mean",
+                    "p2.5",
+                    "p50",
+                    "p97.5",
+                    "n_censored",
+                ],
+                paper_report.quantiles_rows(_artifact_ready(_result_5_1())),
+            )
+        )
+    )
+
+
+def _result_5_1() -> DemoResult:
+    """A bare 5.1 result for the CSV test (no fixture needed)."""
+    t_grid = np.linspace(0.1, 5.75, 60)
+    fits = {
+        prior_label(index): _fit(
+            prior_label(index),
+            t_grid=t_grid,
+            seed=100 * (index + 1),
+            prior=_prior(index),
+            band=index == 0,
+        )
+        for index in range(len(PRIOR_TABLE))
+    }
+    return DemoResult(
+        label="5.1",
+        fits=fits,
+        meta={"preset": "quick", "n_chains": 2, "n_save": 8},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Artifact writer (integration)
+# ---------------------------------------------------------------------------
+def test_write_report_artifacts_writes_the_plan_layout(
+    tmp_path: Path, result_5_1: DemoResult
+) -> None:
+    section, loaded = _save_section(tmp_path, result_5_1)
+    payload = paper_report.build_payload(loaded, save_dir=section)
+    written = paper_report.write_report_artifacts(section, payload, loaded)
+
+    assert set(written) == {
+        "stats",
+        "rhat_ess",
+        "quantiles",
+        "acceptance",
+        "tables",
+        "figure_1",
+        "figure_2",
+        "figure_3",
+    }
+    for path in written.values():
+        assert path.is_file()
+        assert path.is_relative_to(section)
+
+    stats = json.loads((section / "summary" / "stats.json").read_text())
+    assert stats["full"] == payload["full"]
+    assert stats["first_500"] == payload["first_500"]
+    assert stats["acceptance"]["label"] == "5.1"
+
+    acceptance = json.loads((section / "summary" / "acceptance.json").read_text())
+    assert acceptance["n_clauses"] == len(payload["acceptance"]["clauses"])
+
+    tables = (section / "report" / "tables.md").read_text(encoding="utf-8")
+    assert tables == paper_report.render_markdown(payload)
+    assert "## Acceptance" in tables
+    assert "## Manifest" in tables
+
+    # The writer owns the report half only: the section's draws are untouched.
+    assert (section / "meta.json").is_file()
+    assert (section / "draws").is_dir()
+
+
+def test_write_report_artifacts_renders_byte_identical_figures(
+    tmp_path: Path, result_5_1: DemoResult
+) -> None:
+    """The same stored functionals must give the same PNG bytes."""
+    section, loaded = _save_section(tmp_path, result_5_1)
+    payload = paper_report.build_payload(loaded, save_dir=section)
+
+    first = paper_report.write_report_artifacts(section, payload, loaded)
+    first_bytes = {
+        name: path.read_bytes()
+        for name, path in first.items()
+        if name.startswith("figure_")
+    }
+    second = paper_report.write_report_artifacts(section, payload, loaded)
+    second_bytes = {
+        name: path.read_bytes()
+        for name, path in second.items()
+        if name.startswith("figure_")
+    }
+
+    assert first_bytes == second_bytes
+    assert len(set(first_bytes.values())) == len(first_bytes) == 3
+    for name, data in first_bytes.items():
+        assert data.startswith(b"\x89PNG\r\n\x1a\n"), name
+        # Fixed metadata: no creation time and no drift-prone extra chunks.
+        assert b"Creation" not in data, name
+
+
+def test_write_report_artifacts_5_2_writes_figures_4_and_5(
+    tmp_path: Path,
+) -> None:
+    result = _artifact_result_5_2()
+    section = tmp_path / "run" / "5.2"
+    paper_artifacts.save_demo_result(section, result)
+    loaded = paper_artifacts.load_demo_result(section)
+    payload = paper_report.build_payload(loaded, save_dir=section)
+    written = paper_report.write_report_artifacts(section, payload, loaded)
+
+    assert {"figure_4", "figure_5"} <= set(written)
+    assert "figure_1" not in written
+    assert (section / "figures" / "figure_4.png").is_file()
+    assert (section / "figures" / "figure_5.png").is_file()
+    tables = (section / "report" / "tables.md").read_text(encoding="utf-8")
+    assert "## Figure 4: prior agreement matrix" in tables
+    assert "n_eta_above_grid" in tables
+
+
+def test_write_report_artifacts_rejects_a_label_mismatch(
+    tmp_path: Path, result_5_1: DemoResult
+) -> None:
+    payload = paper_report.build_payload(result_5_1)
+    payload["label"] = "5.2"
+    with pytest.raises(ValueError, match="disagrees"):
+        paper_report.write_report_artifacts(tmp_path, payload, result_5_1)
+
+
+def test_write_report_artifacts_skips_figure_2_without_a_band(
+    tmp_path: Path, result_5_1: DemoResult
+) -> None:
+    bare = paper_report.DemoResult(
+        label="5.1",
+        fits={
+            key: replace(fit, prior_band=None) for key, fit in result_5_1.fits.items()
+        },
+        meta=dict(result_5_1.meta),
+    )
+    section, loaded = _save_section(tmp_path, bare)
+    payload = paper_report.build_payload(loaded, save_dir=section)
+    written = paper_report.write_report_artifacts(section, payload, loaded)
+
+    assert "figure_2" not in written
+    assert "figure_1" in written and "figure_3" in written
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def test_main_writes_then_prints_the_tables(
+    tmp_path: Path,
+    result_5_1: DemoResult,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    section, _ = _save_section(tmp_path, result_5_1)
+
+    assert paper_report.main(["--from-artifacts", str(section), "--write"]) == 0
+    captured = capsys.readouterr()
+    assert "wrote stats:" in captured.out
+    assert "acceptance clauses pass" in captured.out
+    assert (section / "report" / "tables.md").is_file()
+
+    assert paper_report.main(["--from-artifacts", str(section)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("# Replication report: section 5.1")
+    assert "## Acceptance" in captured.out
+    assert "acceptance clauses pass" in captured.err
+
+
+def test_main_reports_a_missing_artifact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "does-not-exist"
+    assert paper_report.main(["--from-artifacts", str(missing)]) == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "does-not-exist" in captured.err
+
+
+def test_main_reports_a_missing_baseline(
+    tmp_path: Path,
+    result_5_1: DemoResult,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    section, _ = _save_section(tmp_path, result_5_1)
+    missing = tmp_path / "baseline.json"
+    assert (
+        paper_report.main(
+            [
+                "--from-artifacts",
+                str(section),
+                "--write",
+                "--baseline",
+                str(missing),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "baseline.json" in captured.err
+    # The failure happened before any report file was written.
+    assert not (section / "report" / "tables.md").exists()
+
+
+def test_main_module_help_runs() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "src.paper_report", "--help"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--from-artifacts" in completed.stdout
+    assert "--write" in completed.stdout
+    assert "--baseline" in completed.stdout

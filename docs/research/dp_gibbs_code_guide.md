@@ -26,15 +26,18 @@ It has two companions:
 | `src/dp_gibbs.py` | ingestion validation and the time transform, state and bookkeeping, the $\alpha$ quadrature grid, the three full conditionals, one sweep, chain storage, initialisation, the collapsed log-posterior, diagnostics | plotting, data generation, functionals |
 | `src/dp_functionals.py` | the paper's §3 steps (i)–(iii) for posterior *and* prior, survival/CDF/density/hazard/quantile functionals on the original scale, two-population comparisons | drawing $\theta$ |
 | `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz`/JSON writes, the self-contained chain, functional, fit and section round-trips, the incremental `ArtifactWriter` and its append-only event log, `finalize_run`/`verify_manifest` for the run-level manifest | fitting, plotting, recomputing summaries |
-| `src/paper_report.py` | report payloads: Figure 1-5 arithmetic, full/first-500 diagnostics, baseline deltas and the acceptance-target mirror | fitting, rendering, writing files, plotting |
+| `src/paper_report.py` | report payloads: Figure 1-5 arithmetic, full/first-500 diagnostics, baseline deltas, the acceptance-target mirror and verdicts, the generated tables/CSVs and the report CLI; the section's `figures/` re-render | fitting, sampling, writing outside the section directory |
 
 Two rules hold everywhere and are enforced by tests, not by convention:
 
 - **No global RNG.** Every function that randomises takes `rng` or `seed`
   explicitly; a chain is replayable from one integer.
-- **`matplotlib` only in `src/paper_examples.py`.** The test that imports
-  `src.dp_gibbs` and asserts `matplotlib` is absent from `sys.modules` is what
-  keeps the numerical modules importable on a headless machine.
+- **`matplotlib` is imported lazily, never at module import.** The figure
+  recipes live in `src/paper_examples.py`; `src/paper_report.py` calls them
+  through its own `_pyplot()`, which imports `matplotlib` on demand with the
+  Agg backend. Tests that import `src.dp_gibbs`, `src.paper_artifacts` or
+  `src.paper_report` and assert `matplotlib` is absent from `sys.modules` are
+  what keep the numerical modules importable on a headless machine.
 
 The sampler keeps the paper's parameterisation $K_W(t\mid\alpha,\lambda) =
 1-\exp(-t^\alpha/\lambda)$: $\lambda$ is *not* the standard Weibull scale and
@@ -730,6 +733,83 @@ unwritable run root prints one `error: ...` line to stderr and returns 1 rather
 than dumping a traceback; argparse still exits 2 for an invalid `--example`,
 `--preset` or `--prior`.
 
+### 6.10 Report rendering and the report CLI (`src/paper_report.py`)
+
+`build_payload(result, save_dir=..., baseline=...)` is the one payload the
+renderer and the writer share. It holds `full` and `first_500` (the note's
+probe, via `slice_result`) side by side, plus `diagnostics`, `acceptance`
+(judged on the **full** draws), `delta` (the first-500 summary against the
+baseline) and `manifest`. Everything in it is JSON-safe, so `summary/stats.json`
+is a verbatim dump and the committed report can be transcribed from one file.
+
+`evaluate_acceptance(summary)` turns a summary into one row per acceptance
+clause -- `clause`, `description`, `target`, `observed`, `pass` -- using only
+`ACCEPTANCE_TARGETS`, so `summary/acceptance.json` answers the gate question
+without importing the paper test modules. `_clauses_5_1` covers Figures 1-3
+and `_clauses_5_2` Figures 4-5; clause names are unique and index the prior
+(`figure_1.n_star_probability[0]`) or the quantity (`figure_5.difference_min`).
+
+`manifest_summary(section)` reads `<run_root>/MANIFEST.json`, i.e. the section
+directory's parent. The report normally runs **before** `finalize_run` (plan
+§7 Step 0), so a missing manifest returns `None` and the table says the run is
+not finalised yet; a manifest that exists but is unreadable or not JSON is a
+`ValueError`, because a corrupt run record must not be rendered as absent. The
+absolute run root is deliberately left out of the summary so a re-rendered
+`tables.md` does not depend on where the artifacts live.
+
+`render_markdown(payload)` produces the tables only: settings, diagnostics,
+the section's Figure tables, the acceptance table, the baseline delta and the
+manifest. It carries no timestamp, no absolute path and no dictionary-order
+dependency, so re-rendering the same artifacts is byte-identical -- which is
+what `scripts/verify_replication.sh` compares. Cells escape `|` and render
+`None` as `n/a`; booleans become `yes`/`no`.
+
+`write_report_artifacts(section, payload, result)` writes the report half of a
+section tree and nothing else:
+
+```text
+<section>/summary/stats.json        # the whole payload
+<section>/summary/rhat_ess.csv      # fit, draw_set, draws_per_chain, variable, time, r_hat, ess
+<section>/summary/quantiles.csv     # fit, arm, quantity, mean, p2.5, p50, p97.5, n_censored
+<section>/summary/acceptance.json   # clause -> target, observed, pass/fail
+<section>/report/tables.md          # render_markdown output
+<section>/figures/figure_*.png      # Figures 1-3 for 5.1, 4-5 for 5.2
+```
+
+`rhat_ess.csv` is long-format and carries both draw sets; the five `S` times
+share the variable name `S` and differ in the `time` column. `quantiles.csv`
+adds `n*` and, for §5.2, the per-draw median `eta` of both arms (the same
+paired `compare` call Figure 5 uses, at `p = 0.5`); `n_censored` counts the
+non-finite draws, which is how the censored-`eta` rows stay visible instead of
+being silently dropped. Writes are atomic (`<name>.tmp` + `os.replace`).
+
+The figures are re-rendered from the loaded `Functionals` by the
+`paper_examples` recipes: the report stage is the **only** figure writer (plan
+R7), so the driver returns `figures=()` whenever it was given `--save-dir`. A
+§5.1 fit without `prior_band` has no Figure 2 and that panel is skipped rather
+than drawn from the posterior alone. PNG bytes are reproducible because
+`paper_examples._save` pins `dpi=150`, `format="png"` and
+`metadata=PNG_METADATA` (`{"Software": "survival_01 replication"}`): without
+that, matplotlib writes its own version string and Pillow a creation time, and
+the same draws would yield different bytes on the next render. The regression
+test renders the same functionals twice and compares **bytes**.
+
+`main` is the runbook's single report entry point:
+
+```bash
+python -m src.paper_report --from-artifacts output/run/5.2 --write
+python -m src.paper_report --from-artifacts output/run/5.1 --baseline other.json
+```
+
+`--from-artifacts DIR` is required (the **section** directory, not the run
+root), `--write` opts into the layout above and `--baseline FILE` overrides
+`docs/research/dp_gibbs_results_baseline.json`. Without `--write` the same
+tables are printed to stdout and only the `n/m acceptance clauses pass` line
+goes to stderr, which is the dry-run form. An unreadable artifact tree, a
+missing baseline or a payload the artifacts cannot supply prints one
+`error: ...` line and exits 1 -- the baseline is loaded and the payload built
+before anything is written, so a failed dry run leaves no partial report.
+
 ---
 
 ## 7. Gotcha checklist
@@ -784,7 +864,9 @@ The test suite of plan §7 is the argument. In the order it is worth reading:
 | 19, 20 | `test_invariance.py`, `test_degenerate.py` | data-order invariance, degenerate data |
 | 25, 26 | `test_functionals.py`, `test_quantiles.py` | functionals against closed forms and the inverse map |
 | 28 | `test_golden.py` | fixed-seed regression of the whole chain |
+| 29 | `test_paper_artifacts.py` | the artifact round-trips, event log and manifest verification |
 | 30 | `test_paper_5_1.py`, `test_paper_5_2.py` | the §6.3 reproduction, opt-in `-m paper` |
+| 31 | `test_paper_report.py` | report payloads, acceptance verdicts, generated tables/CSVs and the byte-identical figure re-render |
 
 Tests 15, 16, 17 are the ones that establish correctness rather than
 plausibility: exact enumeration on a small problem, a second implementation,
