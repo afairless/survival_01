@@ -84,6 +84,19 @@ One integration test closes the loop the plan asks for: a ``quick``-preset
 §5.2 arm-A fit is saved, loaded back, and must still feed ``r_hat()``/``ess()``
 with bit-identical values while ``run.meta == result.meta``.
 
+Step 5 adds the incremental writer the long runs use.  A section cannot be
+held in memory, so ``ArtifactWriter`` writes each fit as soon as it is fitted,
+attaches the prior band to the reference fit (rewriting only the two band
+fields of ``fit-meta.json``, because an unlisted band file is an integrity
+error) and writes the section ``meta.json`` last.  The tests pin the plan §5
+layout, the append-only ``logs/events-<section>.jsonl`` stream (one JSON
+object per line with ``ts``/``t_monotonic``/``kind``, extended rather than
+truncated by a second writer, fields validated *before* the fit directory is
+written), the defaults a fit takes from the section meta, the fit/band target
+resolution, and the refusal to write a section meta that names a fit directory
+the writer can no longer see.  The stream is the only run-level file this unit
+writes: ``MANIFEST.json`` belongs to the manifest unit.
+
 The property-based tests use seeded NumPy generators; the repository has no
 Hypothesis dependency.  The inputs are random, the invariants are
 deterministic.
@@ -96,6 +109,7 @@ import subprocess
 import sys
 import zipfile
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +123,7 @@ from src.paper_artifacts import (
     SCHEMA_VERSION,
     ArtifactError,
     ArtifactIntegrityError,
+    ArtifactWriter,
     _jsonable,
     atomic_savez,
     load_chain,
@@ -2430,3 +2445,506 @@ def test_quick_preset_round_trip_feeds_r_hat_and_ess(tmp_path: Path) -> None:
         np.testing.assert_array_equal(
             ess(loaded.chains, "S")[label], ess(fit.chains, "S")[label]
         )
+
+
+# ---------------------------------------------------------------------------
+# Incremental run writer (plan §6.1)
+# ---------------------------------------------------------------------------
+
+#: The section provenance a §5.2 driver records; ``t_max`` is the shared grid
+#: maximum, which is what makes arm B's fit record the common scale.
+WRITER_META: dict[str, Any] = {
+    "preset": "quick",
+    "seed": 20240602,
+    "data_seed": 721383,
+    "prior_indices": (0, 2),
+    "n_chains": 2,
+    "burn_in": 5,
+    "n_save": 4,
+    "thin": 1,
+    "t_max": 4.5518,
+    "t_max_a": 4.5518,
+    "t_max_b": 3.5,
+}
+
+
+def artifact_writer(
+    tmp_path: Path, *, section: str = "5.2", **kwargs: Any
+) -> ArtifactWriter:
+    """An :class:`ArtifactWriter` rooted at ``tmp_path/run``."""
+    kwargs.setdefault("meta", dict(WRITER_META))
+    return ArtifactWriter(tmp_path / "run", section=section, **kwargs)
+
+
+def writer_band(fit: Fit, *, n_draws: int = 3) -> Functionals:
+    """A prior band on ``fit``'s grid, shaped like the §5.1 band."""
+    band = make_functionals(
+        n_draws=n_draws,
+        n_grid=fit.t_grid.size,
+        seed=20261118,
+        meta=dict(PRIOR_BAND_META),
+    )
+    band.t_grid = np.array(fit.t_grid, copy=True)
+    return band
+
+
+def event_lines(path: Path) -> list[dict[str, Any]]:
+    """Parse an event stream into its JSON records."""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+# --- construction ----------------------------------------------------------
+
+
+def test_artifact_writer_uses_the_plan_layout(tmp_path: Path) -> None:
+    """Root, section directory and event stream follow plan §5 exactly."""
+    root = tmp_path / "run"
+    writer = ArtifactWriter(root, section="5.2", meta={"preset": "quick"})
+    assert writer.root == root
+    assert writer.section == "5.2"
+    assert writer.section_dir == root / "5.2"
+    assert writer.event_log == root / "logs" / "events-5.2.jsonl"
+    assert writer.fit_keys == ()
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("section", ["", ".", "..", "5/1", "5 1", "5\\1", 5, None])
+def test_artifact_writer_rejects_an_unusable_section(
+    tmp_path: Path, section: object
+) -> None:
+    """The section becomes a directory and file name, so it is validated."""
+    with pytest.raises(ArtifactError, match="section"):
+        ArtifactWriter(tmp_path / "run", section=section)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("root", ["", None, 3])
+def test_artifact_writer_rejects_an_unusable_root(root: object) -> None:
+    """An empty or non-path run root is named in the error."""
+    with pytest.raises(ArtifactError, match="run root"):
+        ArtifactWriter(root, section="5.1")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [object(), [1, 2], {"bad": object()}, {"bad": complex(1.0, 2.0)}],
+)
+def test_artifact_writer_rejects_unusable_section_meta(
+    tmp_path: Path, meta: object
+) -> None:
+    """The section meta is stored verbatim, so it must have a JSON form."""
+    with pytest.raises(ArtifactError, match="section meta"):
+        ArtifactWriter(tmp_path / "run", section="5.1", meta=meta)  # type: ignore[arg-type]
+
+
+def test_artifact_writer_label_defaults_to_the_section(tmp_path: Path) -> None:
+    """``DemoResult.label`` is the section name unless a caller overrides it."""
+    writer = artifact_writer(tmp_path)
+    writer.write_meta()
+    assert load_demo_result(writer.section_dir).label == "5.2"
+
+
+def test_artifact_writer_label_override_survives_write_meta(tmp_path: Path) -> None:
+    """A readable label is kept verbatim rather than slugged."""
+    writer = ArtifactWriter(
+        tmp_path / "run", section="5.1", meta={}, label="Section 5.1"
+    )
+    writer.write_meta()
+    assert load_demo_result(writer.section_dir).label == "Section 5.1"
+
+
+# --- event stream ----------------------------------------------------------
+
+
+def test_event_appends_one_json_object_per_line(tmp_path: Path) -> None:
+    """Each call appends one record with the documented keys."""
+    writer = artifact_writer(tmp_path)
+    first = writer.event("run_start", stage="driver", preset="quick")
+    second = writer.event("fit_start", key=FIT_LABEL, prior_indices=(0, 2))
+    lines = event_lines(writer.event_log)
+    assert len(lines) == 2
+    assert lines[0] == first
+    assert lines[1] == second
+    assert lines[0]["kind"] == "run_start"
+    assert lines[0]["stage"] == "driver"
+    assert lines[1]["prior_indices"] == [0, 2]
+    assert isinstance(lines[0]["t_monotonic"], float)
+    assert lines[1]["t_monotonic"] >= lines[0]["t_monotonic"]
+
+
+def test_event_stream_is_append_only_across_writers(tmp_path: Path) -> None:
+    """A second writer of the same section extends the stream, never truncates."""
+    first = artifact_writer(tmp_path)
+    first.event("run_start")
+    first.event("fit_done", key=FIT_LABEL)
+    log = first.event_log
+    before = log.read_text(encoding="utf-8")
+    second = artifact_writer(tmp_path)
+    second.event("run_end")
+    after = log.read_text(encoding="utf-8")
+    assert after.startswith(before)
+    assert [record["kind"] for record in event_lines(log)] == [
+        "run_start",
+        "fit_done",
+        "run_end",
+    ]
+
+
+def test_event_stamp_uses_the_injected_clocks(tmp_path: Path) -> None:
+    """``ts`` and ``t_monotonic`` are the documented clocks, not local time."""
+    writer = artifact_writer(
+        tmp_path,
+        wall_clock=lambda: "2026-11-08T00:00:01.250Z",
+        monotonic=lambda: 42.5,
+    )
+    record = writer.event("run_start")
+    assert record["ts"] == "2026-11-08T00:00:01.250Z"
+    assert record["t_monotonic"] == 42.5
+    parsed = datetime.fromisoformat(record["ts"].replace("Z", "+00:00"))
+    assert parsed.utcoffset() == timedelta(0)
+
+
+def test_default_event_stamp_is_iso_and_utc(tmp_path: Path) -> None:
+    """Without a seam the writer stamps an ISO 8601 UTC wall clock."""
+    writer = artifact_writer(tmp_path)
+    record = writer.event("run_start")
+    parsed = datetime.fromisoformat(record["ts"].replace("Z", "+00:00"))
+    assert parsed.utcoffset() == timedelta(0)
+    assert isinstance(record["t_monotonic"], float)
+    assert np.isfinite(record["t_monotonic"])
+
+
+@pytest.mark.parametrize("field", ["ts", "t_monotonic"])
+def test_event_rejects_a_reserved_field(tmp_path: Path, field: str) -> None:
+    """A caller field may not shadow the log's fixed schema."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="shadow"):
+        writer.event("run_start", **{field: "x"})
+    assert not writer.event_log.exists()
+
+
+@pytest.mark.parametrize("kind", ["", None, 3])
+def test_event_rejects_an_invalid_kind(tmp_path: Path, kind: object) -> None:
+    """Every line must name the stage it records."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="event kind"):
+        writer.event(kind)  # type: ignore[arg-type]
+    assert not writer.event_log.exists()
+
+
+def test_event_rejects_fields_without_a_json_form(tmp_path: Path) -> None:
+    """A non-serialisable field fails instead of being stringified."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="JSON-serialisable"):
+        writer.event("run_start", payload=object())
+    assert not writer.event_log.exists()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"wall_clock": lambda: ""},
+        {"wall_clock": lambda: 3},  # type: ignore[dict-item]
+        {"monotonic": lambda: float("inf")},
+        {"monotonic": lambda: float("nan")},
+    ],
+)
+def test_event_rejects_an_unusable_clock(
+    tmp_path: Path, kwargs: dict[str, Any]
+) -> None:
+    """An empty stamp or a non-finite tick would corrupt the ordering."""
+    writer = artifact_writer(tmp_path, **kwargs)
+    with pytest.raises(ArtifactError, match="clock"):
+        writer.event("run_start")
+    assert not writer.event_log.exists()
+
+
+# --- fit_done --------------------------------------------------------------
+
+
+def test_fit_done_writes_a_plan_shaped_fit_directory(tmp_path: Path) -> None:
+    """The directory name, fit-meta defaults and the event follow plan §5/§5.1."""
+    writer = artifact_writer(tmp_path)
+    fit = make_fit()
+    directory = writer.fit_done(fit, timing=1.5, arm="A")
+    assert directory == writer.section_dir / "draws" / "A-nu_Gamma_2_0.9"
+    assert_fits_equal(load_fit(directory), fit)
+    stored = fit_meta(directory)
+    assert stored["arm"] == "A"
+    assert stored["label"] == FIT_LABEL
+    assert stored["data_seed"] == 721383
+    assert stored["shared_t_max"] == 4.5518
+    assert stored["extra"]["timing"] == 1.5
+    assert writer.fit_keys == (f"A: {FIT_LABEL}",)
+    records = event_lines(writer.event_log)
+    assert len(records) == 1
+    assert records[0]["kind"] == "fit_done"
+    assert records[0]["key"] == f"A: {FIT_LABEL}"
+    assert records[0]["path"] == "5.2/draws/A-nu_Gamma_2_0.9"
+    assert records[0]["n_chains"] == fit.n_chains
+    assert records[0]["n_draws"] == fit.functionals.n_draws
+    assert records[0]["timing"] == 1.5
+
+
+def test_fit_done_without_an_arm_uses_the_five_one_directory(tmp_path: Path) -> None:
+    """§5.1 fits are keyed by the bare label and get no arm prefix."""
+    writer = artifact_writer(tmp_path, section="5.1")
+    fit = make_fit()
+    directory = writer.fit_done(fit)
+    assert directory == writer.section_dir / "draws" / "nu_Gamma_2_0.9"
+    assert fit_meta(directory)["arm"] is None
+    assert writer.fit_keys == (FIT_LABEL,)
+    assert event_lines(writer.event_log)[0]["key"] == FIT_LABEL
+
+
+def test_fit_done_provenance_overrides_the_section_defaults(tmp_path: Path) -> None:
+    """Explicit provenance wins over the section meta; the rest is ``extra``."""
+    writer = artifact_writer(tmp_path)
+    fit = make_fit()
+    directory = writer.fit_done(
+        fit,
+        timing={"chains": 0.5},
+        arm="A",
+        data_seed=11,
+        shared_t_max=9.5,
+        chain_seeds=(1, 2),
+    )
+    stored = fit_meta(directory)
+    assert stored["data_seed"] == 11
+    assert stored["shared_t_max"] == 9.5
+    assert stored["extra"] == {"timing": {"chains": 0.5}, "chain_seeds": [1, 2]}
+
+
+def test_fit_done_rejects_a_duplicate_fit(tmp_path: Path) -> None:
+    """Writing the same key twice would silently replace a finished fit."""
+    writer = artifact_writer(tmp_path)
+    writer.fit_done(make_fit(), arm="A")
+    with pytest.raises(ArtifactError, match="already written"):
+        writer.fit_done(make_fit(), arm="A")
+    assert len(event_lines(writer.event_log)) == 1
+
+
+def test_fit_done_rejects_a_slug_collision(tmp_path: Path) -> None:
+    """Two labels that slug to one name cannot both own a directory."""
+    writer = artifact_writer(tmp_path, section="5.1")
+    writer.fit_done(make_fit(label="nu ~ Gamma(2, 0.9)"))
+    with pytest.raises(ArtifactError, match="both map to the directory"):
+        writer.fit_done(make_fit(label="nu  ~ Gamma(2, 0.9)"))
+
+
+def test_fit_done_rejects_a_non_fit(tmp_path: Path) -> None:
+    """A duck-typed object is not a ``Fit``."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="Fit"):
+        writer.fit_done(object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("arm", ["", "A/B", "A B", "5A", 1])
+def test_fit_done_rejects_an_unusable_arm(tmp_path: Path, arm: object) -> None:
+    """The arm prefixes a directory name, so ``A/B`` cannot be accepted."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="arm"):
+        writer.fit_done(make_fit(), arm=arm)  # type: ignore[arg-type]
+
+
+def test_fit_done_rejects_provenance_without_a_json_form(tmp_path: Path) -> None:
+    """Fields are validated before the fit directory is written."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="JSON-serialisable"):
+        writer.fit_done(make_fit(), bad=object())
+    assert not (writer.section_dir / "draws" / "nu_Gamma_2_0.9").exists()
+    assert not writer.event_log.exists()
+
+
+# --- band_done -------------------------------------------------------------
+
+
+def test_band_done_attaches_the_band_to_the_first_fit(tmp_path: Path) -> None:
+    """The §5.1 reference fit carries the band, and the metadata lists it."""
+    writer = artifact_writer(tmp_path)
+    fit = make_fit()
+    directory = writer.fit_done(fit, arm="A")
+    band = writer_band(fit)
+    path = writer.band_done(band, timing=0.25)
+    assert path == directory / "prior-band.npz"
+    loaded = load_fit(directory)
+    assert loaded.prior_band is not None
+    assert_functionals_equal(loaded.prior_band, band)
+    assert loaded.prior_band.meta == _jsonable(PRIOR_BAND_META)
+    stored = fit_meta(directory)
+    assert stored["prior_band"] == {
+        "path": "prior-band.npz",
+        "dtype": "float64",
+        "shape": [3, int(fit.t_grid.size)],
+    }
+    assert stored["prior_band_meta"] == _jsonable(PRIOR_BAND_META)
+    assert stored["extra"]["band_timing"] == 0.25
+    records = event_lines(writer.event_log)
+    assert [record["kind"] for record in records] == ["fit_done", "band_done"]
+    assert records[1]["key"] == f"A: {FIT_LABEL}"
+    assert records[1]["n_draws"] == 3
+    assert records[1]["path"] == "5.2/draws/A-nu_Gamma_2_0.9/prior-band.npz"
+    assert records[1]["timing"] == 0.25
+
+
+def test_band_done_targets_an_explicit_fit(tmp_path: Path) -> None:
+    """An object, a label and an arm each select the band's fit directory."""
+    writer = artifact_writer(tmp_path)
+    fit_a = make_fit()
+    fit_b = make_fit(seed=20240603)
+    directory_a = writer.fit_done(fit_a, arm="A")
+    directory_b = writer.fit_done(fit_b, arm="B")
+    band = writer_band(fit_b)
+    assert writer.band_done(band, fit=fit_b, arm="B") == directory_b / "prior-band.npz"
+    assert load_fit(directory_b).prior_band is not None
+    assert load_fit(directory_a).prior_band is None
+    assert writer.band_done(band, arm="A") == directory_a / "prior-band.npz"
+    assert load_fit(directory_a).prior_band is not None
+    with pytest.raises(ArtifactError, match="several arms"):
+        writer.band_done(band, fit_label=FIT_LABEL)
+
+
+def test_band_done_rejects_an_unknown_target(tmp_path: Path) -> None:
+    """A label no fit was written under names the miss, and writes nothing."""
+    writer = artifact_writer(tmp_path)
+    fit = make_fit()
+    directory = writer.fit_done(fit, arm="A")
+    band = writer_band(fit)
+    with pytest.raises(ArtifactError, match="no fit with label"):
+        writer.band_done(band, fit_label="nu ~ Gamma(3, 0.05)")
+    assert not (directory / "prior-band.npz").exists()
+    assert fit_meta(directory)["prior_band"] is None
+
+
+def test_band_done_requires_a_written_fit(tmp_path: Path) -> None:
+    """The band is attached to a fit, so there must be one to attach it to."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="call fit_done"):
+        writer.band_done(make_functionals())
+
+
+def test_band_done_rejects_a_non_functionals(tmp_path: Path) -> None:
+    """A duck-typed band is refused before any write."""
+    writer = artifact_writer(tmp_path)
+    writer.fit_done(make_fit())
+    with pytest.raises(ArtifactError, match="Functionals"):
+        writer.band_done(object())  # type: ignore[arg-type]
+
+
+def test_band_done_rejects_a_grid_disagreement(tmp_path: Path) -> None:
+    """A band on a different grid would be rejected by ``load_fit``; refuse early."""
+    writer = artifact_writer(tmp_path)
+    fit = make_fit()
+    directory = writer.fit_done(fit)
+    band = writer_band(fit)
+    band.t_grid = band.t_grid * 1.5
+    with pytest.raises(ArtifactError, match="grid"):
+        writer.band_done(band)
+    assert not (directory / "prior-band.npz").exists()
+    assert fit_meta(directory)["prior_band"] is None
+
+
+def test_band_done_rejects_arrays_outside_the_schema(tmp_path: Path) -> None:
+    """A shape disagreement between the four arrays is caught before writing."""
+    writer = artifact_writer(tmp_path)
+    fit = make_fit()
+    directory = writer.fit_done(fit)
+    band = writer_band(fit)
+    band.S = band.S[:, :2]
+    with pytest.raises(ArtifactError, match="outside the artifact schema"):
+        writer.band_done(band)
+    assert not (directory / "prior-band.npz").exists()
+    assert fit_meta(directory)["prior_band"] is None
+
+
+def test_band_done_rejects_a_changed_fit_directory(tmp_path: Path) -> None:
+    """A fit directory resaved under another label is not the recorded fit."""
+    writer = artifact_writer(tmp_path)
+    fit = make_fit()
+    directory = writer.fit_done(fit, arm="A")
+    rewrite_fit_meta(directory, lambda payload: payload.__setitem__("arm", "B"))
+    with pytest.raises(ArtifactError, match="no longer match"):
+        writer.band_done(writer_band(fit))
+
+
+# --- write_meta ------------------------------------------------------------
+
+
+def test_write_meta_round_trips_through_load_demo_result(tmp_path: Path) -> None:
+    """A writer-built section loads as the driver's ``DemoResult``."""
+    writer = artifact_writer(tmp_path)
+    fit_a = make_fit()
+    fit_b = make_fit(seed=20240603)
+    band = writer_band(fit_a)
+    writer.fit_done(fit_a, timing=2.0, arm="A")
+    writer.fit_done(fit_b, timing=1.0, arm="B")
+    writer.band_done(band, fit=fit_a, arm="A", timing=0.1)
+    meta_path = writer.write_meta()
+    assert meta_path == writer.section_dir / "meta.json"
+    assert not (meta_path.with_suffix(".json.tmp")).exists()
+    run = load_demo_result(writer.section_dir)
+    keys = [f"A: {FIT_LABEL}", f"B: {FIT_LABEL}"]
+    assert list(run.fits) == keys
+    assert run.label == "5.2"
+    assert run.meta == WRITER_META
+    assert run.meta["prior_indices"] == (0, 2)
+    assert run.figures == ()
+    assert_fits_equal(run.fits[keys[0]], replace(fit_a, prior_band=band))
+    assert_fits_equal(run.fits[keys[1]], fit_b)
+    assert demo_meta(writer.section_dir)["fit_keys"] == keys
+
+
+def test_write_meta_round_trips_an_empty_section(tmp_path: Path) -> None:
+    """The None end: no fits still produces a loadable section."""
+    writer = artifact_writer(
+        tmp_path, section="5.1", meta={"preset": "quick", "seed": None}
+    )
+    writer.write_meta()
+    run = load_demo_result(writer.section_dir)
+    assert run.fits == {}
+    assert run.label == "5.1"
+    assert run.meta == {"preset": "quick", "seed": None}
+    assert demo_meta(writer.section_dir)["fit_keys"] == []
+
+
+def test_write_meta_rejects_a_missing_fit_directory(tmp_path: Path) -> None:
+    """A section that names a fit it no longer holds is refused."""
+    writer = artifact_writer(tmp_path)
+    directory = writer.fit_done(make_fit())
+    (directory / "fit-meta.json").unlink()
+    with pytest.raises(ArtifactError, match="missing"):
+        writer.write_meta()
+    assert not (writer.section_dir / "meta.json").exists()
+
+
+def test_write_meta_accepts_a_replacement_meta(tmp_path: Path) -> None:
+    """The driver may supply the final provenance when the section ends."""
+    writer = artifact_writer(tmp_path)
+    writer.write_meta(meta={"preset": "paper", "seed": None})
+    assert load_demo_result(writer.section_dir).meta == {
+        "preset": "paper",
+        "seed": None,
+    }
+
+
+@pytest.mark.parametrize("meta", [{"bad": object()}, [1, 2], 3])
+def test_write_meta_rejects_unusable_meta(tmp_path: Path, meta: object) -> None:
+    """A replacement meta is held to the same JSON contract."""
+    writer = artifact_writer(tmp_path)
+    with pytest.raises(ArtifactError, match="section meta"):
+        writer.write_meta(meta=meta)  # type: ignore[arg-type]
+
+
+def test_writer_is_closed_after_the_context_manager(tmp_path: Path) -> None:
+    """Every writer method refuses to write once the block has exited."""
+    root = tmp_path / "run"
+    with ArtifactWriter(root, section="5.2", meta={"preset": "quick"}) as writer:
+        assert writer.root == root
+        writer.event("run_start")
+    with pytest.raises(ArtifactError, match="closed"):
+        writer.event("run_end")
+    with pytest.raises(ArtifactError, match="closed"):
+        writer.fit_done(make_fit())
+    with pytest.raises(ArtifactError, match="closed"):
+        writer.band_done(make_functionals())
+    with pytest.raises(ArtifactError, match="closed"):
+        writer.write_meta()

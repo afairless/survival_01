@@ -25,7 +25,7 @@ It has two companions:
 | --- | --- | --- |
 | `src/dp_gibbs.py` | ingestion validation and the time transform, state and bookkeeping, the $\alpha$ quadrature grid, the three full conditionals, one sweep, chain storage, initialisation, the collapsed log-posterior, diagnostics | plotting, data generation, functionals |
 | `src/dp_functionals.py` | the paper's §3 steps (i)–(iii) for posterior *and* prior, survival/CDF/density/hazard/quantile functionals on the original scale, two-population comparisons | drawing $\theta$ |
-| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz`/JSON writes and the self-contained chain, functional, fit and section round-trips; later units add the event log and the manifest | fitting, plotting, recomputing summaries |
+| `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz`/JSON writes, the self-contained chain, functional, fit and section round-trips, the incremental `ArtifactWriter` and its append-only event log; a later unit adds the run manifest | fitting, plotting, recomputing summaries |
 
 Two rules hold everywhere and are enforced by tests, not by convention:
 
@@ -402,8 +402,8 @@ standard library and the container types it reconstructs on load (`DPChains`
 and friends from `dp_gibbs`, `Functionals` from `dp_functionals`), never
 `matplotlib` or any plotting code, and it never runs the sampler or evaluates
 a functional. The primitives, chain, functional, fit and section units are
-introduced first; the event-log and manifest units of plan §6.1 layer on top
-of them.
+introduced first; the incremental writer of plan §6.1 (and the run manifest,
+which is layered on it) then drives the long runs.
 
 | name | role |
 | --- | --- |
@@ -421,6 +421,7 @@ of them.
 | `load_fit(directory)` | validate `fit-meta.json`, then every archive against its record and its own schema, and rebuild a `Fit` with the band re-attached |
 | `save_demo_result(directory, result)` | write a section directory: one fit directory per fit under `draws/`, plus `meta.json` last; never a figure |
 | `load_demo_result(directory)` | load every named fit and rebuild `DemoResult` with `prior_indices` as a tuple and `figures=()` |
+| `ArtifactWriter(root, *, section, meta=None, label=None)` | incremental writer: `fit_done(fit, timing=None, *, arm=None, **extra)`, `band_done(band, timing=None, *, fit=None, fit_label=None, arm=None, **extra)`, `event(kind, **fields)`, `write_meta(*, meta=None)`; never writes `MANIFEST.json` or figures |
 
 ### 6.1 Why the write helper is not `np.savez(tmp_name)`
 
@@ -555,6 +556,43 @@ JSON cannot express the types the paper preconditions compare, so
 is not turned into `0`), and `t_max`/`t_max_a`/`t_max_b` become floats. A fit
 directory the section file does not name is an error, so `result.fits` is the
 whole tree and a manifest can hash exactly what a reviewer sees.
+
+### 6.6 The incremental writer and its event log (`ArtifactWriter`)
+
+The paper runs are hours long, so a section is never held in memory and
+written at the end: `ArtifactWriter` is the context manager the drivers use,
+one instance per section, writing under one run root.
+
+- `fit_done(fit, timing=None, *, arm=None, **extra)` writes
+  `<root>/<section>/draws/<arm->slug>/` through `save_fit` as soon as a fit
+  exists, so the next fit can start without the previous arrays. The section
+  `meta` supplies two defaults the fit does not carry -- `data_seed` and the
+  shared `t_max` (the §5.2 grid maximum) -- and `extra`/`timing` land in
+  `fit-meta.json`'s `extra`. A duplicate key, a duplicate slug or an arm that
+  is not a plain identifier (`A/B` would leave `draws/`) is rejected before
+  anything is written.
+- `band_done(band, timing=None, *, fit=None, fit_label=None, arm=None, ...)`
+  selects the target fit (first written by default), stores `prior-band.npz`
+  there and then rewrites only `prior_band`/`prior_band_meta` (plus
+  `extra.band_timing`) in that `fit-meta.json`. The band file comes first: a crash between the two
+  writes leaves an *unlisted* band, which `load_fit` rejects, never a band the
+  metadata claims but the directory lacks. In a two-arm section pass `arm` as
+  well as the fit, because the fit label alone matches both arms.
+- `event(kind, **fields)` appends one JSON object per line to
+  `<root>/logs/events-<section>.jsonl` with `ts` (ISO 8601 UTC),
+  `t_monotonic` (`time.perf_counter`) and `kind` plus the caller's fields.
+  Each call opens the file in append mode and `fsync`-es the line, so a crash
+  keeps every completed event, a second writer of the same section extends the
+  stream instead of truncating it, and `t_monotonic` orders events without
+  trusting the wall clock. Fields are validated *before* the artifact they
+  describe is written, so a non-serialisable provenance value cannot leave a
+  fit directory without its log line.
+- `write_meta()` writes the section `meta.json` last, naming exactly the fits
+  that were written (in write order) and refusing a section that names a fit
+  directory no longer on disk.
+
+The writer never writes `MANIFEST.json` (plan R7 gives that to
+`finalize_run`) and never writes figures (also R7).
 
 ---
 

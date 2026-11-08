@@ -38,7 +38,14 @@ functional, fit and run writers are built on, plus the chain round-trip:
 * :func:`save_demo_result` / :func:`load_demo_result` -- a whole section
   (plan §5): the section ``meta.json`` plus one fit directory per fit under
   ``draws/``, reconstructing ``DemoResult.meta`` with its original types
-  (``prior_indices`` stays a tuple).
+  (``prior_indices`` stays a tuple);
+* :class:`ArtifactWriter` -- the *incremental* writer the drivers use (plan
+  §6.1): each fit is written as soon as it is fitted, the prior band is
+  attached to the reference fit, and the section ``meta.json`` is written last,
+  so a crashed run never claims artifacts it does not hold.  It owns the
+  append-only ``logs/events-<section>.jsonl`` stream (``ts``/
+  ``t_monotonic``/``kind``) and never writes ``MANIFEST.json`` -- the manifest
+  unit is layered on top.
 
 Why the write helper exists
 ---------------------------
@@ -60,8 +67,8 @@ functional -- it only owns the containers.  ``Fit`` and ``DemoResult`` live in
 ``src.paper_examples``; importing that module is cheap (its ``matplotlib``
 import is lazy), but the import is done **inside** the fit/run functions rather
 than at module scope, so the driver can import this module in either order
-without a cycle.  The event-log and manifest units of plan §6.1 are layered on
-top of the primitives here.
+without a cycle.  The manifest unit of plan §6.1 is layered on top of the
+primitives here.
 """
 
 from __future__ import annotations
@@ -70,9 +77,11 @@ import json
 import os
 import re
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import IO, TYPE_CHECKING, Any
 
 import numpy as np
@@ -87,6 +96,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "ArtifactError",
     "ArtifactIntegrityError",
+    "ArtifactWriter",
     "atomic_savez",
     "load_chain",
     "load_demo_result",
@@ -2097,3 +2107,636 @@ def load_demo_result(directory: str | os.PathLike[str]) -> DemoResult:
         figures=(),
         meta=_restore_demo_meta(section_meta, meta_path),
     )
+
+
+# ---------------------------------------------------------------------------
+# Incremental run writer (plan §6.1)
+# ---------------------------------------------------------------------------
+
+#: Event-record keys the writer owns; a caller field may not shadow one, so a
+#: provenance key cannot silently replace the stamp or the kind.
+_EVENT_RESERVED = frozenset({"ts", "t_monotonic", "kind"})
+
+#: Run-root subdirectory holding the log files (plan §5).
+_LOGS_DIR = "logs"
+
+#: Event-stream name: one append-only stream per section.
+_EVENTS_NAME = "events-{section}.jsonl"
+
+#: An arm prefix must be a plain identifier.  It becomes part of a directory
+#: name, so ``"A/B"`` would put a fit outside ``draws/``.
+_ARM_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+
+
+def _utc_timestamp() -> str:
+    """Wall-clock stamp of one event line (ISO 8601, UTC, milliseconds)."""
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _validated_root(root: object) -> Path:
+    """Validate the run root of an :class:`ArtifactWriter`."""
+    if isinstance(root, os.PathLike):
+        return Path(root)
+    if isinstance(root, str) and root:
+        return Path(root)
+    raise ArtifactError(f"artifact run root must be a non-empty path, got {root!r}")
+
+
+def _validated_section(section: object) -> str:
+    """Validate a section name: one plain directory name (``"5.1"``)."""
+    if not isinstance(section, str) or not section:
+        raise ArtifactError(
+            f"artifact section must be a non-empty string, got {section!r}"
+        )
+    if section in {".", ".."} or _NON_SLUG.search(section):
+        raise ArtifactError(
+            f"artifact section {section!r} must be a single directory name of "
+            "[A-Za-z0-9._-] characters"
+        )
+    return section
+
+
+def _validated_arm(arm: object) -> str | None:
+    """Validate the optional arm prefix (``"A"``/``"B"`` in §5.2)."""
+    if arm is None:
+        return None
+    if not isinstance(arm, str) or not _ARM_NAME.match(arm):
+        raise ArtifactError(
+            f"artifact arm must be None or a plain identifier, got {arm!r}"
+        )
+    return arm
+
+
+def _validated_text(value: object, *, name: str) -> str:
+    """Validate a required non-empty string field of the writer."""
+    if not isinstance(value, str) or not value:
+        raise ArtifactError(f"{name} must be a non-empty string, got {value!r}")
+    return value
+
+
+def _writer_meta(meta: object, *, name: str) -> dict[str, Any]:
+    """Convert a caller's provenance mapping into the stored JSON object."""
+    if meta is None:
+        return {}
+    if not isinstance(meta, Mapping):
+        raise ArtifactError(f"{name} must be a mapping, got {type(meta).__name__}")
+    try:
+        converted = _jsonable(dict(meta))
+    except ArtifactError as exc:
+        raise ArtifactError(f"{name} is not JSON-serialisable: {exc}") from exc
+    if not isinstance(converted, dict):  # pragma: no cover - dict in, dict out
+        raise ArtifactError(f"{name} must be a JSON object")
+    return converted
+
+
+@dataclass(frozen=True)
+class _WrittenFit:
+    """One fit the writer has already written (internal bookkeeping)."""
+
+    key: str
+    arm: str | None
+    label: str
+    directory: Path
+
+
+class ArtifactWriter:
+    """Write one replication section incrementally (plan §6.1).
+
+    A driver builds one writer per section and calls :meth:`fit_done` after
+    every fit, :meth:`band_done` once the prior band exists and
+    :meth:`write_meta` when the section is complete.  The long runs cannot hold
+    a whole section in memory, so nothing is batched: a fit is written before
+    the next one starts, and the section ``meta.json`` is written last, after
+    every fit directory it names exists.
+
+    Layout, relative to ``root`` (plan §5)::
+
+        logs/events-<section>.jsonl        # append-only event stream
+        <section>/draws/<arm->slug>/       # one save_fit directory per fit
+        <section>/meta.json                # section metadata, written last
+
+    ``root`` is the run root, not the section directory, because the event
+    stream is run-level: both sections of one replication share ``logs/``.
+    The writer never writes ``MANIFEST.json`` (plan R7 gives that to
+    ``finalize_run``) and never writes figures (also R7).
+
+    Each :meth:`event` line is one JSON object with the writer's ``ts`` (ISO
+    8601 UTC), ``t_monotonic`` (:func:`time.perf_counter`, so events can be
+    ordered without trusting the wall clock) and ``kind`` fields plus the
+    caller's fields.  The line is appended, flushed and ``fsync``-ed before the
+    call returns, so a crash keeps every completed event and never truncates an
+    earlier one.  Event fields are validated *before* the artifact they
+    describe is written, so a non-serialisable provenance value cannot leave a
+    fit directory without its log line.
+
+    Parameters
+    ----------
+    root:
+        Run root directory.  Created lazily by the first write.
+    section:
+        Section name, a single directory name of ``[A-Za-z0-9._-]``
+        (``"5.1"``/``"5.2"``).  It names both ``<root>/<section>`` and
+        ``logs/events-<section>.jsonl``.
+    meta:
+        Section provenance stored verbatim in ``meta.json`` -- the
+        ``DemoResult.meta`` dict of the driver (preset, seeds,
+        ``prior_indices``, chain count, ``t_max``).  Defaults to an empty
+        object.
+    label:
+        The section label (``DemoResult.label``); defaults to ``section``.
+    monotonic:
+        Clock for ``t_monotonic``; defaults to :func:`time.perf_counter`.
+        A test seam only.
+    wall_clock:
+        Clock for ``ts``; defaults to an ISO 8601 UTC stamp.  A test seam only.
+
+    Raises
+    ------
+    ArtifactError
+        If ``root``/``section``/``label`` have the wrong type or shape, or
+        ``meta`` has no JSON form.
+    """
+
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        section: str,
+        meta: Mapping[str, Any] | None = None,
+        label: str | None = None,
+        monotonic: Callable[[], float] | None = None,
+        wall_clock: Callable[[], str] | None = None,
+    ) -> None:
+        self._root = _validated_root(root)
+        self._section = _validated_section(section)
+        self._label = (
+            self._section
+            if label is None
+            else _validated_text(label, name="artifact section label")
+        )
+        self._meta = _writer_meta(meta, name="section meta")
+        self._monotonic = perf_counter if monotonic is None else monotonic
+        self._wall_clock = _utc_timestamp if wall_clock is None else wall_clock
+        self._fits: dict[str, _WrittenFit] = {}
+        self._closed = False
+
+    # -- context manager ---------------------------------------------------
+
+    def __enter__(self) -> ArtifactWriter:
+        """Return the writer; writes stay allowed until the block exits."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        """Close the writer; a later write is an error, not a silent append."""
+        self._closed = True
+        return False
+
+    # -- public state ------------------------------------------------------
+
+    @property
+    def root(self) -> Path:
+        """The run root this writer writes under."""
+        return self._root
+
+    @property
+    def section(self) -> str:
+        """The section name (``"5.1"``/``"5.2"``)."""
+        return self._section
+
+    @property
+    def section_dir(self) -> Path:
+        """The section directory, ``<root>/<section>``."""
+        return self._root / self._section
+
+    @property
+    def event_log(self) -> Path:
+        """The append-only event stream, ``<root>/logs/events-<section>.jsonl``."""
+        return self._root / _LOGS_DIR / _EVENTS_NAME.format(section=self._section)
+
+    @property
+    def fit_keys(self) -> tuple[str, ...]:
+        """The fit keys written so far, in write order."""
+        return tuple(self._fits)
+
+    # -- events ------------------------------------------------------------
+
+    def event(self, kind: str, **fields: Any) -> dict[str, Any]:
+        """Append one event line and return the record that was written.
+
+        ``kind`` names the stage (``"run_start"``, ``"fit_done"``,
+        ``"band_done"``, ``"run_end"``, ...).  ``fields`` are stored verbatim
+        through :func:`_jsonable`; they may not shadow ``ts``,
+        ``t_monotonic`` or ``kind``, because those three keys are the log's
+        fixed schema.  The file is opened in append mode for each call, so
+        two writers of the same section -- a resumed run, a test -- extend one
+        stream instead of truncating it.
+
+        Raises
+        ------
+        ArtifactError
+            If the writer is closed, ``kind`` is not a non-empty string, a
+            field shadows a reserved key, or a field has no JSON form.
+        """
+        payload = self._event_payload(kind, fields)
+        self._append_event(payload)
+        return payload
+
+    def _event_payload(self, kind: str, fields: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate and assemble one event record without writing it."""
+        self._require_open()
+        if not isinstance(kind, str) or not kind:
+            raise ArtifactError(f"event kind must be a non-empty string, got {kind!r}")
+        clashing = sorted(_EVENT_RESERVED.intersection(fields))
+        if clashing:
+            raise ArtifactError(
+                f"event fields may not shadow the writer keys "
+                f"{sorted(_EVENT_RESERVED)}: got {clashing}"
+            )
+        try:
+            converted = _jsonable(dict(fields))
+        except ArtifactError as exc:
+            raise ArtifactError(
+                f"event {kind!r} fields are not JSON-serialisable: {exc}"
+            ) from exc
+        if not isinstance(converted, dict):  # pragma: no cover - dict in, dict out
+            raise ArtifactError(f"event {kind!r} fields must be a JSON object")
+        stamp = self._wall_clock()
+        if not isinstance(stamp, str) or not stamp:
+            raise ArtifactError(
+                f"event wall clock must return a non-empty string, got {stamp!r}"
+            )
+        tick = float(self._monotonic())
+        if not np.isfinite(tick):
+            raise ArtifactError(f"event monotonic clock must be finite, got {tick!r}")
+        return {"ts": stamp, "t_monotonic": tick, "kind": kind, **converted}
+
+    def _append_event(self, payload: Mapping[str, Any]) -> Path:
+        """Append one JSON object as a line, flushed and ``fsync``-ed."""
+        target = self.event_log
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return target
+
+    # -- fits --------------------------------------------------------------
+
+    def fit_done(
+        self,
+        fit: Fit,
+        timing: Any = None,
+        *,
+        arm: str | None = None,
+        **provenance: Any,
+    ) -> Path:
+        """Write one finished fit as a :func:`save_fit` directory.
+
+        The directory is ``<root>/<section>/draws/<arm->slug(label)>`` -- the
+        plan §5 name, so a reviewer never needs the writer to find it.  The
+        fit's own ``prior_band`` is stored when it has one; the driver usually
+        attaches the band later, with :meth:`band_done`.
+
+        Two defaults come from the section ``meta`` because the fit object does
+        not hold them: ``data_seed`` is recorded when the section meta has one
+        (it is a demo-level seed) and ``shared_t_max`` is taken from the
+        section ``t_max``, which is the common grid maximum of §5.2.  Anything
+        in ``provenance`` overrides both; everything that is not a reserved
+        fit key (``arm``, ``data_seed``, ``shared_t_max``) is stored under
+        ``fit-meta.json``'s ``extra``, next to ``timing``.
+
+        Parameters
+        ----------
+        fit:
+            The finished :class:`Fit`; it is not mutated.
+        timing:
+            Optional wall time (seconds) or timing mapping.  Stored in
+            ``fit-meta.json`` as ``extra.timing`` and repeated in the event.
+        arm:
+            The §5.2 arm prefix, ``None`` for §5.1.
+        **provenance:
+            Any further JSON provenance (chain seeds, functional settings).
+
+        Returns
+        -------
+        pathlib.Path
+            The fit directory that was written.
+
+        Raises
+        ------
+        ArtifactError
+            If ``fit`` is not a :class:`Fit`, the arm/key/directory was
+            already written, or a provenance value has no JSON form.
+        """
+        self._require_open()
+        from src.paper_examples import Fit as FitType
+
+        if not isinstance(fit, FitType):
+            raise ArtifactError(f"fit_done expects a Fit, got {type(fit).__name__}")
+        label = _validated_text(fit.label, name="fit label")
+        arm = _validated_arm(arm)
+        key = f"{arm}: {label}" if arm else label
+        if key in self._fits:
+            raise ArtifactError(f"fit {key!r} was already written by this writer")
+        name = _fit_directory_name(arm, label)
+        directory = self.section_dir / _DRAWS_DIR / name
+        for record in self._fits.values():
+            if record.directory == directory:
+                raise ArtifactError(
+                    f"fits {record.key!r} and {key!r} both map to the directory "
+                    f"{name!r}"
+                )
+
+        fields: dict[str, Any] = dict(provenance)
+        fields.update(
+            {
+                "key": key,
+                "path": self._relative(directory),
+                "n_chains": int(fit.n_chains),
+                "n_draws": int(fit.functionals.n_draws),
+            }
+        )
+        if timing is not None:
+            fields["timing"] = timing
+        payload = self._event_payload("fit_done", fields)
+
+        meta: dict[str, Any] = {"arm": arm}
+        if "data_seed" not in provenance and "data_seed" in self._meta:
+            meta["data_seed"] = self._meta["data_seed"]
+        if "shared_t_max" not in provenance and "t_max" in self._meta:
+            meta["shared_t_max"] = self._meta["t_max"]
+        meta.update(provenance)
+        if timing is not None:
+            meta["timing"] = timing
+
+        save_fit(directory, fit, meta=meta)
+        self._fits[key] = _WrittenFit(
+            key=key, arm=arm, label=label, directory=directory
+        )
+        self._append_event(payload)
+        return directory
+
+    # -- prior band --------------------------------------------------------
+
+    def band_done(
+        self,
+        band: Functionals,
+        timing: Any = None,
+        *,
+        fit: Fit | None = None,
+        fit_label: str | None = None,
+        arm: str | None = None,
+        **provenance: Any,
+    ) -> Path:
+        """Attach one prior band to an already written fit directory.
+
+        The band is written as ``prior-band.npz`` and the fit's
+        ``fit-meta.json`` is then updated to record it, because
+        :func:`load_fit` refuses an unlisted band file.  The band file is
+        written first: if the process dies between the two writes, the
+        directory holds a band the metadata does not name, which is an
+        integrity error rather than a fit that silently carries a stale band.
+
+        The target fit defaults to the first fit this writer wrote -- the
+        reference prior's fit, exactly where the §5.1 driver leaves the band.
+        ``fit`` (the in-memory object) contributes its label, so in a two-arm
+        section pass ``arm`` as well: a label that matches several arms is an
+        error rather than a guess, because the wrong fit would silently carry
+        the band.
+
+        Parameters
+        ----------
+        band:
+            The prior :class:`Functionals`.  Its grid must be the target fit's
+            grid (same point count and endpoints) and its arrays must match
+            the functional schema.
+        timing:
+            Optional wall time for the band, stored as
+            ``fit-meta.json``'s ``extra.band_timing``.
+        fit:
+            The fit object the band belongs to (its ``label`` selects the
+            directory).
+        fit_label:
+            The un-slugged label of the target fit, when no object is at hand.
+        arm:
+            The target arm, when the label exists in more than one arm.
+        **provenance:
+            Any further JSON provenance, merged into the fit's ``extra``.
+
+        Returns
+        -------
+        pathlib.Path
+            The ``prior-band.npz`` that was written.
+
+        Raises
+        ------
+        ArtifactError
+            If ``band`` is not a :class:`Functionals`, no fit was written yet,
+            the target is unknown or ambiguous, the band's grid disagrees with
+            the fit's, or the band is outside the artifact schema.
+        """
+        self._require_open()
+        if not isinstance(band, Functionals):
+            raise ArtifactError(
+                f"band_done expects a Functionals, got {type(band).__name__}"
+            )
+        record = self._resolve_fit(fit=fit, fit_label=fit_label, arm=arm)
+        fit_meta = _read_fit_meta(record.directory)
+        if fit_meta.label != record.label or fit_meta.arm != record.arm:
+            raise ArtifactError(
+                f"{fit_meta.path}: label/arm ({fit_meta.label!r}, "
+                f"{fit_meta.arm!r}) no longer match the fit this writer "
+                f"recorded ({record.key!r})"
+            )
+
+        grid = _validated_t_grid(band.t_grid)
+        if (
+            int(grid.size) != fit_meta.n_grid
+            or float(grid[0]) != fit_meta.grid_first
+            or float(grid[-1]) != fit_meta.grid_last
+        ):
+            raise ArtifactError(
+                f"prior band grid ({grid.size} points, "
+                f"[{float(grid[0])!r}, {float(grid[-1])!r}]) disagrees with "
+                f"the fit's grid ({fit_meta.n_grid} points, "
+                f"[{fit_meta.grid_first!r}, {fit_meta.grid_last!r}])"
+            )
+        arrays = {name: getattr(band, name) for name in _FUNCTIONAL_ARRAY_FIELDS}
+        try:
+            _check_functional_arrays(arrays, grid, record.directory)
+            band_meta = _require_jsonable_meta(
+                band.meta, record.directory, name="prior band meta"
+            )
+        except ArtifactIntegrityError as exc:
+            raise ArtifactError(
+                f"prior band is outside the artifact schema: {exc}"
+            ) from exc
+
+        extra = _writer_meta(provenance, name="band provenance")
+        if timing is not None:
+            extra["band_timing"] = timing
+        try:
+            extra = _jsonable(extra)
+        except ArtifactError as exc:
+            raise ArtifactError(
+                f"band provenance is not JSON-serialisable: {exc}"
+            ) from exc
+
+        band_path = record.directory / _PRIOR_BAND_NAME
+        fields: dict[str, Any] = dict(provenance)
+        fields.update(
+            {
+                "key": record.key,
+                "path": self._relative(band_path),
+                "n_draws": int(band.n_draws),
+            }
+        )
+        if timing is not None:
+            fields["timing"] = timing
+        payload = self._event_payload("band_done", fields)
+
+        save_functionals(band_path, band)
+
+        stored = _read_json_object(fit_meta.path, kind="fit metadata")
+        stored_record = dict(
+            _require_record(stored, _FIT_META_KEYS, "fit metadata", fit_meta.path)
+        )
+        stored_extra = stored_record["extra"]
+        if not isinstance(stored_extra, dict):  # pragma: no cover - validated above
+            raise ArtifactIntegrityError(
+                f"{fit_meta.path}: meta field 'extra' must be a JSON object"
+            )
+        stored_extra.update(extra)
+        stored_record["prior_band"] = {
+            "path": _PRIOR_BAND_NAME,
+            "dtype": "float64",
+            "shape": [int(arrays["S"].shape[0]), int(grid.size)],
+        }
+        stored_record["prior_band_meta"] = band_meta
+        _write_json(fit_meta.path, stored_record)
+        self._append_event(payload)
+        return band_path
+
+    def _resolve_fit(
+        self,
+        *,
+        fit: Fit | None,
+        fit_label: str | None,
+        arm: str | None,
+    ) -> _WrittenFit:
+        """Select the fit directory a prior band belongs to."""
+        from src.paper_examples import Fit as FitType
+
+        if fit is not None:
+            if not isinstance(fit, FitType):
+                raise ArtifactError(
+                    f"band_done expects a Fit or None, got {type(fit).__name__}"
+                )
+            object_label = _validated_text(fit.label, name="fit label")
+            if fit_label is not None and fit_label != object_label:
+                raise ArtifactError(
+                    f"band_done got fit {object_label!r} but fit_label {fit_label!r}"
+                )
+            fit_label = object_label
+        if fit_label is not None:
+            fit_label = _validated_text(fit_label, name="fit label")
+        arm = _validated_arm(arm)
+        if not self._fits:
+            raise ArtifactError(
+                "band_done needs a fit written by this writer first; "
+                "call fit_done before the prior band"
+            )
+        if fit_label is None:
+            if arm is None:
+                return next(iter(self._fits.values()))
+            candidates = [record for record in self._fits.values() if record.arm == arm]
+            if not candidates:
+                raise ArtifactError(f"no fit in arm {arm!r} was written by this writer")
+            if len(candidates) > 1:
+                raise ArtifactError(
+                    f"arm {arm!r} holds {len(candidates)} fits; pass fit_label "
+                    "to choose the prior band's fit"
+                )
+            return candidates[0]
+        candidates = [
+            record
+            for record in self._fits.values()
+            if record.label == fit_label and (arm is None or record.arm == arm)
+        ]
+        if not candidates:
+            raise ArtifactError(
+                f"no fit with label {fit_label!r} and arm {arm!r} was written "
+                "by this writer"
+            )
+        if len(candidates) > 1:
+            arms = ", ".join(repr(record.arm) for record in candidates)
+            raise ArtifactError(
+                f"fit label {fit_label!r} was written for several arms "
+                f"({arms}); pass arm to choose the prior band's fit"
+            )
+        return candidates[0]
+
+    # -- section metadata --------------------------------------------------
+
+    def write_meta(self, *, meta: Mapping[str, Any] | None = None) -> Path:
+        """Write the section ``meta.json`` once the section is complete.
+
+        The file names the fits in write order (a JSON object of fits would
+        lose it) through ``fit_keys``, so :func:`load_demo_result` rebuilds the
+        same key order.  It is written last and atomically: a crashed run has
+        no ``meta.json``, which the loader reports instead of accepting a
+        section that names fits it does not hold.  A recorded fit directory
+        that no longer exists (deleted by hand, removed by a cleanup) is an
+        error for the same reason.
+
+        Parameters
+        ----------
+        meta:
+            Optional replacement for the constructor's section provenance.
+
+        Returns
+        -------
+        pathlib.Path
+            ``<root>/<section>/meta.json``.
+
+        Raises
+        ------
+        ArtifactError
+            If the writer is closed, a recorded fit directory is missing its
+            ``fit-meta.json``, or the new ``meta`` has no JSON form.
+        """
+        self._require_open()
+        if meta is not None:
+            self._meta = _writer_meta(meta, name="section meta")
+        missing = [
+            record.key
+            for record in self._fits.values()
+            if not (record.directory / _FIT_META_NAME).is_file()
+        ]
+        if missing:
+            raise ArtifactError(
+                f"fit artifacts are missing for {missing}; refusing to write a "
+                "section meta.json that names them"
+            )
+        return _write_json(
+            self.section_dir / _DEMO_META_NAME,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "label": self._label,
+                "fit_keys": list(self._fits),
+                "meta": self._meta,
+            },
+        )
+
+    # -- internals ---------------------------------------------------------
+
+    def _require_open(self) -> None:
+        """Reject writes after the context manager has exited."""
+        if self._closed:
+            raise ArtifactError(
+                f"artifact writer for section {self._section!r} is closed"
+            )
+
+    def _relative(self, path: Path) -> str:
+        """Return ``path`` relative to the run root, as a POSIX-style string."""
+        return Path(os.path.relpath(path, self._root)).as_posix()
