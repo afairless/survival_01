@@ -32,12 +32,16 @@ report tables quote:
 The first-500 slice is not a second fit.  It is the same stored draws truncated
 after 500 per chain: the chains are rebuilt with
 ``dataclasses.replace(chain.settings, n_save=500)`` (required by
-``DPChains.__post_init__``), while the summary arrays are sliced from the
-stored :class:`~src.dp_functionals.Functionals`.  Those arrays were computed
-with the **full trace's** ``J_common``/``J_prior``, so the slice reuses that
-truncation level instead of recomputing a smaller one from 500 draws.  This is
-what makes the first-500 column a like-for-like replay of
-``docs/research/dp_gibbs_results.md`` (plan §7 Step 2 and §9).
+``DPChains.__post_init__``) and the :class:`~src.dp_functionals.Functionals`
+are **recomputed from those truncated chains**, with the slice's own
+``J_common`` derived from ``max_b nu_b`` over the surviving draws.  Slicing the
+stored arrays instead would leave a fit whose functional arrays carry the full
+trace's truncation level while its chains no longer do -- a mixture no run can
+produce, and one that disagrees with ``docs/research/dp_gibbs_results.md``
+(measured on the §5.2 artifacts: 0.5-1 % on every Figure 4-5 row, while the
+chains themselves replay exactly).  The recomputation is what makes the
+first-500 column a like-for-like replay of the note's probe (plan §7 Step 2 and
+§9).
 
 Scope
 -----
@@ -72,8 +76,14 @@ from typing import Any
 import numpy as np
 from scipy.stats import gamma as gamma_dist
 
-from src.dp_functionals import Functionals, compare
+from src.dp_functionals import (
+    Functionals,
+    FunctionalSettings,
+    compare,
+    posterior_functionals,
+)
 from src.dp_gibbs import DPChains, ess, r_hat
+from src.dp_weibull import truncation_number_for_posterior
 from src.paper_artifacts import ArtifactError, _jsonable, load_demo_result
 from src.paper_examples import (
     REPO_ROOT,
@@ -304,8 +314,14 @@ def _slice_chain(chain: DPChains, n_draws: int) -> DPChains:
     )
 
 
-def _slice_functionals(func: Functionals, indices: np.ndarray) -> Functionals:
-    """Slice the rows of a stored functional array, keeping its meta verbatim."""
+def _slice_rows(func: Functionals, indices: np.ndarray) -> Functionals:
+    """Slice the rows of a stored array, keeping its meta verbatim.
+
+    Only used for the prior band: its rows are independent draws from the
+    prior, so keeping the first ``n_draws`` of them is a smaller band from the
+    same distribution, not a different estimator.  Posterior functionals are
+    never sliced -- see :func:`_recompute_functionals`.
+    """
     return replace(
         func,
         S=func.S[indices],
@@ -316,35 +332,69 @@ def _slice_functionals(func: Functionals, indices: np.ndarray) -> Functionals:
     )
 
 
-def _slice_fit(fit: Fit, n_draws: int) -> Fit:
-    """Slice one fit's chains and its chain-stacked functionals together.
+def _slice_settings(meta: Mapping[str, Any]) -> FunctionalSettings:
+    """Rebuild the functional-path knobs recorded in a ``Functionals`` meta.
 
-    ``posterior_functionals`` stacks draws chain by chain, so the first
-    ``n_draws`` of every chain are not the first ``n_chains * n_draws`` rows.
-    The index list below reconstructs the right rows and therefore keeps the
-    ``J_common``/``J_prior`` that produced the full arrays.
+    ``method`` and ``atom_tol`` change the arrays and are stored by
+    :func:`src.dp_functionals.posterior_functionals`; ``L`` only matters for
+    ``method="mc"`` and is therefore required only there.  ``epsilon`` is not
+    part of these settings: the truncation level reads it from the chains'
+    :class:`~src.dp_gibbs.DPSettings`, which the slice keeps.
+    """
+    method = meta.get("method", "exact")
+    if not isinstance(method, str):
+        raise ValueError(f"functionals meta records a non-string method {method!r}")
+    if method == "mc" and "L" not in meta:
+        raise ValueError(
+            "functionals meta records method='mc' without L; the slice cannot "
+            "be recomputed from the chains without the atom-draw count"
+        )
+    return FunctionalSettings(
+        method=method,
+        L=meta.get("L", FunctionalSettings().L),
+        atom_tol=meta.get("atom_tol", FunctionalSettings().atom_tol),
+        n_t_grid=meta.get("n_t_grid", FunctionalSettings().n_t_grid),
+    )
+
+
+def _recompute_functionals(fit: Fit, chains: list[DPChains]) -> Functionals:
+    """Functionals of ``chains`` under the knobs the full fit used.
+
+    ``J_common`` is derived from ``max_b nu_b`` of the supplied chains, so this
+    is the **slice's own** truncation level -- the estimator the old note's
+    probe used, and the reason the first-500 column is comparable with it.
+    """
+    meta = fit.functionals.meta
+    return posterior_functionals(
+        chains,
+        fit.t_grid,
+        settings=_slice_settings(meta),
+        seed=meta.get("seed"),
+    )
+
+
+def _slice_fit(fit: Fit, n_draws: int) -> Fit:
+    """Slice one fit's chains and rebuild its functionals from them.
+
+    A :class:`~src.paper_examples.Fit` pairs chains with the functionals
+    computed from them.  Slicing the stored arrays would break that pairing:
+    the surviving rows would carry the full trace's ``J_common`` while the
+    chains would not, and every summary would be a mixture no run can produce.
+    The slice therefore recomputes the posterior functionals from the truncated
+    chains, which also reproduces the old note's probe values.
+
+    The prior band is sliced in place: its rows are independent prior draws, so
+    the first ``n_draws`` of them are a valid smaller band.  The baseline marks
+    its width ``not_comparable`` for an unrelated reason (the probe drew 200
+    bands, the run 1 000).
     """
     chains = [_slice_chain(chain, n_draws) for chain in fit.chains]
-    indices: list[int] = []
-    offset = 0
-    for chain in fit.chains:
-        take = min(n_draws, chain.n_draws)
-        indices.extend(range(offset, offset + take))
-        offset += chain.n_draws
-    if fit.functionals.n_draws != offset:
-        raise ValueError(
-            "functionals hold "
-            f"{fit.functionals.n_draws} draws but the fit's chains hold {offset}; "
-            "the functional rows must be stacked chain by chain"
-        )
-    functionals = _slice_functionals(
-        fit.functionals, np.asarray(indices, dtype=np.intp)
-    )
+    functionals = _recompute_functionals(fit, chains)
 
     band = fit.prior_band
     if band is not None:
         take = min(n_draws, band.n_draws)
-        band = _slice_functionals(band, np.arange(take, dtype=np.intp))
+        band = _slice_rows(band, np.arange(take, dtype=np.intp))
 
     return replace(fit, chains=chains, functionals=functionals, prior_band=band)
 
@@ -352,11 +402,12 @@ def _slice_fit(fit: Fit, n_draws: int) -> Fit:
 def slice_result(result: DemoResult, n_draws: int = SLICE_DRAWS) -> DemoResult:
     """Return a copy of ``result`` truncated to the first ``n_draws`` per chain.
 
-    The functionals are sliced from the stored arrays, so their ``meta`` still
-    records the full trace's ``J_common``/``J_prior``.  That is deliberate:
-    recomputing them from the truncated chains would reduce the truncation
-    level and make the first-500 column a different estimator from the old
-    note's probe (plan §7 Step 2).
+    The functionals are recomputed from the truncated chains, so their
+    ``meta`` records the slice's own ``J_common`` and the result stays a
+    coherent fit.  That reproduces the old note's probe column to its displayed
+    precision (plan §7 Step 2); reusing the full trace's truncation level does
+    not, because ``J_common`` grows with ``max_b nu_b`` of the draws it is
+    computed from.
     """
     if not isinstance(result, DemoResult):
         raise ValueError("result must be a DemoResult instance")
@@ -690,6 +741,23 @@ def _diagnostics_block(chains: list[DPChains]) -> dict[str, Any]:
     return block
 
 
+def _slice_truncation(chains: list[DPChains]) -> int:
+    """The ``J_common`` a slice of ``chains`` is computed with.
+
+    Same rule as :func:`src.dp_weibull.truncation_number_for_posterior` inside
+    :func:`src.dp_functionals.posterior_functionals`: one level for the run,
+    fixed at the largest precision drawn, with ``epsilon`` from the sampler
+    settings the slice keeps.
+    """
+    first = chains[0]
+    max_nu = max(float(np.max(chain.nu)) for chain in chains)
+    return int(
+        truncation_number_for_posterior(
+            max_nu, len(first.data.time), first.settings.epsilon
+        )
+    )
+
+
 def diagnostics(
     result: DemoResult, *, slice_draws: int = SLICE_DRAWS
 ) -> dict[str, Any]:
@@ -697,10 +765,12 @@ def diagnostics(
 
     The slice rebuilds each chain with
     ``dataclasses.replace(chain.settings, n_save=500)`` (required by
-    ``DPChains.__post_init__``) and reuses the **full trace's**
-    ``J_common``/``J_prior``, which are recorded under each fit's ``j``.  The
-    slice's own ``r_hat``/``ess`` are then the old note's probe values, not a
-    statistic of a new fit (plan §7 Step 2 and §9).
+    ``DPChains.__post_init__``), so the slice's own ``r_hat``/``ess`` are the
+    old note's probe values, not a statistic of a new fit (plan §7 Step 2 and
+    §9).  Each fit records under ``j`` the stored arrays' ``J_common``
+    (``J_common``), the truncation level the recomputed slice would use
+    (``J_common_slice``, :func:`_slice_truncation`) and the prior band's
+    ``J_prior``, so a reader can tell which level produced which column.
     """
     if not isinstance(result, DemoResult):
         raise ValueError("result must be a DemoResult instance")
@@ -720,6 +790,7 @@ def diagnostics(
             "first_500": _diagnostics_block(sliced),
             "j": {
                 "J_common": fit.functionals.meta.get("J_common"),
+                "J_common_slice": _slice_truncation(sliced),
                 "J_prior": None if band is None else band.meta.get("J_prior"),
             },
         }
@@ -1576,7 +1647,11 @@ def _render_diagnostics(payload: Mapping[str, Any]) -> list[str]:
                     entry["n_star"]["ess"],
                     entry["S"]["r_hat"],
                     entry["S"]["ess"],
-                    truncation["J_common"],
+                    (
+                        truncation["J_common"]
+                        if draw_set == "full"
+                        else truncation["J_common_slice"]
+                    ),
                     truncation["J_prior"],
                 ]
             )
@@ -1595,9 +1670,11 @@ def _render_diagnostics(payload: Mapping[str, Any]) -> list[str]:
     ]
     note = (
         f"The `first_500` block truncates each chain to "
-        f"{diagnostics['slice_draws']} stored draws and reuses the full trace's "
-        "truncation level; `R-hat S` and `ESS S` are the five monitored times "
-        "in the order `nu` reports them."
+        f"{diagnostics['slice_draws']} stored draws and recomputes the "
+        "truncation level from the slice, so its `J_common` is smaller than "
+        "the full trace's; `J_prior` belongs to the prior band, which is "
+        "row-sliced. `R-hat S` and `ESS S` are the five monitored times in "
+        "the order `nu` reports them."
     )
     return _heading("Diagnostics", _table(headers, rows) + ["", note])
 

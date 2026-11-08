@@ -7,9 +7,11 @@ tests pin six contracts:
 * the two summaries expose every Figure 1-5 quantity, with one row per fitted
   prior and JSON-safe values (``tests/test_paper_report.py`` is the drift guard
   for the acceptance target table mirroring the paper tests);
-* the first-500-draw slice is built with ``dataclasses.replace`` and keeps the
-  full trace's ``J_common``/``J_prior`` -- slicing the stored functional arrays
-  must not silently change the truncation level;
+* the first-500-draw slice is built with ``dataclasses.replace`` and
+  **recomputes** the posterior functionals from the truncated chains, so the
+  slice carries its own ``J_common`` -- a sliced ``Fit`` must stay a coherent
+  chains-plus-functionals pair, and that recomputation (not a slice of the
+  stored arrays) is what reproduces the old note's probe column;
 * the diagnostics on the slice reproduce ``r_hat``/``ess`` computed directly
   from the sliced chains, and leave the inputs untouched;
 * the baseline delta names the rows that cannot match by construction and uses
@@ -42,8 +44,9 @@ import numpy as np
 import pytest
 
 from src import paper_artifacts, paper_report
-from src.dp_functionals import Functionals
+from src.dp_functionals import Functionals, posterior_functionals
 from src.dp_gibbs import DPChains, DPPrior, DPSettings, SurvData, ess, r_hat
+from src.dp_weibull import truncation_number_for_posterior
 from src.paper_examples import REPO_ROOT, DemoResult, Fit, prior_label
 from tests import test_paper_5_1, test_paper_5_2
 
@@ -447,8 +450,10 @@ def test_summarize_5_2_rejects_another_section(result_5_1: DemoResult) -> None:
 # ---------------------------------------------------------------------------
 # Slicing and the full-trace truncation level
 # ---------------------------------------------------------------------------
-def test_slice_result_keeps_the_full_trace_j(result_5_1: DemoResult) -> None:
-    """The first-500 summary is the same estimator, just fewer stored draws."""
+def test_slice_result_recomputes_functionals_from_the_slice(
+    result_5_1: DemoResult,
+) -> None:
+    """A sliced fit stays coherent: its functionals are computed from its chains."""
     sliced = paper_report.slice_result(result_5_1, 4)
 
     assert sliced.meta["n_save"] == 4
@@ -459,10 +464,32 @@ def test_slice_result_keeps_the_full_trace_j(result_5_1: DemoResult) -> None:
             assert chain.n_draws == 4
             assert chain.settings.n_save == 4
         assert short.functionals.n_draws == 4 * len(full.chains)
-        assert short.functionals.meta["J_common"] == full.functionals.meta["J_common"]
+
+        # The slice's own truncation rule, from its own draws.
+        max_nu = max(float(chain.nu.max()) for chain in short.chains)
+        expected_j = truncation_number_for_posterior(
+            max_nu, len(short.chains[0].data.time), short.chains[0].settings.epsilon
+        )
+        assert short.functionals.meta["J_common"] == expected_j
+
+        # Recomputation, not a slice of the stored arrays: the arrays match a
+        # fresh `posterior_functionals` call on the truncated chains exactly.
+        again = posterior_functionals(
+            short.chains,
+            short.t_grid,
+            settings=paper_report._slice_settings(full.functionals.meta),
+            seed=full.functionals.meta.get("seed"),
+        )
+        np.testing.assert_array_equal(short.functionals.S, again.S)
+        np.testing.assert_array_equal(short.functionals.F, again.F)
+        np.testing.assert_array_equal(short.functionals.f, again.f)
+        np.testing.assert_array_equal(short.functionals.h, again.h)
+
         if full.prior_band is None:
             assert short.prior_band is None
         else:
+            # A band is a set of independent prior draws: row-slicing it is
+            # valid, and its meta is kept verbatim.
             assert short.prior_band is not None
             assert short.prior_band.n_draws == 4
             assert short.prior_band.meta["J_prior"] == full.prior_band.meta["J_prior"]
@@ -473,6 +500,56 @@ def test_slice_result_keeps_the_full_trace_j(result_5_1: DemoResult) -> None:
     )
     summary = paper_report.summarize_5_1(sliced)
     assert len(summary["figure_1"]["nu_posterior_mean"]) == len(PRIOR_TABLE)
+
+
+def test_slice_result_takes_the_truncation_level_from_the_slice() -> None:
+    """The discarded draws do not set the slice's ``J_common`` any more.
+
+    Regression for the §5.2 gate: reusing the stored arrays' truncation level
+    made every Figure 4-5 row disagree with the old note by 0.5-1 %.
+    """
+    t_grid = np.linspace(0.1, 5.0, 40)
+    chains = []
+    for index in range(2):
+        chain = _chain(n_draws=8, seed=31 + index)
+        nu = np.array(chain.nu, dtype=np.float64)
+        nu[4:] = 80.0  # only the discarded draws are this precise
+        chains.append(replace(chain, nu=nu))
+    n = len(chains[0].data.time)
+    epsilon = chains[0].settings.epsilon
+    full_j = truncation_number_for_posterior(80.0, n, epsilon)
+    slice_j = truncation_number_for_posterior(
+        max(float(chain.nu[:4].max()) for chain in chains), n, epsilon
+    )
+    assert slice_j < full_j
+
+    fit = Fit(
+        label="nu ~ Gamma(2, 0.9)",
+        data=chains[0].data,
+        prior=_prior(0),
+        t_grid=t_grid,
+        chains=chains,
+        functionals=_functionals(t_grid, 16, seed=32, j_common=full_j),
+    )
+    result = DemoResult(
+        label="5.1",
+        fits={"nu ~ Gamma(2, 0.9)": fit},
+        meta={"preset": "quick", "n_save": 8},
+    )
+
+    sliced = paper_report.slice_result(result, 4)
+    short = sliced.fits["nu ~ Gamma(2, 0.9)"]
+
+    assert short.functionals.meta["J_common"] == slice_j
+    assert short.functionals.meta["n_draws"] == 8
+    block = paper_report.diagnostics(result, slice_draws=4)["fits"][
+        "nu ~ Gamma(2, 0.9)"
+    ]
+    assert block["j"] == {
+        "J_common": full_j,
+        "J_common_slice": slice_j,
+        "J_prior": None,
+    }
 
 
 def test_slice_result_caps_at_the_available_draws(result_5_2: DemoResult) -> None:
@@ -517,7 +594,16 @@ def test_diagnostics_slices_with_replace_and_reproduces_r_hat_ess() -> None:
     assert payload["slice_draws"] == 500
     assert block["full"]["draws_per_chain"] == 600
     assert block["first_500"]["draws_per_chain"] == 500
-    assert block["j"] == {"J_common": 42, "J_prior": 7}
+    expected_slice_j = truncation_number_for_posterior(
+        max(float(chain.nu[:500].max()) for chain in chains),
+        len(chains[0].data.time),
+        chains[0].settings.epsilon,
+    )
+    assert block["j"] == {
+        "J_common": 42,
+        "J_common_slice": expected_slice_j,
+        "J_prior": 7,
+    }
     assert len(block["full"]["S"]["r_hat"]) == 5
     assert len(block["full"]["S"]["ess"]) == 5
     assert len(block["full"]["S"]["t"]) == 5
@@ -857,8 +943,12 @@ def test_build_payload_carries_both_draw_sets(result_5_1: DemoResult) -> None:
     assert payload["settings"]["n_fits"] == len(PRIOR_TABLE)
     assert payload["settings"]["slice_draws"] == paper_report.SLICE_DRAWS
     assert payload["manifest"] is None
-    # The first-500 summary is the run itself here: the fixture holds 8 draws.
+    # The first-500 block is recomputed from the truncated chains, so with the
+    # fixture's synthetic stored arrays the functional-derived tables are an
+    # independent computation rather than a copy of the full-draw block.  The
+    # Figure 1 quantities read the chains' own draws, so they do coincide.
     assert payload["first_500"]["figure_1"] == payload["full"]["figure_1"]
+    assert payload["first_500"]["figure_2"] != payload["full"]["figure_2"]
     json.dumps(payload)
 
 

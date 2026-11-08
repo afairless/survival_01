@@ -705,20 +705,32 @@ results note -- and return JSON-safe payloads for the report tables:
 
 `slice_result(result, n_draws=500)` is the old note's probe. It rebuilds each
 chain with `dataclasses.replace(chain.settings, n_save=500)` -- required by
-`DPChains.__post_init__` -- and slices the **stored** functional arrays, not a
-fresh `posterior_functionals` call. Those arrays carry the full trace's
-`J_common`/`J_prior`, so the slice keeps the full run's truncation level; a
-fresh call on 500 draws could compute a smaller $J$ and would no longer be a
-like-for-like replay. The functionals are stacked chain by chain, so the index
-list in `_slice_fit` takes the first 500 rows **per chain**, not the first
-$500\times n_{\text{chains}}$ rows of the matrix.
+`DPChains.__post_init__` -- and **recomputes** the functionals from those
+truncated chains with a fresh `posterior_functionals` call, so the slice's
+`J_common` is derived from the surviving draws' $\max_b \nu_b$. The knobs for
+that call (`method`, `atom_tol`, `seed`) come from the stored `Functionals`
+meta via `_slice_settings`; `epsilon` comes from the chains' own settings.
+
+Slicing the stored arrays instead -- the original design -- left a `Fit` whose
+functionals carried the full trace's $J$ while its chains did not, i.e. a
+mixture no run can produce. The §5.2 gate (2026-11-08) measured the
+consequence: with the arrays sliced, every Figure 4-5 row disagreed with
+`dp_gibbs_results.md` by 0.5-1 % (arm-B peak time 12.02 vs 11.83, $\Pr(\eta_A >
+\eta_B)$ 0.887 vs 0.89, ratio decline 1.936 vs 1.95) even though all seven
+fits' first-500 $\hat R$/ESS matched the note exactly; with the functionals
+recomputed from the slice, all comparable rows matched to displayed precision.
+The prior band is still **row-sliced** (`_slice_rows`): its rows are
+independent prior draws, so the first 500 of them are a smaller band from the
+same distribution.
 
 `diagnostics(result)` returns split $\hat R$ and bulk ESS for `nu`, `n_star` and
 the five-time `S` trace twice: on the full chains and on the same 500-draw
-slice. Each fit records the full trace's `J_common` (functionals) and
-`J_prior` (prior band, when present) under `j`, so a reader can tell which
-truncation level the first-500 column used. Neither the chains nor their arrays
-are mutated.
+slice. Each fit records under `j` the stored arrays' `J_common`, the level the
+recomputed slice uses (`J_common_slice`, from the same
+`truncation_number_for_posterior` rule) and the prior band's `J_prior`, so a
+reader can tell which truncation level produced which column; the generated
+diagnostics table prints the slice's own level on the `first_500` row. Neither
+the chains nor their arrays are mutated.
 
 `delta_vs_baseline(summary, baseline)` flattens the payload to dotted paths,
 matches it against the committed `docs/research/dp_gibbs_results_baseline.json`

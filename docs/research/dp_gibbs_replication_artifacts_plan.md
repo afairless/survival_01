@@ -352,9 +352,10 @@ Consumes a loaded `DemoResult` and emits the report payload. Public API:
 - `diagnostics(result) -> dict` — `r_hat()`/`ess()` for ν, n\* and S at the five
   diagnostic times, computed twice: on all stored draws, and on the old note's
   slice. The slice is built with `dataclasses.replace(chain.settings,
-  n_save=500)` (required by `DPChains.__post_init__`, `dp_gibbs.py:3205`) and
-  reuses the **full-trace** `J_common`/`J_prior` (see §7 Step 2 and §9), so the
-  first-500 column is the note's probe value, not a new fit.
+  n_save=500)` (required by `DPChains.__post_init__`, `dp_gibbs.py:3205`); the
+  first-500 column is the note's probe value, not a new fit. The recomputed
+  slice's own truncation level is recorded as `J_common_slice` next to the
+  stored arrays' `J_common` (see §7 Step 2 and §9).
 - `delta_vs_baseline(summary, baseline)` — signed differences against
   `docs/research/dp_gibbs_results_baseline.json` (extracted once from the
   existing note in this step, with a header saying so, and with a
@@ -512,10 +513,18 @@ tree and re-runs `finalize_run` (R6).
   windows plus a stated Monte Carlo tolerance** (they are a sharper estimate,
   not the probe values); the **first-500 column is the like-for-like check**
   against the note, and only it is a hard gate.
-- The first-500 column is computed with the slice's own `r_hat`/`ess` but the
-  **full trace's** `J_common`/`J_prior`, because the note's probe values were
-  read from the full run's chains (§4 of the note). Both J values are recorded
-  in `stats.json` so a future reader can tell which was used.
+- The first-500 column is computed with the slice's own `r_hat`/`ess` **and
+  its own `J_common`**: the functionals are recomputed from the truncated
+  chains rather than sliced out of the stored arrays. Measured on the §5.2
+  gate (2026-11-08), reusing the full trace's `J_common` left every Figure 4-5
+  row 0.5-1 % away from the note even though all seven fits' first-500
+  R̂/ESS matched exactly; with the slice's own `J_common` every comparable row
+  matches to displayed precision. `stats.json` records both levels
+  (`J_common`, `J_common_slice`) per fit.
+- The chains are the replay: all seven fits' first-500 R̂/ESS reproduce §3 of
+  the note, and the first-500 summaries of §4-§5 reproduce its values. That is
+  the R2 determinism check; the full-draw columns are a sharper estimate of
+  the same posteriors, not a second gate.
 - Rows that **cannot** match by construction are marked `not_comparable` and
   are not part of the gate: the Figure 2 prior-band width (the probe drew 200
   prior bands, the run draws 1 000) and `n_eta_above_grid` (a count, not a
@@ -616,9 +625,12 @@ Three independent layers, none of which requires a refit:
    stay in sync.
 
 Determinism check (R2, §7 Step 2): the chains are a replay, so the posterior
-summaries computed from the *first 500 draws* — using the full trace's
-`J_common`/`J_prior` — must match the old note to its displayed precision, for
-every row that is not in the `not_comparable` list. The rows that cannot match
+summaries computed from the *first 500 draws* — recomputing the functionals
+from the slice, so that its own `J_common` is used — must match the old note to
+its displayed precision, for every row that is not in the `not_comparable` list.
+(Slicing the stored arrays instead keeps the full trace's `J_common` and does
+**not** reproduce the note: the §5.2 gate measured 0.5-1 % offsets on every
+Figure 4-5 row with identical chains.) The rows that cannot match
 (prior-band width, 200 vs 1 000 prior draws; `n_eta_above_grid`, a count) are
 listed once in the plan and once in the report rather than silently excluded.
 Any mismatch in a comparable row is a finding, investigated before the report

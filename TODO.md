@@ -55,6 +55,16 @@ they are the gate between step 11 and step 12. Full commands are in plan §7.
 3. **§5.2 gate** (plan §7 Step 2): compare the first-500 column against
    `dp_gibbs_results.md`; the prior-band width and `n_eta_above_grid` rows are
    `not_comparable`; do not start §5.1 on a comparable mismatch.
+   *Gate outcome (2026-11-08, run `replication-2026-11-08T02-26-53Z`):* the
+   chains replay exactly (all seven fits' first-500 R̂/ESS match the note to
+   its displayed precision), but the first-500 *summaries* did not: the column
+   sliced the stored ``Functionals`` and so kept the 10 000-draw trace's
+   `J_common`, which left every Figure 4-5 row 0.5-1 % off. Recomputing the
+   functionals from the truncated chains (the slice's own `J_common`)
+   reproduces all 16 comparable rows. Fixed in `src/paper_report.py`
+   (`slice_result` now recomputes; `diagnostics` records `J_common_slice`),
+   commit `fix: recompute slice functionals for the first-500 column`; the
+   §5.2 report artifacts were re-rendered from the same draws.
 4. **§5.1 paper run** (~8–12 h overnight, plan §7 Step 3):
    `scripts/replicate.sh 5.1 output/replication-<stamp>` reusing Step 1's root
    (R6); `MANIFEST.json` is rewritten to cover both sections.
