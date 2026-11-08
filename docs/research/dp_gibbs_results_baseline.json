@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "source": "docs/research/dp_gibbs_results.md",
+  "description": "First-500-stored-draw probe values transcribed from the tables of docs/research/dp_gibbs_results.md (Sections 4 and 5), for the delta table of the artifact-backed replication report. The note's probe numbers are the first 500 stored draws per chain; the report compares its own first-500 slice against them. Rows listed under not_comparable cannot match by construction and are excluded from the hard gate: the note's Figure 2 prior band was drawn 200 times in the probe against 1,000 in the run, and n_eta_above_grid is a count, not a summary. The Figure 5c probability is the note's first-500 value (0.890); the note also records 0.901 for the full run.",
+  "sections": {
+    "5.1": {
+      "description": "Probe values from the Section 4 tables of dp_gibbs_results.md.",
+      "not_comparable": [
+        "figure_2.prior_band_width"
+      ],
+      "values": {
+        "figure_1.nu_prior_mean": [2.22, 20.0, 60.0],
+        "figure_1.nu_posterior_mean": [1.5, 2.71, 3.98],
+        "figure_1.nu_posterior_95": [[0.38, 3.65], [0.59, 7.08], [1.03, 9.99]],
+        "figure_1.nu_prior_95_width": [6.1, 61.0, 117.0],
+        "figure_1.nu_posterior_width": [3.27, 6.49, 8.96],
+        "figure_1.nu_posterior_99": [4.25, 8.35, 11.68],
+        "figure_1.n_star_posterior_mean": [7.02, 9.88, 12.78],
+        "figure_1.n_star_probability": [0.987, 0.885, 0.73],
+        "figure_1.n_star_observed_range": [[2, 21], [2, 34], [3, 47]],
+        "figure_2.survival_at_median": [0.494, 0.494, 0.495],
+        "figure_2.density_mass": [0.976, 0.974, 0.973],
+        "figure_2.prior_band_width": 0.833,
+        "figure_2.posterior_band_width": 0.092,
+        "figure_2.second_mode_density": [0.147, 0.147, 0.147],
+        "figure_2.first_mode_density": [0.129, 0.129, 0.129],
+        "figure_3.change_points": [
+          [1.015, 2.137, 4.462],
+          [1.015, 2.137, 4.245],
+          [1.034, 2.137, 4.166]
+        ],
+        "figure_3.band_width_near": [0.386, 0.372, 0.368],
+        "figure_3.band_width_far": [4.65, 4.46, 4.32],
+        "figure_3.band_ratio": [12.1, 12.0, 11.8]
+      }
+    },
+    "5.2": {
+      "description": "Probe values from the Section 5 tables of dp_gibbs_results.md.",
+      "not_comparable": [
+        "figure_5.n_eta_above_grid"
+      ],
+      "values": {
+        "figure_4.prior_agreement": [
+          [1.0, 1.0, 1.0],
+          [1.0, 1.0, 1.0],
+          [1.0, 1.0, 1.0]
+        ],
+        "figure_4.prior_agreement_min": 1.0,
+        "figure_4.survival_difference_min": 0.0101,
+        "figure_4.arm_b_peak_time": 11.83,
+        "figure_4.arm_b_peak_value": 0.0735,
+        "figure_4.arm_b_above_peak_max": 0.0593,
+        "figure_5.prob_eta_a_gt_eta_b": 0.89,
+        "figure_5.difference_min": 0.0101,
+        "figure_5.difference_probability_range": [0.56, 0.91],
+        "figure_5.difference_probability_mean": 0.83,
+        "figure_5.hazard_ratio_mean": [2.298, 1.176],
+        "figure_5.hazard_ratio_decline": 1.95,
+        "figure_5.hazard_ratio_order_probability": 0.81,
+        "figure_5.hazard_ratio_band": [[0.663, 5.455], [0.282, 3.103]],
+        "figure_5.n_eta_above_grid": {
+          "fit_a": null,
+          "fit_b": null
+        }
+      }
+    }
+  }
+}

@@ -26,6 +26,7 @@ It has two companions:
 | `src/dp_gibbs.py` | ingestion validation and the time transform, state and bookkeeping, the $\alpha$ quadrature grid, the three full conditionals, one sweep, chain storage, initialisation, the collapsed log-posterior, diagnostics | plotting, data generation, functionals |
 | `src/dp_functionals.py` | the paper's §3 steps (i)–(iii) for posterior *and* prior, survival/CDF/density/hazard/quantile functionals on the original scale, two-population comparisons | drawing $\theta$ |
 | `src/paper_artifacts.py` | slug rule, JSON-safe metadata conversion, atomic `npz`/JSON writes, the self-contained chain, functional, fit and section round-trips, the incremental `ArtifactWriter` and its append-only event log, `finalize_run`/`verify_manifest` for the run-level manifest | fitting, plotting, recomputing summaries |
+| `src/paper_report.py` | report payloads: Figure 1-5 arithmetic, full/first-500 diagnostics, baseline deltas and the acceptance-target mirror | fitting, rendering, writing files, plotting |
 
 Two rules hold everywhere and are enforced by tests, not by convention:
 
@@ -671,6 +672,55 @@ the repository is allowed. The `output/` root itself is rejected too: its parent
 would make `<run_root>/logs` the repository root. This is a guard against a
 3 GB artifact tree landing in a tracked directory, not a substitute for the
 `.gitignore` entry.
+
+### 6.9 Report payloads (`src/paper_report.py`)
+
+`summarize_5_1` and `summarize_5_2` read a loaded `DemoResult` -- never a
+results note -- and return JSON-safe payloads for the report tables:
+
+- Figure 1: the prior/posterior means, central intervals and widths of $\nu$,
+  the $n^\ast$ mean/probability/range, and the learning and right-tail
+  comparisons;
+- Figure 2: mean $S(1.1727)$, $\int\hat f\,dt$, the two density-mode values and
+  the prior-vs-posterior 95 % band width on $(0,4]$ for the reference fit;
+- Figure 3: the smoothed hazard's sign changes on $(0,5)$ and its 95 % band
+  width at $t=2.5$ and $t=4.5$;
+- Figures 4-5: the ordered prior-agreement matrix, $\min(\hat S_A-\hat S_B)$,
+  arm B's smoothed-hazard peak and its maximum above 20, and the Figure 5
+  quantities from `compare` (paired $\Pr(\eta_A>\eta_B)$, the $F_B-F_A$
+  minima/probabilities, the mean hazard ratio at 5 and 25, the ordering
+  probability, the 95 % ratio bands and `n_eta_above_grid`).
+
+`slice_result(result, n_draws=500)` is the old note's probe. It rebuilds each
+chain with `dataclasses.replace(chain.settings, n_save=500)` -- required by
+`DPChains.__post_init__` -- and slices the **stored** functional arrays, not a
+fresh `posterior_functionals` call. Those arrays carry the full trace's
+`J_common`/`J_prior`, so the slice keeps the full run's truncation level; a
+fresh call on 500 draws could compute a smaller $J$ and would no longer be a
+like-for-like replay. The functionals are stacked chain by chain, so the index
+list in `_slice_fit` takes the first 500 rows **per chain**, not the first
+$500\times n_{\text{chains}}$ rows of the matrix.
+
+`diagnostics(result)` returns split $\hat R$ and bulk ESS for `nu`, `n_star` and
+the five-time `S` trace twice: on the full chains and on the same 500-draw
+slice. Each fit records the full trace's `J_common` (functionals) and
+`J_prior` (prior band, when present) under `j`, so a reader can tell which
+truncation level the first-500 column used. Neither the chains nor their arrays
+are mutated.
+
+`delta_vs_baseline(summary, baseline)` flattens the payload to dotted paths,
+matches it against the committed `docs/research/dp_gibbs_results_baseline.json`
+(extracted from the old note's first-500 tables) and returns
+`{observed, baseline, delta, not_comparable}` per row. The two rows that cannot
+match by construction are named in the baseline: the 200-draw prior band of the
+probe versus the run's 1 000, and `n_eta_above_grid`, which is a count. A row
+whose shape changed (for example a different number of hazard change points)
+keeps a `null` delta rather than crashing the report.
+
+`ACCEPTANCE_TARGETS` mirrors the constants of
+`tests/test_paper_5_1.py`/`tests/test_paper_5_2.py`. The mirror is tested, not
+maintained by comment: editing a threshold in one file without the other fails
+`tests/test_paper_report.py` in the default gate.
 
 The CLI exposes `--save-dir DIR`. `--out` now defaults to `None` in the parser;
 `main` resolves the omitted flag to `DEFAULT_FIGURE_DIR` (preserving the old
