@@ -676,6 +676,15 @@ would make `<run_root>/logs` the repository root. This is a guard against a
 3 GB artifact tree landing in a tracked directory, not a substitute for the
 `.gitignore` entry.
 
+The `-m` entry point aliases itself: `python -m src.paper_examples` runs the
+file as `__main__`, while `paper_artifacts` imports `src.paper_examples.Fit`
+lazily by its canonical name. Without the alias in the `if __name__ ==
+"__main__"` block that second import would execute the module again and give
+two distinct `Fit` classes, so `ArtifactWriter.fit_done` would reject a real
+`Fit` with "expects a Fit, got Fit". The alias registers the running module
+under its canonical name first, so the shell entry point and the in-process
+tests agree.
+
 ### 6.9 Report payloads (`src/paper_report.py`)
 
 `summarize_5_1` and `summarize_5_2` read a loaded `DemoResult` -- never a
@@ -810,6 +819,62 @@ missing baseline or a payload the artifacts cannot supply prints one
 `error: ...` line and exits 1 -- the baseline is loaded and the payload built
 before anything is written, so a failed dry run leaves no partial report.
 
+### 6.11 The replication scripts (`scripts/`)
+
+Two tracked bash scripts (plan §6.5, §7) make the runbook one line; they add no
+statistics, they only sequence the Python entry points above.
+
+`scripts/replicate.sh <5.1|5.2> [run_root]` -- the run. With no `run_root` it
+stamps `output/replication-<UTC>`; a **given** root is reused, never created
+(plan R6), which is how the §5.1 stage joins the §5.2 tree and how the single
+run-level `MANIFEST.json` comes to cover both sections. The stages, each
+failing the script (`set -euo pipefail`) and logging to
+`logs/run-<section>.log`:
+
+1. `logs/env.txt` -- git SHA and dirty flag, pixi lock digest, package
+   versions, host, cores, memory, disk (appended, so a reused root records
+   both stages);
+2. the driver, `python -m src.paper_examples --save-dir <root>/<section>`;
+3. the report stage, `python -m src.paper_report --write`, the only writer of
+   `<section>/figures/` (plan R7);
+4. `finalize_run` -- **early**: the artifact-mode acceptance suite asserts
+   that the manifest's `code_sha` is this checkout's `HEAD`, so a manifest must
+   exist before the replay;
+5. `pytest -m paper tests/test_paper_5_<n>.py` with `DP_PAPER_ARTIFACTS` and
+   `DP_PAPER_PRESET` set, to `logs/pytest-paper-<section>.log` -- no fitting;
+6. `finalize_run` again and `verify_manifest`, so the run cannot finish with a
+   broken tree.
+
+Everything that appends to `logs/run-<section>.log` runs **before** the final
+`finalize_run`: the manifest hashes the log, so one line written afterwards
+would make the tree it describes stale. The last two stages therefore print to
+the console only. `REPLICATE_PRESET`, `REPLICATE_PRIORS` and
+`REPLICATE_ACCEPTANCE=0` (skip stage 5) exist for machinery smoke runs -- the
+`quick` preset with one prior does not satisfy the acceptance clauses, so such
+a run must not claim to have replayed them -- and `REPLICATE_PYTHON` selects
+the launcher (default `pixi run python`, which is what the `pixi.toml` tasks
+`replicate-5.2`, `replicate-5.1` and `verify-paper` wrap).
+
+`scripts/verify_replication.sh <run_root>` -- the reviewer entry point, no
+fitting anywhere:
+
+1. `verify_manifest` re-hashes every listed file;
+2. each section's figures are re-rendered **into a scratch directory** (via the
+   report stage's own `_render_figures`) and compared byte-for-byte with
+   `<section>/figures/`; writing into the tree would invalidate the manifest
+   that was just checked;
+3. `pytest -m paper` for every section present, with `DP_PAPER_ARTIFACTS` and
+   the preset read from the section's `meta.json` (`meta.preset`), i.e. the
+   committed acceptance modules replayed against the saved draws;
+4. `verify_manifest` again, which proves neither stage wrote into the tree.
+
+A section directory is recognised by its name (`5.1`/`5.2`) plus a
+`meta.json`; a root without one is rejected instead of passing vacuously.
+`DP_PAPER_ARTIFACTS_ALLOW_SHA_MISMATCH=1` is inherited by the replay, so an
+older run can be inspected from a newer checkout without pretending its draws
+came from `HEAD`. `tests/test_scripts.py` pins the argument surface, the stage
+order and one real end-to-end round trip at the `quick` preset.
+
 ---
 
 ## 7. Gotcha checklist
@@ -867,6 +932,8 @@ The test suite of plan §7 is the argument. In the order it is worth reading:
 | 29 | `test_paper_artifacts.py` | the artifact round-trips, event log and manifest verification |
 | 30 | `test_paper_5_1.py`, `test_paper_5_2.py` | the §6.3 reproduction, opt-in `-m paper` |
 | 31 | `test_paper_report.py` | report payloads, acceptance verdicts, generated tables/CSVs and the byte-identical figure re-render |
+| 32 | `test_cli.py` | import and CLI hygiene, plus the tiny-preset driver smoke tests |
+| 33 | `test_scripts.py` | the `scripts/` argument surface, stage order and one real `quick` round trip through `replicate.sh` and `verify_replication.sh` |
 
 Tests 15, 16, 17 are the ones that establish correctness rather than
 plausibility: exact enumeration on a small problem, a second implementation,

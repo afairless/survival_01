@@ -10,6 +10,14 @@ test-all = "pytest"
 lint = "ruff check src tests && ruff format --check src tests"
 typecheck = "pyright"
 
+# Replication runbook (docs/research/dp_gibbs_replication_artifacts_plan.md
+# §6.5, §7): thin wrappers, so each stage is one command.  Arguments are
+# appended to the task, so `pixi run replicate-5.1 output/replication-<stamp>`
+# joins the §5.2 tree (plan R6).
+"replicate-5.2" = "scripts/replicate.sh 5.2"
+"replicate-5.1" = "scripts/replicate.sh 5.1"
+"verify-paper" = "scripts/verify_replication.sh"
+
 [dependencies]
 numpy = ">=2.5.4,<3"
 pandas = ">=3.1.0,<4"

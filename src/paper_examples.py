@@ -1143,4 +1143,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    # ``python -m src.paper_examples`` runs this file as ``__main__``.  The
+    # artifact helpers import ``src.paper_examples.Fit`` lazily by its
+    # canonical name, which would execute the module a second time and give
+    # two distinct ``Fit`` classes (the ``isinstance`` guards of
+    # ``ArtifactWriter`` would then reject a real ``Fit``).  Registering the
+    # running module under its canonical name first makes both imports the
+    # same object, so the ``-m`` form and the in-process tests agree.
+    sys.modules.setdefault("src.paper_examples", sys.modules[__name__])
     raise SystemExit(main())
