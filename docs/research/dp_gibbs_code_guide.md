@@ -632,6 +632,54 @@ a broken tree is diagnosed in one pass. A returned `ManifestReport` is a pass:
 its `paths`, `file_count`, `total_bytes`, `code_sha` and `code_dirty` are what
 the report's provenance table quotes.
 
+### 6.8 Driver and CLI wiring (`src/paper_examples.py`)
+
+`example_5_1` and `example_5_2` take an optional `save_dir`; when it is set
+they become the first stage of the replication pipeline instead of a figure
+recipe. The argument is the **section directory** (`<run_root>/5.1` or
+`<run_root>/5.2`), matching what the report CLI later reads. Its parent is the
+run root, so the plan §5 layout holds:
+
+```text
+<run_root>/
+  logs/events-5.1.jsonl     # run-level, written by ArtifactWriter.event
+  5.1/
+    meta.json               # written last, after every fit directory
+    draws/<arm->slug>/      # chain-<b>.npz, functionals.npz, fit-meta.json
+                            # and, for §5.1, prior-band.npz
+```
+
+The driver enters `_artifact_writer`, which roots an `ArtifactWriter` at the
+section directory's parent. Each fit is passed to `fit_done` as soon as
+`fit_dataset` returns -- before the next fit starts -- and the prior band is
+attached with `band_done` afterwards. The event stream starts with `run_start`,
+records one `fit_start`/`fit_done` pair per fit (`arm="A"`/`"B"` in §5.2), then
+`band_done` for §5.1 and finally `run_end`; every timing comes from
+`time.perf_counter` and is stored in `fit-meta.json`'s `extra`. Arm B is written
+to its own `B-<slug>` directory, and the section `meta.json` is written only
+after every fit it names exists.
+
+With `save_dir` the driver writes **no** figure and returns `figures=()`: plan
+R7 gives `figures/` to the report stage, which re-renders it from the stored
+functionals. Without `save_dir` the old behaviour is unchanged, including the
+three/five PNG paths returned in `DemoResult.figures`.
+
+`_validated_save_dir` resolves the path and refuses anything inside the
+repository that is not under the git-ignored `output/` tree (so `docs/`,
+`src/`, `tests/` and the repository root are rejected), while any path outside
+the repository is allowed. The `output/` root itself is rejected too: its parent
+would make `<run_root>/logs` the repository root. This is a guard against a
+3 GB artifact tree landing in a tracked directory, not a substitute for the
+`.gitignore` entry.
+
+The CLI exposes `--save-dir DIR`. `--out` now defaults to `None` in the parser;
+`main` resolves the omitted flag to `DEFAULT_FIGURE_DIR` (preserving the old
+meaning) and passes it through, but the driver ignores it whenever `--save-dir`
+is present because no figures are written. A rejected tracked path or an
+unwritable run root prints one `error: ...` line to stderr and returns 1 rather
+than dumping a traceback; argparse still exits 2 for an invalid `--example`,
+`--preset` or `--prior`.
+
 ---
 
 ## 7. Gotcha checklist

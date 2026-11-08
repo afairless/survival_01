@@ -22,6 +22,7 @@ without a minutes-long MCMC run.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src import paper_examples
+from src import paper_artifacts, paper_examples
 from src.dp_functionals import FunctionalSettings
 from src.dp_gibbs import DPSettings
 from src.paper_data import NU_PRIORS
@@ -53,6 +54,12 @@ TINY_PRESET = paper_examples.Preset(
     functionals=FunctionalSettings(method="exact", L=8, atom_tol=1e-6, n_t_grid=300),
     n_prior_draws=4,
 )
+
+
+@pytest.fixture
+def tiny_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register the tiny preset so the CLI can drive a real, cheap run."""
+    monkeypatch.setitem(paper_examples.PRESETS, "tiny", TINY_PRESET)
 
 
 # ---------------------------------------------------------------------------
@@ -274,3 +281,255 @@ def test_example_5_2_always_fits_the_reported_comparison_prior(
     assert result.meta["prior_indices"] == (0, 2)
     assert "A: nu ~ Gamma(2, 0.9)" in result.fits
     assert "B: nu ~ Gamma(2, 0.9)" in result.fits
+
+
+# ---------------------------------------------------------------------------
+# Artifact-backed driver and CLI (plan §6.2)
+# ---------------------------------------------------------------------------
+def test_cli_out_defaults_to_none_and_keeps_the_figure_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--out`` is optional at the parser and resolved in ``main``."""
+    parser = paper_examples.build_parser()
+    assert parser.parse_args(["--example", "5.1"]).out is None
+
+    calls: list[dict[str, object]] = []
+
+    def fake_example_5_1(**kwargs: object) -> paper_examples.DemoResult:
+        calls.append(kwargs)
+        return paper_examples.DemoResult(label="5.1", fits={}, figures=())
+
+    monkeypatch.setattr(paper_examples, "example_5_1", fake_example_5_1)
+
+    assert paper_examples.main(["--example", "5.1", "--preset", "quick"]) == 0
+    assert calls[0]["out_dir"] == paper_examples.DEFAULT_FIGURE_DIR
+    assert calls[0]["save_dir"] is None
+
+    explicit = tmp_path / "explicit-figures"
+    assert (
+        paper_examples.main(
+            ["--example", "5.1", "--preset", "quick", "--out", str(explicit)]
+        )
+        == 0
+    )
+    assert calls[1]["out_dir"] == explicit
+
+    save_dir = tmp_path / "run" / "5.1"
+    assert (
+        paper_examples.main(
+            [
+                "--example",
+                "5.1",
+                "--preset",
+                "quick",
+                "--save-dir",
+                str(save_dir),
+            ]
+        )
+        == 0
+    )
+    # The omitted --out keeps its documented meaning; the driver ignores it
+    # because --save-dir suppresses figures entirely.
+    assert calls[2]["out_dir"] == paper_examples.DEFAULT_FIGURE_DIR
+    assert calls[2]["save_dir"] == save_dir
+
+
+def test_example_5_1_save_dir_round_trips_the_fits(tmp_path: Path) -> None:
+    """The driver saves every fit and the band, and writes no figure."""
+    save_dir = tmp_path / "5.1"
+    result = paper_examples.example_5_1(
+        preset=TINY_PRESET,
+        prior_indices=(0,),
+        seed=31,
+        save_dir=save_dir,
+    )
+
+    assert result.figures == ()
+    assert not (save_dir / "figures").exists()
+    assert (save_dir / "meta.json").is_file()
+    assert (tmp_path / "logs" / "events-5.1.jsonl").is_file()
+
+    loaded = paper_artifacts.load_demo_result(save_dir)
+    assert loaded.label == "5.1"
+    assert loaded.figures == ()
+    assert loaded.meta == result.meta
+    assert loaded.meta["prior_indices"] == (0,)
+    assert set(loaded.fits) == set(result.fits)
+
+    key = next(iter(result.fits))
+    original = result.fits[key]
+    restored = loaded.fits[key]
+    assert restored.label == original.label
+    assert restored.prior == original.prior
+    assert np.array_equal(restored.data.time, original.data.time)
+    assert np.array_equal(restored.data.event, original.data.event)
+    assert restored.data.t_max == original.data.t_max
+    assert np.array_equal(restored.t_grid, original.t_grid)
+    assert np.array_equal(restored.functionals.S, original.functionals.S)
+    assert np.array_equal(restored.functionals.f, original.functionals.f)
+    assert restored.prior_band is not None
+    assert original.prior_band is not None
+    assert np.array_equal(restored.prior_band.S, original.prior_band.S)
+
+    fit_dir = save_dir / "draws" / paper_artifacts.slug(original.label)
+    assert (fit_dir / "functionals.npz").is_file()
+    assert (fit_dir / "prior-band.npz").is_file()
+    assert (fit_dir / "fit-meta.json").is_file()
+    for index in range(original.n_chains):
+        assert (fit_dir / f"chain-{index}.npz").is_file()
+
+
+def test_cli_save_dir_writes_the_section_tree(
+    tmp_path: Path, tiny_cli: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI writes draws, functionals, fit meta and events, but no figure."""
+    save_dir = tmp_path / "5.1"
+    assert (
+        paper_examples.main(
+            [
+                "--example",
+                "5.1",
+                "--preset",
+                "tiny",
+                "--prior",
+                "1",
+                "--seed",
+                "41",
+                "--save-dir",
+                str(save_dir),
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == "example 5.1: 1 fit(s)\n"
+
+    loaded = paper_artifacts.load_demo_result(save_dir)
+    assert loaded.label == "5.1"
+    assert loaded.meta["prior_indices"] == (0,)
+    assert not (save_dir / "figures").exists()
+
+    fit = next(iter(loaded.fits.values()))
+    fit_dir = save_dir / "draws" / paper_artifacts.slug(fit.label)
+    assert (fit_dir / "functionals.npz").is_file()
+    assert (fit_dir / "fit-meta.json").is_file()
+    assert len(list(fit_dir.glob("chain-*.npz"))) == fit.n_chains
+
+    payload = json.loads((fit_dir / "fit-meta.json").read_text(encoding="utf-8"))
+    assert payload["extra"]["timing"] >= 0.0
+
+    log = tmp_path / "logs" / "events-5.1.jsonl"
+    records = [
+        json.loads(line)
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert [record["kind"] for record in records] == [
+        "run_start",
+        "fit_start",
+        "fit_done",
+        "band_done",
+        "run_end",
+    ]
+    for record in records:
+        assert {"ts", "t_monotonic", "kind"} <= set(record)
+    assert records[2]["timing"] >= 0.0
+
+
+def test_cli_save_dir_puts_arm_b_in_its_own_directory(
+    tmp_path: Path, tiny_cli: None
+) -> None:
+    """Section 5.2 persists arm B under its own ``B-<slug>`` directory."""
+    save_dir = tmp_path / "5.2"
+    assert (
+        paper_examples.main(
+            [
+                "--example",
+                "5.2",
+                "--preset",
+                "tiny",
+                "--prior",
+                "1",
+                "--seed",
+                "42",
+                "--save-dir",
+                str(save_dir),
+            ]
+        )
+        == 0
+    )
+
+    loaded = paper_artifacts.load_demo_result(save_dir)
+    assert set(loaded.fits) == {
+        "A: nu ~ Gamma(2, 0.9)",
+        "B: nu ~ Gamma(2, 0.9)",
+    }
+    assert loaded.meta["prior_indices"] == (0,)
+    for key in loaded.fits:
+        arm, label = key.split(": ", maxsplit=1)
+        fit_dir = save_dir / "draws" / f"{arm}-{paper_artifacts.slug(label)}"
+        assert (fit_dir / "fit-meta.json").is_file()
+        payload = json.loads((fit_dir / "fit-meta.json").read_text(encoding="utf-8"))
+        assert payload["arm"] == arm
+    assert (tmp_path / "logs" / "events-5.2.jsonl").is_file()
+    assert not (save_dir / "figures").exists()
+
+
+@pytest.mark.parametrize("tracked", ["docs/x", "src/x", "tests/x"])
+def test_cli_rejects_a_tracked_save_dir(
+    tracked: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 3 GB artifact tree may never land in a tracked directory."""
+    save_dir = REPO_ROOT / tracked
+    assert (
+        paper_examples.main(
+            ["--example", "5.1", "--preset", "quick", "--save-dir", str(save_dir)]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert "tracked path" in captured.err
+    assert str(save_dir.resolve()) in captured.err
+    assert not save_dir.exists()
+
+
+def test_cli_unwritable_save_dir_exits_nonzero(
+    tmp_path: Path,
+    tiny_cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unwritable run root is one message and a nonzero exit."""
+    original_mkdir = Path.mkdir
+
+    def deny_mkdir(
+        self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if self == tmp_path or tmp_path in self.parents:
+            raise PermissionError(f"read-only filesystem: {self}")
+        original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", deny_mkdir)
+    save_dir = tmp_path / "5.1"
+    assert (
+        paper_examples.main(
+            [
+                "--example",
+                "5.1",
+                "--preset",
+                "tiny",
+                "--prior",
+                "1",
+                "--save-dir",
+                str(save_dir),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert captured.err.startswith("error: ")
+    assert "read-only filesystem" in captured.err
+    assert captured.err.count("\n") == 1

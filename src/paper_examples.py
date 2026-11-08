@@ -16,7 +16,15 @@ turns the paper's Sections 5.1 and 5.2 into runnable recipes:
   git-ignored ``docs/research/figures/`` (decision 8: numbers go into
   ``docs/research/dp_gibbs_results.md``, binaries never enter git);
 * ``python -m src.paper_examples --example {5.1,5.2} --preset {quick,paper,
-  paper-lite} --prior {1,2,3,all} --seed N --out DIR``.
+  paper-lite} --prior {1,2,3,all} --seed N --out DIR``, and the artifact-backed
+  form ``--save-dir DIR``, which writes every fit through
+  :class:`src.paper_artifacts.ArtifactWriter` instead of plotting it.
+
+With ``save_dir`` the driver is the first stage of the replication pipeline
+(``docs/research/dp_gibbs_replication_artifacts_plan.md`` §6.2): each fit is
+saved before the next one starts, the prior band is attached afterwards, and
+no figure is written.  The report stage owns ``figures/`` (plan R7) and
+re-renders it from the stored draws.
 
 Non-goals
 ---------
@@ -39,7 +47,10 @@ produced it.  The prior is elicited on the original scale but applied on the
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Sequence
+import sys
+import time
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -61,6 +72,7 @@ from src.dp_gibbs import (
     make_surv_data,
     sample_chains,
 )
+from src.paper_artifacts import ArtifactError, ArtifactWriter
 from src.paper_data import (
     A_GAMMA,
     A_PHI,
@@ -288,6 +300,89 @@ def _as_prior_indices(indices: Iterable[int] | None) -> tuple[int, ...]:
         if value not in out:
             out.append(value)
     return tuple(out)
+
+
+def _validated_save_dir(save_dir: Path | str) -> Path:
+    """Resolve and vet one artifact section directory.
+
+    Artifacts may only be written to the git-ignored ``output/`` tree or to a
+    path outside the repository.  A 3 GB run must never be able to land in
+    ``docs/``, ``src/``, ``tests/`` or any other tracked directory (plan
+    §6.2), so the check is on the resolved path rather than its spelling.
+
+    ``save_dir`` names the section directory (``<run_root>/5.1``); its parent
+    is the run root that owns ``logs/`` and ``MANIFEST.json``.  The section
+    directory itself is therefore rejected when it *is* ``output/``, because
+    the run root -- and the event log -- would then be the repository root.
+    """
+    try:
+        path = Path(save_dir)
+    except TypeError as exc:
+        raise ValueError(f"save_dir must be a path, got {save_dir!r}") from exc
+    if not str(path):
+        raise ValueError("save_dir must be a non-empty path")
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError as exc:
+        raise ValueError(f"save_dir {path} cannot be resolved: {exc}") from exc
+
+    output_root = (REPO_ROOT / "output").resolve()
+    try:
+        resolved.relative_to(REPO_ROOT)
+    except ValueError:
+        return resolved
+    try:
+        resolved.relative_to(output_root)
+    except ValueError:
+        raise ValueError(
+            f"save_dir {resolved} is a tracked path; replication artifacts may "
+            f"only be written under {output_root} or outside the repository "
+            f"{REPO_ROOT}"
+        ) from None
+    if resolved == output_root:
+        raise ValueError(
+            f"save_dir {resolved} is the output root, not a section directory; "
+            "pass <run_root>/5.1 or <run_root>/5.2"
+        )
+    return resolved
+
+
+@contextmanager
+def _artifact_writer(
+    save_dir: Path | str | None,
+    *,
+    label: str,
+    meta: dict[str, Any],
+) -> Iterator[ArtifactWriter | None]:
+    """Yield the incremental writer for ``save_dir``, or ``None`` without it.
+
+    ``save_dir`` is the section directory, so the writer is rooted at its
+    parent: the plan §5 layout keeps ``logs/events-<section>.jsonl`` at the run
+    root and the fit directories under ``<run_root>/<section>/draws``.  The
+    event stream starts with a ``run_start`` record; the driver writes one
+    ``fit_start``/``fit_done`` pair per fit and closes with ``run_end``.
+    """
+    if save_dir is None:
+        yield None
+        return
+    section_dir = _validated_save_dir(save_dir)
+    writer = ArtifactWriter(
+        section_dir.parent,
+        section=section_dir.name,
+        label=label,
+        meta=meta,
+    )
+    with writer:
+        writer.event(
+            "run_start",
+            example=label,
+            save_dir=str(section_dir),
+            preset=meta.get("preset"),
+            seed=meta.get("seed"),
+            prior_indices=meta.get("prior_indices"),
+            n_chains=meta.get("n_chains"),
+        )
+        yield writer
 
 
 def data_5_1(seed: int = DATA_SEED_5_1) -> SurvData:
@@ -726,6 +821,7 @@ def example_5_1(
     seed: int | None = SEED_5_1,
     data_seed: int = DATA_SEED_5_1,
     out_dir: Path | str = DEFAULT_FIGURE_DIR,
+    save_dir: Path | str | None = None,
     max_workers: int | None = None,
 ) -> DemoResult:
     """Run Section 5.1 end to end and write Figures 1-3.
@@ -734,49 +830,73 @@ def example_5_1(
     writes ``figure_1.png``, ``figure_2.png`` and ``figure_3.png`` under
     ``out_dir``.  Figure 2 compares the posterior of the first selected prior
     with its prior band -- the elicitation-scale caveat of plan decision 2.
+
+    With ``save_dir`` the driver instead persists the run (plan §6.2): every
+    fit is written before the next one starts, the prior band is attached to
+    the first fit, and no figure is written at all (plan R7).  ``save_dir`` is
+    the section directory (``<run_root>/5.1``); its parent holds ``logs/``.
     """
     resolved = resolve_preset(preset)
     indices = _as_prior_indices(prior_indices)
     data = data_5_1(seed=int(data_seed))
     grid = time_grid(data.t_max, resolved.functionals.n_t_grid)
+    meta: dict[str, Any] = {
+        "preset": resolved.name,
+        "seed": seed,
+        "data_seed": int(data_seed),
+        "prior_indices": indices,
+        "n_chains": resolved.sampler.n_chains,
+        "burn_in": resolved.sampler.burn_in,
+        "n_save": resolved.sampler.n_save,
+        "thin": resolved.sampler.thin,
+        "t_max": data.t_max,
+    }
 
-    fits: dict[str, Fit] = {}
-    for index in indices:
-        prior = make_prior(index)
-        fits[prior_label(index)] = fit_dataset(
-            data,
-            prior,
-            preset=resolved,
-            seed=seed,
-            t_grid=grid,
-            max_workers=max_workers,
-        )
+    with _artifact_writer(save_dir, label="5.1", meta=meta) as writer:
+        fits: dict[str, Fit] = {}
+        for index in indices:
+            label = prior_label(index)
+            if writer is not None:
+                writer.event("fit_start", arm=None, label=label)
+            started = time.perf_counter()
+            fit = fit_dataset(
+                data,
+                make_prior(index),
+                preset=resolved,
+                seed=seed,
+                t_grid=grid,
+                max_workers=max_workers,
+            )
+            elapsed = time.perf_counter() - started
+            if writer is not None:
+                writer.fit_done(fit, elapsed)
+            fits[label] = fit
 
-    reference = next(iter(fits.values()))
-    band = prior_band(reference, preset=resolved, seed=seed)
-    reference.prior_band = band
+        reference = next(iter(fits.values()))
+        started = time.perf_counter()
+        band = prior_band(reference, preset=resolved, seed=seed)
+        elapsed = time.perf_counter() - started
+        if writer is not None:
+            writer.band_done(band, elapsed, fit=reference)
+        reference.prior_band = band
 
-    out = Path(out_dir)
-    figures = (
-        figure_1(fits, path=out / "figure_1.png"),
-        figure_2(reference, band, path=out / "figure_2.png"),
-        figure_3(fits, path=out / "figure_3.png"),
-    )
+        if writer is not None:
+            writer.write_meta()
+            writer.event("run_end", figures=0)
+            figures: tuple[Path, ...] = ()
+        else:
+            out = Path(out_dir)
+            figures = (
+                figure_1(fits, path=out / "figure_1.png"),
+                figure_2(reference, band, path=out / "figure_2.png"),
+                figure_3(fits, path=out / "figure_3.png"),
+            )
+
     return DemoResult(
         label="5.1",
         fits=fits,
         figures=figures,
-        meta={
-            "preset": resolved.name,
-            "seed": seed,
-            "data_seed": int(data_seed),
-            "prior_indices": indices,
-            "n_chains": resolved.sampler.n_chains,
-            "burn_in": resolved.sampler.burn_in,
-            "n_save": resolved.sampler.n_save,
-            "thin": resolved.sampler.thin,
-            "t_max": data.t_max,
-        },
+        meta=meta,
     )
 
 
@@ -786,6 +906,7 @@ def example_5_2(
     prior_indices: Iterable[int] | None = None,
     seed: int | None = SEED_5_2,
     out_dir: Path | str = DEFAULT_FIGURE_DIR,
+    save_dir: Path | str | None = None,
     max_workers: int | None = None,
 ) -> DemoResult:
     """Run Section 5.2 end to end and write Figures 4 and 5.
@@ -798,6 +919,10 @@ def example_5_2(
     fits that record different ``t_max`` values, and the paper's comparison
     lives on one common week scale.  Figures 4 and 5 are written under
     ``out_dir``.
+
+    With ``save_dir`` every fit is persisted before the next one starts, arm B
+    lands in its own ``B-<slug>`` directory, and no figure is written (plan
+    §6.2/R7).  ``save_dir`` is the section directory (``<run_root>/5.2``).
     """
     resolved = resolve_preset(preset)
     indices = _as_prior_indices(prior_indices)
@@ -808,53 +933,75 @@ def example_5_2(
     data_a = data_5_2("A", t_max=shared_t_max)
     data_b = data_5_2("B", t_max=shared_t_max)
     grid = time_grid(shared_t_max, resolved.functionals.n_t_grid)
+    meta: dict[str, Any] = {
+        "preset": resolved.name,
+        "seed": seed,
+        "prior_indices": indices,
+        "n_chains": resolved.sampler.n_chains,
+        "burn_in": resolved.sampler.burn_in,
+        "n_save": resolved.sampler.n_save,
+        "thin": resolved.sampler.thin,
+        "t_max": shared_t_max,
+        "t_max_a": data_a.t_max,
+        "t_max_b": data_b.t_max,
+    }
 
-    fits: dict[str, Fit] = {}
-    for index in indices:
-        fit = fit_dataset(
-            data_a,
-            make_prior(index),
+    with _artifact_writer(save_dir, label="5.2", meta=meta) as writer:
+        fits: dict[str, Fit] = {}
+        for index in indices:
+            label = prior_label(index)
+            if writer is not None:
+                writer.event("fit_start", arm="A", label=label)
+            started = time.perf_counter()
+            fit = fit_dataset(
+                data_a,
+                make_prior(index),
+                preset=resolved,
+                seed=seed,
+                t_grid=grid,
+                max_workers=max_workers,
+            )
+            elapsed = time.perf_counter() - started
+            if writer is not None:
+                writer.fit_done(fit, elapsed, arm="A")
+            fits[f"A: {label}"] = fit
+
+        label_b = prior_label(0)
+        if writer is not None:
+            writer.event("fit_start", arm="B", label=label_b)
+        started = time.perf_counter()
+        fit_b = fit_dataset(
+            data_b,
+            make_prior(0),
             preset=resolved,
             seed=seed,
             t_grid=grid,
             max_workers=max_workers,
         )
-        fits[f"A: {prior_label(index)}"] = fit
+        elapsed = time.perf_counter() - started
+        if writer is not None:
+            writer.fit_done(fit_b, elapsed, arm="B")
+        fits[f"B: {label_b}"] = fit_b
 
-    fit_b = fit_dataset(
-        data_b,
-        make_prior(0),
-        preset=resolved,
-        seed=seed,
-        t_grid=grid,
-        max_workers=max_workers,
-    )
-    fits[f"B: {prior_label(0)}"] = fit_b
+        fits_a = {key[3:]: fit for key, fit in fits.items() if key.startswith("A: ")}
+        reference_a = fits[f"A: {label_b}"]
 
-    fits_a = {key[3:]: fit for key, fit in fits.items() if key.startswith("A: ")}
-    reference_a = fits[f"A: {prior_label(0)}"]
+        if writer is not None:
+            writer.write_meta()
+            writer.event("run_end", figures=0)
+            figures: tuple[Path, ...] = ()
+        else:
+            out = Path(out_dir)
+            figures = (
+                figure_4(fits_a, fit_b, path=out / "figure_4.png"),
+                figure_5(reference_a, fit_b, path=out / "figure_5.png"),
+            )
 
-    out = Path(out_dir)
-    figures = (
-        figure_4(fits_a, fit_b, path=out / "figure_4.png"),
-        figure_5(reference_a, fit_b, path=out / "figure_5.png"),
-    )
     return DemoResult(
         label="5.2",
         fits=fits,
         figures=figures,
-        meta={
-            "preset": resolved.name,
-            "seed": seed,
-            "prior_indices": indices,
-            "n_chains": resolved.sampler.n_chains,
-            "burn_in": resolved.sampler.burn_in,
-            "n_save": resolved.sampler.n_save,
-            "thin": resolved.sampler.thin,
-            "t_max": shared_t_max,
-            "t_max_a": data_a.t_max,
-            "t_max_b": data_b.t_max,
-        },
+        meta=meta,
     )
 
 
@@ -910,8 +1057,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         type=Path,
-        default=DEFAULT_FIGURE_DIR,
-        help=f"figure directory (default: {DEFAULT_FIGURE_DIR})",
+        default=None,
+        help=(
+            "figure directory (default: "
+            f"{DEFAULT_FIGURE_DIR}); ignored when --save-dir is given, because "
+            "the driver then writes no figures (plan R7)"
+        ),
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "write replication artifacts to the section directory DIR "
+            "(for example output/replication-<stamp>/5.1) and no figures; "
+            "DIR must live under the git-ignored output/ tree or outside the "
+            "repository"
+        ),
     )
     parser.add_argument(
         "--max-workers",
@@ -923,7 +1086,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point.  Returns 0 on success; argparse exits 2 on bad input."""
+    """CLI entry point.  Returns 0 on success; argparse exits 2 on bad input.
+
+    ``--out`` is resolved here rather than in the parser so that the omitted
+    flag keeps its historical ``DEFAULT_FIGURE_DIR`` meaning, while
+    ``--save-dir`` suppresses figures entirely.  A rejected or unwritable
+    artifact directory exits 1 with one ``error:`` line on stderr instead of a
+    traceback, because the message is the useful part for a long run.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -931,22 +1101,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.prior != "all":
         prior_indices = (int(args.prior) - 1,)
     seed = args.seed
-    if args.example == "5.1":
-        result = example_5_1(
-            preset=args.preset,
-            prior_indices=prior_indices,
-            seed=SEED_5_1 if seed is None else seed,
-            out_dir=args.out,
-            max_workers=args.max_workers,
-        )
-    else:
-        result = example_5_2(
-            preset=args.preset,
-            prior_indices=prior_indices,
-            seed=SEED_5_2 if seed is None else seed,
-            out_dir=args.out,
-            max_workers=args.max_workers,
-        )
+    out_dir = DEFAULT_FIGURE_DIR if args.out is None else args.out
+    try:
+        if args.example == "5.1":
+            result = example_5_1(
+                preset=args.preset,
+                prior_indices=prior_indices,
+                seed=SEED_5_1 if seed is None else seed,
+                out_dir=out_dir,
+                save_dir=args.save_dir,
+                max_workers=args.max_workers,
+            )
+        else:
+            result = example_5_2(
+                preset=args.preset,
+                prior_indices=prior_indices,
+                seed=SEED_5_2 if seed is None else seed,
+                out_dir=out_dir,
+                save_dir=args.save_dir,
+                max_workers=args.max_workers,
+            )
+    except (ArtifactError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     print(f"example {result.label}: {len(result.fits)} fit(s)")
     for path in result.figures:
