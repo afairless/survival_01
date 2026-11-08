@@ -51,6 +51,15 @@ decision 5; any use of it must be named in that results note.  The figures are
 written to a temporary directory: the recipes are exercised but nothing is
 written under the git-ignored ``docs/research/figures/``.
 
+Instead of refitting, the module can **replay a saved run**: set
+``DP_PAPER_ARTIFACTS`` to a section directory written by the driver
+(``<run_root>/5.1``) and every assertion is made against
+``paper_artifacts.load_demo_result`` of that tree.  Artifact mode holds 12
+assertions -- the eleven acceptance clauses below plus the manifest check that
+the run's recorded ``code_sha`` is the checked-out ``HEAD`` -- against 11 for a
+refit.  ``DP_PAPER_ARTIFACTS_ALLOW_SHA_MISMATCH=1`` relaxes that one check, so
+an older run can be inspected without pretending it came from this checkout.
+
 What each test would catch
 --------------------------
 * a ``nu`` update that ignores ``b_nu`` (the posterior sets would not move
@@ -66,7 +75,10 @@ What each test would catch
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -80,6 +92,13 @@ pytestmark = pytest.mark.paper
 #: Environment variable selecting the reproduction preset (see module docstring).
 PRESET_ENV = "DP_PAPER_PRESET"
 DEFAULT_PRESET = "paper"
+
+#: Environment variable replaying the suite against a saved run tree.
+ARTIFACTS_ENV = "DP_PAPER_ARTIFACTS"
+#: Override for replaying an older run whose recorded SHA is not ``HEAD``.
+ALLOW_SHA_MISMATCH_ENV = "DP_PAPER_ARTIFACTS_ALLOW_SHA_MISMATCH"
+#: Values of the override variable that count as "on".
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 #: Plan Section 6.1, computed there from the true mixture.
 POPULATION_MEDIAN = 1.1727
@@ -129,13 +148,28 @@ def _resolve_preset() -> paper_examples.Preset:
     return paper_examples.resolve_preset(name)
 
 
+def _artifacts_dir() -> Path | None:
+    """The saved section directory named by ``DP_PAPER_ARTIFACTS``, if any."""
+    value = os.environ.get(ARTIFACTS_ENV)
+    return Path(value) if value else None
+
+
 @pytest.fixture(scope="module")
 def run(tmp_path_factory: pytest.TempPathFactory) -> paper_examples.DemoResult:
     """Fit Section 5.1 under all three priors and write Figures 1-3.
 
+    With ``DP_PAPER_ARTIFACTS`` set, the saved section is loaded instead of
+    fitted, so the acceptance clauses are replayed on the stored draws without
+    touching the sampler (plan Section 6.4).
+
     The figures go to a temporary directory: they are a by-product here, and
     the git-ignored ``docs/research/figures/`` is for the manual/CLI runs.
     """
+    artifacts = _artifacts_dir()
+    if artifacts is not None:
+        from src import paper_artifacts
+
+        return paper_artifacts.load_demo_result(artifacts)
     preset = _resolve_preset()
     out_dir = tmp_path_factory.mktemp(f"section_5_1_{preset.name}")
     return paper_examples.example_5_1(
@@ -444,3 +478,72 @@ def test_hazard_band_widens_beyond_the_data(run: paper_examples.DemoResult) -> N
             f"({width_far:.4f}) is not {HAZARD_BAND_RATIO:g}x the band at "
             f"t = {near} ({width_near:.4f})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Artifact mode (plan Section 6.4): the replay must come from this checkout
+# ---------------------------------------------------------------------------
+def _manifest_code_sha(artifacts: Path) -> str | None:
+    """The ``code_sha`` of the run that owns the saved section tree."""
+    from src import paper_artifacts
+
+    manifest = paper_artifacts.manifest_path(artifacts.parent)
+    assert manifest.is_file(), (
+        f"{manifest} is missing: finalise the run with finalize_run before "
+        "replaying its acceptance suite in artifact mode"
+    )
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    assert isinstance(record, dict), f"{manifest} must hold a JSON object"
+    return record.get("code_sha")
+
+
+def _git_head() -> str | None:
+    """The checked-out ``HEAD`` revision, or ``None`` outside a checkout."""
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=paper_examples.REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    revision = completed.stdout.strip()
+    return revision or None
+
+
+def _allow_code_sha_mismatch() -> bool:
+    """Whether the override variable relaxes the manifest ``code_sha`` check."""
+    return os.environ.get(ALLOW_SHA_MISMATCH_ENV, "").strip().lower() in _TRUTHY
+
+
+def test_artifacts_come_from_the_checked_out_code() -> None:
+    """Artifact mode: the run's ``code_sha`` is this checkout's ``HEAD``.
+
+    ``finalize_run`` stamps the manifest with ``git rev-parse HEAD``, so a
+    replayed acceptance suite proves the stored draws came from the code that
+    is being tested.  A refit run skips -- there is no manifest yet -- which is
+    what keeps 11/11 and 12/12 (resp. 7/7 and 8/8 in Section 5.2) the same
+    module.  ``DP_PAPER_ARTIFACTS_ALLOW_SHA_MISMATCH=1`` passes an older run
+    through unchanged: inspecting it is legitimate, silently *pretending* it
+    matches ``HEAD`` is not.
+    """
+    artifacts = _artifacts_dir()
+    if artifacts is None:
+        pytest.skip(f"{ARTIFACTS_ENV} is not set: this is a refit run")
+
+    code_sha = _manifest_code_sha(artifacts)
+    assert isinstance(code_sha, str) and len(code_sha) == 40, (
+        f"{artifacts.parent}: manifest code_sha must be a 40-character git "
+        f"revision, got {code_sha!r}"
+    )
+    head = _git_head()
+    assert head is not None, (
+        f"cannot read HEAD of {paper_examples.REPO_ROOT}: replay the artifacts "
+        "from a git checkout"
+    )
+    if _allow_code_sha_mismatch():
+        return
+    assert code_sha == head, (
+        f"the artifacts under {artifacts.parent} were produced by {code_sha}, "
+        f"not by HEAD {head}: re-run the replication, or set "
+        f"{ALLOW_SHA_MISMATCH_ENV}=1 to replay an older run as it is"
+    )
