@@ -1382,6 +1382,26 @@ pending; changing one of these is a plan change, not an implementation detail.
 8. **Figures:** the plot images go to the git-ignored
    `docs/research/figures/`; the numbers go in
    `docs/research/dp_gibbs_results.md`. No binaries in git.
+   **Amended 2026-11-09 by the artifact-backed run** (plan
+   `docs/research/dp_gibbs_replication_artifacts_plan.md`, R5/R6/R7): the
+   reproduction now writes one complete, git-untracked run directory and the
+   committed record is the new report, not the old note.
+
+   - run root: `output/replication-2026-11-08T02-26-53Z`, sections `5.1` and
+     `5.2`, `paper` preset, 67 files, 2 608 901 966 bytes.
+   - per section: `draws/<fit>/` (chains, functionals, `fit-meta.json`,
+     `prior-band.npz` for the reference prior), `summary/`, `report/tables.md`,
+     `figures/figure_*.png`; plus run-level `logs/` and `MANIFEST.json`.
+   - figures are written only by `python -m src.paper_report` from the stored
+     draws (PNG, fixed metadata) and are byte-reproducible
+     (`scripts/verify_replication.sh` re-renders them into a scratch directory
+     and compares bytes); `docs/research/figures/` is no longer written.
+   - the manifest records `code_sha 0234f59`, `code_dirty: false`, the pixi
+     lock hash `0e943d13…` and `sha256 2a3bebb4…`; the §5.2 draws were produced
+     by `4a3e6be` and the §5.1 draws by `21caf16` (`logs/env.txt` per section).
+   - the numbers live in `docs/research/dp_gibbs_replication_report.md`, which
+     supersedes `dp_gibbs_results.md` as the auditable record; the old note is
+     kept as history and carries a pointer. No binaries in git.
 9. **Naming:** `n` = number of observations, `J` = truncation level, `n_star`
    = cluster count, `n_j` = cluster size, `n_j^o`/`n_j^c` = its uncensored and
    censored parts. Never a bare `n` in new code.
