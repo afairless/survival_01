@@ -525,11 +525,14 @@ tree and re-runs `finalize_run` (R6).
   the note, and the first-500 summaries of §4-§5 reproduce its values. That is
   the R2 determinism check; the full-draw columns are a sharper estimate of
   the same posteriors, not a second gate.
-- Rows that **cannot** match by construction are marked `not_comparable` and
-  are not part of the gate: the Figure 2 prior-band width (the probe drew 200
-  prior bands, the run draws 1 000) and `n_eta_above_grid` (a count, not a
-  summary). Everything else must match to the displayed precision; a listed
-  row that does not is a finding.
+- Rows that **cannot** match by construction are marked `not_comparable`, with
+  the reason recorded per row under `not_comparable_notes`, and are not part of
+  the gate: the Figure 1 prior 95 % width and the Figure 2 prior-band width (the
+  probe drew 200 prior samples, the run draws 1 000, and the report takes the
+  Figure 1 width from the exact gamma quantiles — 5.92 / 53.29 / 132.12 — while
+  the note's 6.1 / 61 / 117 are sample estimates from those 200 draws), and
+  `n_eta_above_grid` (a count, not a summary). Everything else must match to the
+  displayed precision; a listed row that does not is a finding.
 - Sanity: `r_hat < 1.05` everywhere, ESS ≥ 1 400 per fit **on the first-500
   slice** (on 40 000 draws ESS is an order of magnitude larger, so that column
   alone would be a vacuous gate), `n_eta_above_grid` recorded.
@@ -630,9 +633,10 @@ from the slice, so that its own `J_common` is used — must match the old note t
 its displayed precision, for every row that is not in the `not_comparable` list.
 (Slicing the stored arrays instead keeps the full trace's `J_common` and does
 **not** reproduce the note: the §5.2 gate measured 0.5-1 % offsets on every
-Figure 4-5 row with identical chains.) The rows that cannot match
-(prior-band width, 200 vs 1 000 prior draws; `n_eta_above_grid`, a count) are
-listed once in the plan and once in the report rather than silently excluded.
+Figure 4-5 row with identical chains.) The rows that cannot match (the §5.1
+prior width and prior-band width, both 200-draw sample estimates in the probe;
+`n_eta_above_grid`, a count) are listed once in the plan, once in the baseline
+JSON with the reason and once in the report rather than silently excluded.
 Any mismatch in a comparable row is a finding, investigated before the report
 is accepted.
 

@@ -735,11 +735,14 @@ the chains nor their arrays are mutated.
 `delta_vs_baseline(summary, baseline)` flattens the payload to dotted paths,
 matches it against the committed `docs/research/dp_gibbs_results_baseline.json`
 (extracted from the old note's first-500 tables) and returns
-`{observed, baseline, delta, not_comparable}` per row. The two rows that cannot
-match by construction are named in the baseline: the 200-draw prior band of the
-probe versus the run's 1 000, and `n_eta_above_grid`, which is a count. A row
-whose shape changed (for example a different number of hazard change points)
-keeps a `null` delta rather than crashing the report.
+`{observed, baseline, delta, not_comparable}` per row. The rows that cannot
+match by construction are named in the baseline, each with its reason under
+`not_comparable_notes`: the §5.1 prior 95 % width (the note's sample estimate
+from 200 prior draws, 6.1 / 61 / 117, versus the exact gamma quantiles the
+report computes, 5.92 / 53.29 / 132.12), the 200-draw prior band of the probe
+versus the run's 1 000, and `n_eta_above_grid`, which is a count. A row whose
+shape changed (for example a different number of hazard change points) keeps a
+`null` delta rather than crashing the report.
 
 `ACCEPTANCE_TARGETS` mirrors the constants of
 `tests/test_paper_5_1.py`/`tests/test_paper_5_2.py`. The mirror is tested, not

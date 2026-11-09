@@ -42,6 +42,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from scipy.stats import gamma as gamma_dist
 
 from src import paper_artifacts, paper_report
 from src.dp_functionals import Functionals, posterior_functionals
@@ -673,11 +674,18 @@ def test_committed_baseline_is_loadable() -> None:
     assert baseline["source"] == "docs/research/dp_gibbs_results.md"
     assert set(baseline["sections"]) == {"5.1", "5.2"}
     assert baseline["sections"]["5.1"]["not_comparable"] == [
-        "figure_2.prior_band_width"
+        "figure_1.nu_prior_95_width",
+        "figure_2.prior_band_width",
     ]
     assert baseline["sections"]["5.2"]["not_comparable"] == [
         "figure_5.n_eta_above_grid"
     ]
+    # Every flagged row carries a human-readable reason, so the gate cannot
+    # grow a silent exclusion.
+    for label, section in baseline["sections"].items():
+        assert set(section["not_comparable_notes"]) == set(section["not_comparable"]), (
+            label
+        )
 
 
 def test_committed_baseline_keeps_the_notes_arithmetic() -> None:
@@ -696,6 +704,29 @@ def test_committed_baseline_keeps_the_notes_arithmetic() -> None:
 
     assert np.all(near < far), "the 2.5 column is the narrow one"
     np.testing.assert_allclose(far / near, ratio, rtol=0.02)
+
+
+def test_committed_baseline_prior_width_is_not_the_exact_quantile() -> None:
+    """The note's prior width is a 200-draw estimate, not ``gamma.ppf``.
+
+    Pinned because the §5.1 gate turns on it: the run computes the exact prior
+    width, and the note's numbers are outside any rounding of it.
+    """
+    values = paper_report.load_baseline()["sections"]["5.1"]["values"]
+    note = np.asarray(values["figure_1.nu_prior_95_width"], dtype=np.float64)
+    exact = np.array(
+        [
+            gamma_dist.ppf(0.975, a, scale=1.0 / b)
+            - gamma_dist.ppf(0.025, a, scale=1.0 / b)
+            for a, b in PRIOR_TABLE
+        ]
+    )
+
+    np.testing.assert_allclose(exact, [5.92, 53.29, 132.12], atol=0.01)
+    assert not np.allclose(note, exact, rtol=0.01)
+    # The learning clause (posterior narrower than prior) holds under both.
+    posterior = np.asarray(values["figure_1.nu_posterior_width"], dtype=np.float64)
+    assert bool(np.all(posterior < exact)) and bool(np.all(posterior < note))
 
 
 def test_committed_baseline_keeps_the_hazard_ratio_decline() -> None:
@@ -723,7 +754,17 @@ def test_delta_vs_baseline_5_1_signs_and_not_comparable(
 
     rows = delta["rows"]
     assert delta["label"] == "5.1"
-    assert delta["not_comparable"] == ["figure_2.prior_band_width"]
+    assert delta["not_comparable"] == [
+        "figure_1.nu_prior_95_width",
+        "figure_2.prior_band_width",
+    ]
+
+    width = rows["figure_1.nu_prior_95_width"]
+    assert width["not_comparable"] is True
+    assert width["baseline"] == [6.1, 61.0, 117.0]
+    assert width["delta"][0] == pytest.approx(
+        summary["figure_1"]["nu_prior_95_width"][0] - 6.1
+    )
 
     prior_mean = rows["figure_1.nu_prior_mean"]
     assert prior_mean["observed"] == summary["figure_1"]["nu_prior_mean"]

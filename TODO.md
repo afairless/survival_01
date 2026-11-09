@@ -65,6 +65,14 @@ they are the gate between step 11 and step 12. Full commands are in plan §7.
    (`slice_result` now recomputes; `diagnostics` records `J_common_slice`),
    commit `fix: recompute slice functionals for the first-500 column`; the
    §5.2 report artifacts were re-rendered from the same draws.
+   *§5.1 gate (2026-11-09, same run root):* 28/28 acceptance clauses pass and
+   19 of 20 comparable first-500 rows match the note to displayed precision.
+   The exception is `figure_1.nu_prior_95_width`: the report uses the exact
+   gamma quantiles (5.92 / 53.29 / 132.12), the note's 6.1 / 61 / 117 are
+   sample estimates from the probe's 200 prior draws (72nd / 95th / 14th
+   percentile of that Monte Carlo distribution). Marked `not_comparable` with
+   the reason in the baseline JSON, commit `fix: mark the note's prior-width
+   row not comparable`; all draws-based rows are unaffected.
 4. **§5.1 paper run** (~8–12 h overnight, plan §7 Step 3):
    `scripts/replicate.sh 5.1 output/replication-<stamp>` reusing Step 1's root
    (R6); `MANIFEST.json` is rewritten to cover both sections.

@@ -1,13 +1,18 @@
 {
   "schema_version": 1,
   "source": "docs/research/dp_gibbs_results.md",
-  "description": "First-500-stored-draw probe values transcribed from the tables of docs/research/dp_gibbs_results.md (Sections 4 and 5), for the delta table of the artifact-backed replication report. The note's probe numbers are the first 500 stored draws per chain; the report compares its own first-500 slice against them. Rows listed under not_comparable cannot match by construction and are excluded from the hard gate: the note's Figure 2 prior band was drawn 200 times in the probe against 1,000 in the run, and n_eta_above_grid is a count, not a summary. The Figure 5c probability is the note's first-500 value (0.890); the note also records 0.901 for the full run.",
+  "description": "First-500-stored-draw probe values transcribed from the tables of docs/research/dp_gibbs_results.md (Sections 4 and 5), for the delta table of the artifact-backed replication report. The note's probe numbers are the first 500 stored draws per chain; the report compares its own first-500 slice against them. Rows listed under not_comparable cannot match by construction and are excluded from the hard gate; not_comparable_notes records why for each of them (three in total: the note's Figure 1 prior width and Figure 2 prior band, both sample estimates from the probe's 200 prior draws, and n_eta_above_grid, a count rather than a summary). The Figure 5c probability is the note's first-500 value (0.890); the note also records 0.901 for the full run.",
   "sections": {
     "5.1": {
       "description": "Probe values from the Section 4 tables of dp_gibbs_results.md.",
       "not_comparable": [
+        "figure_1.nu_prior_95_width",
         "figure_2.prior_band_width"
       ],
+      "not_comparable_notes": {
+        "figure_1.nu_prior_95_width": "The note's prior width is a sample estimate from the probe's 200 prior draws, not the exact gamma quantile the report computes: gamma.ppf(0.975) - gamma.ppf(0.025) is 5.92 / 53.29 / 132.12, while the note's 6.1 / 61 / 117 are 3 percent above, 14 percent above and 11 percent below those values and sit at the 72nd / 95th / 14th percentile of the 200-draw sampling distribution of the same statistic (4000 simulated probes, seeds 0-3999). A 14 percent error is unreachable for an exact quantile, so the row cannot match a report that computes the prior law exactly. The acceptance clause it feeds (posterior narrower than prior) holds either way: 3.27 < 5.92, 6.48 < 53.29, 8.96 < 132.12.",
+        "figure_2.prior_band_width": "The probe drew the Figure 2 prior band 200 times, the run draws 1,000; the band's width changes in the third decimal."
+      },
       "values": {
         "figure_1.nu_prior_mean": [2.22, 20.0, 60.0],
         "figure_1.nu_posterior_mean": [1.5, 2.71, 3.98],
@@ -39,6 +44,9 @@
       "not_comparable": [
         "figure_5.n_eta_above_grid"
       ],
+      "not_comparable_notes": {
+        "figure_5.n_eta_above_grid": "A per-fit count of quantiles censored to +inf, not a summary; recorded for the reader, never differenced."
+      },
       "values": {
         "figure_4.prior_agreement": [
           [1.0, 1.0, 1.0],
