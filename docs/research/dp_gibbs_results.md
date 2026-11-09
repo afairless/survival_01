@@ -1,5 +1,11 @@
 # Reproduction Results: Kottas (2002) §5.1 and §5.2
 
+> **Superseded as the auditable record** by
+> [`dp_gibbs_replication_report.md`](dp_gibbs_replication_report.md), which
+> regenerates every number from the stored draws of run
+> `output/replication-2026-11-08T02-26-53Z` and states exactly which rows of
+> this note reproduce. This note is kept as the narrative history.
+
 This note carries the numbers behind the paper reproduction: the settings, the
 seeds, the chain diagnostics, the wall clock, and the achieved value for every
 acceptance clause of `docs/research/dp_gibbs_plan.md` §6.3. The figures
