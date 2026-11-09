@@ -80,6 +80,18 @@ they are the gate between step 11 and step 12. Full commands are in plan §7.
    output/replication-<stamp>` exits 0 without fitting, then write the report
    for step 12 from `output/.../report/tables.md`.
 
+**Runbook complete (2026-11-09).** Steps 1–5 are done for run
+`output/replication-2026-11-08T02-26-53Z` (7 fits, 28 chains, 280 000 stored
+draws, 67 files, 2 608 901 966 B, manifest
+`2a3bebb4541ee42b77143d8d11062869072f2605c8986a6cf280f2a5519e7655`):
+§5.2 10/10 and §5.1 28/28 acceptance clauses pass, the artifact-mode replay
+gives 8/8 and 12/12, and `verify_replication.sh` re-renders all five figures
+byte-identically and exits 0. Commits: `21caf16` (first-500 estimator),
+`0234f59` (prior-width row), `33f35e1` + `e8f2f61` (report, verbatim tables),
+`a598efd` (plan decision 8). The documentation commits leave HEAD ahead of the
+manifest's `code_sha`, so a replay from a later checkout uses
+`DP_PAPER_ARTIFACTS_ALLOW_SHA_MISMATCH=1`.
+
 ## Notes
 
 - Steps 2–6 split plan §6.1's single module into independently testable units
